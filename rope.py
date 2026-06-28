@@ -2,6 +2,11 @@ import torch
 
 from config import ModelConfig
 
+def apply_rotary(x, cos, sin):
+    x1 = x[..., :x.shape[-1] // 2]      # shape [1, 1, seq_len, d/2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)    # shape [1, 1, seq_len, d]
+
 class BaseRoPE():
     def __init__(self, dim: int, max_seq_len: int, base: float = 1_000_000.0, fixed=True):
         self.dim = dim
@@ -29,11 +34,6 @@ class BaseRoPE():
         sin = self.sin_cached[..., offset:offset+T, :]
 
         return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
-
-def apply_rotary(x, cos, sin):
-    x1 = x[..., :x.shape[-1] // 2]      # shape [1, 1, seq_len, d/2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)    # shape [1, 1, seq_len, d]
 
 class DefaultRoPE(BaseRoPE):
     pass
