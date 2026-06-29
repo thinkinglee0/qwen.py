@@ -98,7 +98,7 @@ def test_causal_mask():
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
-# prefill(S+P) == prefill(P) + decode(range(P, S))?
+# prefill(S) == prefill(P) + decode(range(P, S))?
 @pytest.mark.parametrize("use_cache", [True, False])
 def test_forward_and_kv_cache_correctness(target_model, use_cache: bool):
     torch.manual_seed(0)        # ramdom seed, to fix the executing process.
@@ -113,7 +113,7 @@ def test_forward_and_kv_cache_correctness(target_model, use_cache: bool):
     cache = output.past_key_values
     incremental = [output.logits[:, -1, :]]     # logit at position P-1
     for t in range(P, S):                       # decode the rest 1-by-1
-        if use_cache:
+        if use_cache:       # kv cache
             output = target_model.forward(ids[:, t:t+1], cache=list(cache))
             cache = output.past_key_values
         else:
