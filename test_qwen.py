@@ -1,10 +1,19 @@
 import pytest
+import pytest_asyncio
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
+from httpx import ASGITransport, AsyncClient
+from qwen_fastapi import app, get_model_client
 
 from qwen import QwenModel, make_causal_mask
 from utils import resolve_device, default_dtype
+from config import ModelConfig
+
+# constant variables
+MODEL_DIR = "../qwen2.5-0.5b"
+CLASSIC_PROMPT = "The capital of France is"
+MAX_NEW_TOKEN_NUM = 40
 
 
 logger = logging.getLogger(__name__)
@@ -13,16 +22,26 @@ logger = logging.getLogger(__name__)
 def tokenizer():
     return AutoTokenizer.from_pretrained(MODEL_DIR)
 
-
 @pytest.fixture(scope="module")
 def inputs(tokenizer):
-    input_str = "The capital of France is"
-    return tokenizer(input_str, return_tensors="pt")    # transformers.tokenization_utils_base.BatchEncoding {input_ids, attention_mask}
+    return tokenizer(CLASSIC_PROMPT, return_tensors="pt")    # transformers.tokenization_utils_base.BatchEncoding {input_ids, attention_mask}
 
 # my implementation
 @pytest.fixture(scope="module")
-def target_model():
-    return QwenModel(MODEL_DIR)
+def target_config():
+    return ModelConfig.from_pretrained(MODEL_DIR)       # load weights
+
+@pytest.fixture(scope="module")
+def target_model(target_config):
+    return QwenModel(target_config)
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def api_client(target_model):
+    app.dependency_overrides[get_model_client] = lambda: target_model
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
 
 # instance of modeling_qwen2.py from transformers
 @pytest.fixture(scope="module")
@@ -35,10 +54,6 @@ def ref_model():
 def sampling(tok, last_logit):
     new_token_id = last_logit.argmax()
     return tok.decode(new_token_id.item()), new_token_id
-
-# constant variables
-MODEL_DIR = "../qwen2.5-0.5b"
-MAX_NEW_TOKEN_NUM = 40
 
 # map[platform:xx]
 CUR_HOST_PLATFORM = "mac"
@@ -164,14 +179,14 @@ def test_forward_comparason_with_reference(target_model, ref_model, tokenizer, i
 
 REPETITION_PENALTY_SWITCH_OFF = 1.0
 REPETITION_PENALTY_DEFAULT = 1.1
-@pytest.mark.parametrize("repetition_penalty", [REPETITION_PENALTY_SWITCH_OFF, REPETITION_PENALTY_DEFAULT])
-def test_generation_comparason_with_reference(target_model, ref_model, tokenizer, inputs, repetition_penalty: float):
+@pytest.mark.parametrize("ref_repetition_penalty", [REPETITION_PENALTY_SWITCH_OFF, REPETITION_PENALTY_DEFAULT])
+def test_generation_comparason_with_reference(target_model, ref_model, tokenizer, inputs, ref_repetition_penalty: float):
     logger.info(f"input_ids: {inputs.input_ids.shape}")
     target_output_token_ids = target_model.generate(inputs.input_ids, MAX_NEW_TOKEN_NUM)
     target_output_tokens = tokenizer.decode(target_output_token_ids[0])
     logger.info(f"target_output_tokens: |{target_output_tokens}|")
 
-    ref_model.generation_config.repetition_penalty = repetition_penalty
+    ref_model.generation_config.repetition_penalty = ref_repetition_penalty
     ref_output = ref_model.generate(
         **inputs,
         max_new_tokens=MAX_NEW_TOKEN_NUM,
@@ -188,9 +203,34 @@ def test_generation_comparason_with_reference(target_model, ref_model, tokenizer
     else:
         logger.info("comparison result: match")
     
-    if repetition_penalty == REPETITION_PENALTY_SWITCH_OFF:
+    if ref_repetition_penalty == REPETITION_PENALTY_SWITCH_OFF:
         assert target_output_tokens == ref_output_tokens
     else:
         assert target_output_tokens != ref_output_tokens
 
+@pytest.mark.asyncio
+async def test_streaming_generation(target_model, tokenizer, inputs):
+    stream_chunks = [tok async for tok in target_model.generate_stream(inputs.input_ids, MAX_NEW_TOKEN_NUM)]
+    async_ids = torch.cat([t.reshape(t.shape[0], -1) for t in stream_chunks], dim=1)
+    logger.info(f"async output: |{tokenizer.decode(async_ids[0])}|")
+    
+    sync_ids = target_model.generate(inputs.input_ids, MAX_NEW_TOKEN_NUM)
+    logger.info(f"sync output : |{tokenizer.decode(sync_ids[0])}|")
 
+    assert torch.equal(async_ids, sync_ids)
+
+@pytest.mark.asyncio
+async def test_endpoint_health(api_client):
+    r = await api_client.get("/health")
+    assert r.status_code == 200
+
+@pytest.mark.asyncio
+async def test_endpoint_generate_stream(api_client):
+    chunks = []
+    async with api_client.stream("POST", "/generate_stream", json={"prompt": CLASSIC_PROMPT}) as resp:
+        assert resp.status_code == 200
+        async for line in resp.aiter_lines():
+            if line.startswith("data: "):
+                chunks.append(line.removeprefix("data: ").strip())
+    logger.info(f"fastapi output: |{chunks}|")
+    assert chunks and chunks[-1] == "[DONE]"      # 按你的 SSE 协议断言

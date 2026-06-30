@@ -1,9 +1,13 @@
 import json, torch
+from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 from safetensors.torch import load_file
 import dataclasses
+import logging
 
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelConfig():
@@ -36,6 +40,10 @@ class ModelConfig():
 
     # derived
     head_dim: int = 0
+
+    # other
+    model_dir: str = ""
+    weights: Any | None = None
     
     def __post_init__(self):
         if self.head_dim == 0:
@@ -47,17 +55,22 @@ class ModelConfig():
         if self.rope_scaling is None:
             self.rope_scaling = {"rope_type": "default"}
 
+        self.weights = load_qwen_weights(self)
+
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":
         with open(Path(model_dir) / "config.json") as f:
             raw: dict = json.load(f)
 
+        raw["model_dir"] = model_dir    # inject
+
         # keep only the fields declared on the dataclass; silently drop any extra keys
         valid = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in raw.items() if k in valid})
 
-def load_qwen_weights(config: ModelConfig, model_dir: str | Path, dtype=torch.float32):
-    flat = load_file(Path(model_dir) / "model.safetensors", device="cpu")
+def load_qwen_weights(config: ModelConfig, dtype=torch.float32):
+    logger.info(f"load_qwen_weights, dir: {config.model_dir}")
+    flat = load_file(Path(config.model_dir) / "model.safetensors", device="cpu")
     # cast to desired dtype
     flat = {k: v.to(dtype) if v.is_floating_point() else v for k, v in flat.items()}
 

@@ -4,8 +4,10 @@ from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from pathlib import Path
 import logging
+import asyncio
+from typing import AsyncIterator
 
-from config import load_qwen_weights, ModelConfig
+from config import ModelConfig
 from rope import init_rope
 from utils import resolve_device, default_dtype
 
@@ -54,10 +56,10 @@ def make_causal_mask(q_len: int, k_len: int, device: torch.device, dtype: torch.
     return mask[None, None]  # (1, 1, q_len, k_len)
 
 class QwenModel(nn.Module):
-    def __init__(self, model_dir: str | Path, max_bsz: int = 1):
+    def __init__(self, config: ModelConfig, max_bsz: int = 1):
         super().__init__()
-        self.config = ModelConfig.from_pretrained(model_dir)
-        self.weights = load_qwen_weights(self.config, model_dir)
+        self.config = config
+        self.weights = config.weights
 
         self.rope = init_rope(self.config)
 
@@ -170,6 +172,7 @@ class QwenModel(nn.Module):
         latest_tokens = last_logit.argmax(1, keepdim=True)
         return latest_tokens
 
+    @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_len: int = 300) -> torch.Tensor:
         bsz, seq_len = input_ids.size()
         if bsz > 1:
@@ -185,7 +188,40 @@ class QwenModel(nn.Module):
             cache = output.past_key_values
             latest_tokens = self.sample(output.logits)
             output_tokens = torch.cat([output_tokens, latest_tokens], -1)
-            latest_token_id = latest_tokens[0, 0]
+            latest_token_id = latest_tokens[0, 0].item()
 
         return output_tokens
+
+    @torch.no_grad()
+    def _decode_step(self, latest_tokens: torch.Tensor, cache: list):
+        output = self.forward(latest_tokens, cache)
+        cache = output.past_key_values
+        next_tokens = self.sample(output.logits)
+        return next_tokens, cache
+
+    async def generate_stream(self, input_ids: torch.Tensor, max_len: int = 300) -> AsyncIterator[torch.Tensor]:
+        bsz, seq_len = input_ids.size()
+        if bsz > 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        
+        cache = init_kv_cache(self.config.num_hidden_layers, bsz, self.config.num_key_value_heads, self.config.head_dim,
+                              self.device, self.dtype)
+        latest_tokens = input_ids   # shape [bsz, seq_len]
+        max_new = min(self.config.max_position_embeddings - seq_len, max_len)
+
+        loop = asyncio.get_running_loop()
+        yield latest_tokens
+
+        num_generated = 0
+        while num_generated < max_new:
+            latest_tokens, cache = await loop.run_in_executor(None, self._decode_step, latest_tokens, list(cache))
+            latest_token_id = latest_tokens[0, 0].item()
+            num_generated += 1
+
+            yield latest_tokens
+
+            if latest_token_id == self.config.eos_token_id:
+                break
+    
+
 
