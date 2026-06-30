@@ -4,7 +4,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 from httpx import ASGITransport, AsyncClient
-from qwen_fastapi import app, get_model_client
+from main import app, get_model_client
 
 from qwen import QwenModel, make_causal_mask
 from utils import resolve_device, default_dtype
@@ -210,7 +210,7 @@ def test_generation_comparason_with_reference(target_model, ref_model, tokenizer
 
 @pytest.mark.asyncio
 async def test_streaming_generation(target_model, tokenizer, inputs):
-    stream_chunks = [tok async for tok in target_model.generate_stream(inputs.input_ids, MAX_NEW_TOKEN_NUM)]
+    stream_chunks = [tok async for tok in target_model.async_generate(inputs.input_ids, MAX_NEW_TOKEN_NUM)]
     async_ids = torch.cat([t.reshape(t.shape[0], -1) for t in stream_chunks], dim=1)
     logger.info(f"async output: |{tokenizer.decode(async_ids[0])}|")
     
@@ -233,4 +233,4 @@ async def test_endpoint_generate_stream(api_client):
             if line.startswith("data: "):
                 chunks.append(line.removeprefix("data: ").strip())
     logger.info(f"fastapi output: |{chunks}|")
-    assert chunks and chunks[-1] == "[DONE]"      # 按你的 SSE 协议断言
+    assert chunks and chunks[-1] == "[DONE]"

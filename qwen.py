@@ -199,7 +199,7 @@ class QwenModel(nn.Module):
         next_tokens = self.sample(output.logits)
         return next_tokens, cache
 
-    async def generate_stream(self, input_ids: torch.Tensor, max_len: int = 300) -> AsyncIterator[torch.Tensor]:
+    async def async_generate(self, input_ids: torch.Tensor, max_len: int = 300) -> AsyncIterator[torch.Tensor]:
         bsz, seq_len = input_ids.size()
         if bsz > 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")

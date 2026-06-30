@@ -14,7 +14,7 @@ MODEL_DIR = "../qwen2.5-0.5b"
 async def lifespan(app: FastAPI):
     cfg = ModelConfig.from_pretrained(MODEL_DIR)
     model = QwenModel(cfg)
-    app.state.model_client = model                   # 存到 app.state,startup 时 load 一次
+    app.state.model_client = model
     yield
 
 class GenRequest(BaseModel):
@@ -40,7 +40,7 @@ def _generate_stream_imp(req: GenRequest, model: QwenModel,
     input_ids = tokenizer(req.prompt, return_tensors="pt").input_ids.to(model.device)
 
     async def sse():
-        async for token in model.generate_stream(input_ids, req.max_len):
+        async for token in model.async_generate(input_ids, req.max_len):
             piece = tokenizer.decode(token[0])
             yield prefix+piece+suffix
         yield prefix+"[DONE]"+suffix

@@ -9,11 +9,13 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 
 ## Status
 
-| Milestone | Scope                                                                    | State                                                                        |
-| --------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| **M1**    | Forward pass — embed → 24 × decoder block → final norm → logits          | ✅ done, logits validated against the `transformers` reference layer-by-layer |
-| **M2**    | KV cache (incremental decode, `past_len` plumbing)                       | 🔜 next — `past_len` already stubbed in `forward()`                          |
-| later     | sampling / generation loop, batched decode, performance work on 7B / A10 | planned                                                                      |
+| Milestone | Scope                                                           | State                                                                        |
+| --------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **M1**    | Forward pass — embed → 24 × decoder block → final norm → logits | ✅ done, logits validated against the `transformers` reference layer-by-layer |
+| **M2**    | KV cache (incremental decode, `past_len` plumbing)              | ✅ done, logits validated against the non-kv-cache mode by pytest             |
+| **M3**    | Streaming HTTP service                                          | ✅ done, introducing FastAPI, async                                           |
+| **M4**    | static batching                                                 | 🔜 next — `bsz`already stubbed with `1`                                      |
+| later     | continuous batching, performance work on 7B / A10               | planned                                                                      |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
 
@@ -29,54 +31,46 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 - **Tied embeddings** — `lm_head` falls back to `embed_tokens.weight` when
   `tie_word_embeddings=True` (0.5B); a separate `lm_head.weight` is used when present (7B).
 - **Weight loading** — `safetensors` → flat dict, dtype cast, config parsed from `config.json` into a typed dataclass.
+- **KV cache** — `prefill` and `decode` share the same `forward`; `init_kv_cache`while `cache`is None in `forward`function; return `cache` on the end of `forward` for the next iteration.
+- **Streaming HTTP service** — `async_generate`throws `_decode_step`into the current `event loop`, and yields CPU after `_decode_step`returns; `/generate_stream`and `/health`endpoints implemented by FastAPI; `@asynccontextmanager`, `@pytest_asyncio.fixture` and `@pytest.fixture` ensure that the model **Weights** only loads **once** in testing scenarios of sync functions, async functions, and FastAPI endpoints.
 
 ---
 
 ## Repository layout
 
-| File                                       | Responsibility                                                                                                                        |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `config.py`                                | `ModelConfig` dataclass, `from_pretrained` (parse `config.json`), `load_qwen_weights` (safetensors + dtype + tied-embedding handling) |
-| `rope.py`                                  | `BaseRoPE` + `Default` / `Linear` / `DynamicNTK` variants, `init_rope` factory                                                        |
-| `qwen.py`                                  | `QwenModel` — the full forward pass                                                                                                   |
-| `t.py`                                     | Validation harness: hooks + monkey-patch to capture intermediates and `compare` against the `transformers` reference                  |
-| `docs/qwen25_inference_alignment_notes.md` | Engineering notes — the pitfalls hit while aligning against HuggingFace, and the methodology used to find them                        |
+| File                                       | Responsibility                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.py`                                | `ModelConfig` dataclass, `from_pretrained` (parse `config.json`), `load_qwen_weights` (safetensors + dtype + tied-embedding handling)                                                                                                                                                                    |
+| `rope.py`                                  | `BaseRoPE` + `Default` / `Linear` / `DynamicNTK` variants, `init_rope` factory                                                                                                                                                                                                                           |
+| `qwen.py`                                  | `QwenModel` — the full forward pass, generation loop and async generation loop                                                                                                                                                                                                                           |
+| `main.py`                                  | FastAPI endpoints                                                                                                                                                                                                                                                                                        |
+| `test_qwen.py`                             | unit tests by pytest for `QwenModel`, including FastAPI endpoints, and comparasons between `prefill(seq)` and `prefill(sub_seq) + decode(rest_seq)` step by step , between `QwenModel` and `modeling_qwen2.py`, between that with `KV cache` and non-`KV cache`, between `generate` and `async_generate` |
+| `test_rope.py`                             | unit tests by pytest for `rope.py`                                                                                                                                                                                                                                                                       |
+| `utils.py`                                 | some functions                                                                                                                                                                                                                                                                                           |
+| `docs/qwen25_inference_alignment_notes.md` | Engineering notes — the pitfalls hit while aligning against HuggingFace, and the methodology used to find them                                                                                                                                                                                           |
 
 ---
 
 ## Quickstart
 
 ```bash
-pip install torch safetensors transformers
+pip install torch safetensors transformers fastapi uvicorn pytest_asyncio pytest
 
 # fetch the dev model (≈1 GB)
-huggingface-cli download Qwen/Qwen2.5-0.5B --local-dir ./qwen2.5-0.5b
+huggingface-cli download Qwen/Qwen2.5-0.5B --local-dir ../qwen2.5-0.5b
 
-# point the harness at the weights, then run the reference comparison
-python t.py
+# verify
+pytest
+
+# start FastAPI service
+uvicorn main:app --host 0.0.0.0 --port 8001
+
+# test
+$ curl -N -X POST "http://127.0.0.1:8001/generate_stream_plain"      -H "Content-Type: application/json"      -d '{"prompt": "The capital of France is", "max_len": 200}'
+The capital of France is Paris. It is the largest city in Europe and the third largest city in the world. It is located in the south of France, on the banks of the Seine River. It is situated on the Île de la Cité, which is a small island in the center of the city. The city is surrounded by the Seine River and the Mediterranean Sea. It is also surrounded by the Pyrenees mountains. The city is known for its beautiful architecture, its rich history, and its beautiful parks and gardens. Paris is a city of contrasts, with its modern and old parts, its rich and poor parts, and its diverse and multicultural population. It is a city of art, culture, and science, and it is a city of innovation and progress. Paris is a city of love, and it is a city of hope. It is a city of dreams, and it is a city of reality. It is a city of beauty, and it is a city of wonder. Paris
 ```
 
-`t.py` resolves the model directory via `model_dir` near the top of the file — set it to
-wherever you placed the weights. A passing run prints aligned logits between `qwen.py` and the `transformers` reference, and the same next-token prediction for the prompt
-`"The capital of France is"`.
-
-Minimal inference:
-
-```python
-from transformers import AutoTokenizer
-from qwen import QwenModel
-
-model_dir = "./qwen2.5-0.5b"
-tok = AutoTokenizer.from_pretrained(model_dir)
-model = QwenModel(model_dir)
-
-ids = tok("The capital of France is", return_tensors="pt").input_ids
-logits = model(ids).logits                 # [1, seq, vocab]
-next_id = logits[0, -1].argmax(dim=-1)     # greedy
-print(tok.decode(next_id))                 # -> " Paris"
-```
-
----
+`pytest` results all pass as expected. The letters from the `curl` response display like a typewriter.
 
 ## Validation
 
@@ -110,10 +104,9 @@ The full set of pitfalls found this way — RoPE `inv_freq` exponent, `view`/`tr
 
 ## Roadmap
 
-1. **M2 — KV cache.** Replace `past_len = 0` with the running cache length; cache K/V per layer; mask becomes `(q_len, past_len + q_len)`. Validate incremental decode against a full re-prefill.
-2. **Generation loop & sampling** — greedy + temperature / top-p, decoupled from the model.
-3. **Batched decode** — padding / position handling for `bsz > 1`.
-4. **Performance** — move to GPU, profile against the 7B / A10 target.
+1. **Sampling** — greedy + temperature / top-p, decoupled from the model.
+2. **Batched decode** — padding / position handling for `bsz > 1`.
+3. **Performance** — move to GPU, profile against the 7B / A10 target.
 
 ---
 
