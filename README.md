@@ -66,8 +66,9 @@ pytest
 uvicorn main:app --host 0.0.0.0 --port 8001
 
 # test
-$ curl -N -X POST "http://127.0.0.1:8001/generate_stream_plain"      -H "Content-Type: application/json"      -d '{"prompt": "The capital of France is", "max_len": 200}'
-The capital of France is Paris. It is the largest city in Europe and the third largest city in the world. It is located in the south of France, on the banks of the Seine River. It is situated on the Île de la Cité, which is a small island in the center of the city. The city is surrounded by the Seine River and the Mediterranean Sea. It is also surrounded by the Pyrenees mountains. The city is known for its beautiful architecture, its rich history, and its beautiful parks and gardens. Paris is a city of contrasts, with its modern and old parts, its rich and poor parts, and its diverse and multicultural population. It is a city of art, culture, and science, and it is a city of innovation and progress. Paris is a city of love, and it is a city of hope. It is a city of dreams, and it is a city of reality. It is a city of beauty, and it is a city of wonder. Paris
+curl -N -X POST "http://127.0.0.1:8001/generate_stream_plain"      -H "Content-Type: application/json"      -d '{"prompt": "The capital of France is", "max_output_len": 400}'
+The capital of France is Paris. It was founded in 789 AD by Charlemagne, the last king of the Carolingian dynasty. The city has a long and rich history dating back to the Roman Empire. In fact, it was the first European capital to be built on land that would later become the French Riviera.
+Paris is also home to many famous landmarks such as Notre Dame Cathedral, the Eiffel Tower, the Louvre Museum, the Arc de Triomphe, and the Champs-Élysées. The city is also known for its vibrant culture, including jazz music, ballet, and theater performances. Paris is a popular tourist destination, with millions of visitors each year. Its rich history and beautiful architecture make it an important cultural center in Europe.<|endoftext|>[DONE]
 ```
 
 `pytest` results all pass as expected. The letters from the `curl` response display like a typewriter.

@@ -31,9 +31,17 @@ class ModelConfig():
     attention_dropout: float
     torch_dtype: str
     transformers_version: str
-    bos_token_id: int
-    eos_token_id: int
     model_type: str
+
+    # from generation_config.json
+    do_sample: bool
+    bos_token_id: int
+    pad_token_id: int
+    eos_token_id: list[int]
+    temperature: float
+    repetition_penalty: float
+    top_p: float
+    top_k: float
 
     # optional
     rope_scaling: dict | None = None
@@ -62,6 +70,10 @@ class ModelConfig():
         with open(Path(model_dir) / "config.json") as f:
             raw: dict = json.load(f)
 
+        with open(Path(model_dir) / "generation_config.json") as f:
+            raw2: dict = json.load(f)
+
+        raw.update(raw2)    # merge generation config into model config
         raw["model_dir"] = model_dir    # inject
 
         # keep only the fields declared on the dataclass; silently drop any extra keys

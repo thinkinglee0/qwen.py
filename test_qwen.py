@@ -177,16 +177,12 @@ def test_forward_comparason_with_reference(target_model, ref_model, tokenizer, i
         # shape [bsz, seq_len]
         input_ids = torch.cat([input_ids, torch.full((1,1), target_new_token_id)], -1)
 
-REPETITION_PENALTY_SWITCH_OFF = 1.0
-REPETITION_PENALTY_DEFAULT = 1.1
-@pytest.mark.parametrize("ref_repetition_penalty", [REPETITION_PENALTY_SWITCH_OFF, REPETITION_PENALTY_DEFAULT])
-def test_generation_comparason_with_reference(target_model, ref_model, tokenizer, inputs, ref_repetition_penalty: float):
+def test_generation_comparason_with_reference(target_model, ref_model, tokenizer, inputs: float):
     logger.info(f"input_ids: {inputs.input_ids.shape}")
     target_output_token_ids = target_model.generate(inputs.input_ids, MAX_NEW_TOKEN_NUM)
     target_output_tokens = tokenizer.decode(target_output_token_ids[0])
     logger.info(f"target_output_tokens: |{target_output_tokens}|")
 
-    ref_model.generation_config.repetition_penalty = ref_repetition_penalty
     ref_output = ref_model.generate(
         **inputs,
         max_new_tokens=MAX_NEW_TOKEN_NUM,
@@ -203,10 +199,7 @@ def test_generation_comparason_with_reference(target_model, ref_model, tokenizer
     else:
         logger.info("comparison result: match")
     
-    if ref_repetition_penalty == REPETITION_PENALTY_SWITCH_OFF:
-        assert target_output_tokens == ref_output_tokens
-    else:
-        assert target_output_tokens != ref_output_tokens
+    assert target_output_tokens == ref_output_tokens
 
 @pytest.mark.asyncio
 async def test_streaming_generation(target_model, tokenizer, inputs):

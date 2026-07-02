@@ -55,6 +55,13 @@ def make_causal_mask(q_len: int, k_len: int, device: torch.device, dtype: torch.
     mask = torch.triu(mask, diagonal=k_len - q_len + 1)
     return mask[None, None]  # (1, 1, q_len, k_len)
 
+# todo: batching
+def apply_repetition_penalty(logits, seen_ids, penalty):
+    # logits: [vocab_size]; seen_ids: 已出现 token id (含 prompt)
+    s = logits[seen_ids]
+    logits[seen_ids] = torch.where(s > 0, s / penalty, s * penalty)
+    return logits
+
 class QwenModel(nn.Module):
     def __init__(self, config: ModelConfig, max_bsz: int = 1):
         super().__init__()
@@ -167,13 +174,17 @@ class QwenModel(nn.Module):
         output.logits = logits
         return output
 
-    def sample(self, logits: torch.Tensor):
+    def sample(self, logits: torch.Tensor, output_tokens: torch.Tensor):
+        logits[0, -1] = apply_repetition_penalty(logits[0, -1],
+                                                seen_ids=output_tokens,
+                                                penalty=self.config.repetition_penalty)
+
         last_logit = logits[:, -1, :]
         latest_tokens = last_logit.argmax(1, keepdim=True)
         return latest_tokens
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_len: int = 300) -> torch.Tensor:
+    def generate(self, input_ids: torch.Tensor, max_output_len: int = 300) -> torch.Tensor:
         bsz, seq_len = input_ids.size()
         if bsz > 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
@@ -181,46 +192,48 @@ class QwenModel(nn.Module):
         cache = init_kv_cache(self.config.num_hidden_layers, bsz, self.config.num_key_value_heads, self.config.head_dim,
                               self.device, self.dtype)
         latest_token_id = input_ids[0, -1]  # todo: only for bsz=1
-        output_tokens = input_ids.clone()
+        output_tokens = input_ids.clone()   # include inputs
         latest_tokens = input_ids
-        while latest_token_id != self.config.eos_token_id and output_tokens.size(1) < min(self.config.max_position_embeddings, seq_len+max_len):
+        while latest_token_id != self.config.eos_token_id and output_tokens.size(1) < min(self.config.max_position_embeddings, seq_len+max_output_len):
             output = self.forward(latest_tokens, list(cache))
             cache = output.past_key_values
-            latest_tokens = self.sample(output.logits)
+            latest_tokens = self.sample(output.logits, output_tokens)
             output_tokens = torch.cat([output_tokens, latest_tokens], -1)
             latest_token_id = latest_tokens[0, 0].item()
 
         return output_tokens
 
     @torch.no_grad()
-    def _decode_step(self, latest_tokens: torch.Tensor, cache: list):
+    def _decode_step(self, output_tokens: torch.Tensor, latest_tokens: torch.Tensor, cache: list):
         output = self.forward(latest_tokens, cache)
         cache = output.past_key_values
-        next_tokens = self.sample(output.logits)
+        next_tokens = self.sample(output.logits, output_tokens)
         return next_tokens, cache
 
-    async def async_generate(self, input_ids: torch.Tensor, max_len: int = 300) -> AsyncIterator[torch.Tensor]:
+    async def async_generate(self, input_ids: torch.Tensor, max_output_len: int = 300) -> AsyncIterator[torch.Tensor]:
         bsz, seq_len = input_ids.size()
         if bsz > 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
         
         cache = init_kv_cache(self.config.num_hidden_layers, bsz, self.config.num_key_value_heads, self.config.head_dim,
                               self.device, self.dtype)
+        output_tokens = input_ids.clone()
         latest_tokens = input_ids   # shape [bsz, seq_len]
-        max_new = min(self.config.max_position_embeddings - seq_len, max_len)
+        max_new = min(self.config.max_position_embeddings - seq_len, max_output_len)
 
         loop = asyncio.get_running_loop()
         yield latest_tokens
 
         num_generated = 0
         while num_generated < max_new:
-            latest_tokens, cache = await loop.run_in_executor(None, self._decode_step, latest_tokens, list(cache))
+            latest_tokens, cache = await loop.run_in_executor(None, self._decode_step, output_tokens, latest_tokens, list(cache))
+            output_tokens = torch.cat([output_tokens, latest_tokens], -1)
             latest_token_id = latest_tokens[0, 0].item()
             num_generated += 1
 
             yield latest_tokens
 
-            if latest_token_id == self.config.eos_token_id:
+            if latest_token_id in self.config.eos_token_id:
                 break
     
 

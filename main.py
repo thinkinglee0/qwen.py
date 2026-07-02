@@ -3,9 +3,22 @@ from fastapi.responses import StreamingResponse
 from transformers import AutoTokenizer
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+import logging
 
 from qwen import QwenModel
 from config import ModelConfig
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="{asctime} [{levelname}] {filename}:{lineno} - {message}",
+    style="{",
+    handlers=[
+        logging.FileHandler("t.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 # constant variables
 MODEL_DIR = "../qwen2.5-0.5b"
@@ -19,11 +32,13 @@ async def lifespan(app: FastAPI):
 
 class GenRequest(BaseModel):
     prompt: str
-    max_len: int = 100
+    max_output_len: int = 100
     # temperature: float = 0.7
 
 app = FastAPI(lifespan=lifespan)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+
+logger.info("Qwen HTTP service is starting...")
 
 def get_model_client(request: Request) -> QwenModel:
     return request.app.state.model_client
@@ -40,7 +55,7 @@ def _generate_stream_imp(req: GenRequest, model: QwenModel,
     input_ids = tokenizer(req.prompt, return_tensors="pt").input_ids.to(model.device)
 
     async def sse():
-        async for token in model.async_generate(input_ids, req.max_len):
+        async for token in model.async_generate(input_ids, req.max_output_len):
             piece = tokenizer.decode(token[0])
             yield prefix+piece+suffix
         yield prefix+"[DONE]"+suffix
