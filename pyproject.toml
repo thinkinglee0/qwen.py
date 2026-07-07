@@ -16,3 +16,13 @@ filterwarnings = [
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen"
+version = "0.1.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]                  # tells setuptools the package lives under src/

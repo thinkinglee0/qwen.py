@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from rope import BaseRoPE
+from qwen.rope import BaseRoPE
 
 def test_inv_freq_values():
     rope = BaseRoPE(dim=8, max_seq_len=16, base=10000.0)

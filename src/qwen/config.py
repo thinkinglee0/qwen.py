@@ -1,3 +1,5 @@
+# src/config.py
+
 import json, torch
 from typing import Any
 from dataclasses import dataclass
@@ -38,13 +40,19 @@ class ModelConfig():
     bos_token_id: int
     pad_token_id: int
     eos_token_id: list[int]
-    temperature: float
-    repetition_penalty: float
     top_p: float
     top_k: float
 
-    # optional
+    # optional from config.json
     rope_scaling: dict | None = None
+
+    # optional from generation_config.json
+    temperature: float = 1.
+    top_k: float = 0.
+    top_p: float = 1.
+    repetition_penalty: float = 1.
+    frequency_penalty: float = 0.
+    presence_penalty: float = 0.
 
     # derived
     head_dim: int = 0
@@ -62,6 +70,8 @@ class ModelConfig():
 
         if self.rope_scaling is None:
             self.rope_scaling = {"rope_type": "default"}
+
+        logger.info(f"config: {self}")
 
         self.weights = load_qwen_weights(self)
 

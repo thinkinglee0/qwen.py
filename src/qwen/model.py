@@ -2,20 +2,23 @@ import math
 import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from pathlib import Path
 import logging
-import asyncio
-from typing import AsyncIterator
 
-from config import ModelConfig
-from rope import init_rope
-from utils import resolve_device, default_dtype
+from qwen.config import ModelConfig
+from qwen.rope import init_rope
+from qwen.utils import resolve_device, default_dtype
 
 # index: cache[layer_idx] = (k, v)
 # k, v shape: (B, n_kv_heads, seq_len_so_far, head_dim)
 KVCache = list[tuple[torch.Tensor, torch.Tensor]]
 
 logger = logging.getLogger(__name__)
+
+def init_kv_cache2(config: ModelConfig,
+                   bsz: int,
+                   device: torch.device,
+                   dtype: torch.dtype):
+    return init_kv_cache(config.num_hidden_layers, bsz, config.num_key_value_heads, config.head_dim, device, dtype)
 
 def init_kv_cache(n_layers: int,
                   bsz: int,
@@ -55,13 +58,6 @@ def make_causal_mask(q_len: int, k_len: int, device: torch.device, dtype: torch.
     mask = torch.triu(mask, diagonal=k_len - q_len + 1)
     return mask[None, None]  # (1, 1, q_len, k_len)
 
-# todo: batching
-def apply_repetition_penalty(logits, seen_ids, penalty):
-    # logits: [vocab_size]; seen_ids: 已出现 token id (含 prompt)
-    s = logits[seen_ids]
-    logits[seen_ids] = torch.where(s > 0, s / penalty, s * penalty)
-    return logits
-
 class QwenModel(nn.Module):
     def __init__(self, config: ModelConfig, max_bsz: int = 1):
         super().__init__()
@@ -99,14 +95,8 @@ class QwenModel(nn.Module):
     def forward(self, input_ids: torch.Tensor, cache: KVCache | None = None) -> CausalLMOutputWithPast:
         hidden_states = self.embed_tokens(input_ids)    # [bsz, seq_len, hidden_size]
         bsz, q_len, _ = hidden_states.size()
-
         past_len = 0 if cache is None else cache[0][0].shape[2]
-        if cache is None:
-            past_len = 0
-            cache = init_kv_cache(self.config.num_hidden_layers, bsz, self.config.num_key_value_heads, self.config.head_dim,
-                              hidden_states.device, self.dtype)
-        else:
-            past_len = cache[0][0].shape[2]
+
         causal_mask = make_causal_mask(q_len, q_len+past_len, hidden_states.device, hidden_states.dtype)
 
         for layer in range(self.config.num_hidden_layers):
@@ -128,10 +118,11 @@ class QwenModel(nn.Module):
             query_states, key_states = self.rope(query_states, key_states, past_len)
 
             #kv cache
-            keys, vals = cache[layer]
-            key_states = torch.cat([keys, key_states], 2)
-            value_states = torch.cat([vals, value_states], 2)
-            cache[layer] = (key_states, value_states)  # upate cache
+            if cache is not None:
+                keys, vals = cache[layer]
+                key_states = torch.cat([keys, key_states], 2)
+                value_states = torch.cat([vals, value_states], 2)
+                cache[layer] = (key_states, value_states)  # upate cache
 
             # repeat k,v for grouped-query attention (GQA)
             if self.num_query_heads % self.config.num_key_value_heads != 0:
@@ -170,71 +161,11 @@ class QwenModel(nn.Module):
 
         # output
         output = CausalLMOutputWithPast()
-        output.past_key_values = tuple(cache)
+        if cache is not None:
+            output.past_key_values = tuple(cache)
         output.logits = logits
         return output
 
-    def sample(self, logits: torch.Tensor, output_tokens: torch.Tensor):
-        logits[0, -1] = apply_repetition_penalty(logits[0, -1],
-                                                seen_ids=output_tokens,
-                                                penalty=self.config.repetition_penalty)
 
-        last_logit = logits[:, -1, :]
-        latest_tokens = last_logit.argmax(1, keepdim=True)
-        return latest_tokens
-
-    @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_output_len: int = 300) -> torch.Tensor:
-        bsz, seq_len = input_ids.size()
-        if bsz > 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        
-        cache = init_kv_cache(self.config.num_hidden_layers, bsz, self.config.num_key_value_heads, self.config.head_dim,
-                              self.device, self.dtype)
-        latest_token_id = input_ids[0, -1]  # todo: only for bsz=1
-        output_tokens = input_ids.clone()   # include inputs
-        latest_tokens = input_ids
-        while latest_token_id != self.config.eos_token_id and output_tokens.size(1) < min(self.config.max_position_embeddings, seq_len+max_output_len):
-            output = self.forward(latest_tokens, list(cache))
-            cache = output.past_key_values
-            latest_tokens = self.sample(output.logits, output_tokens)
-            output_tokens = torch.cat([output_tokens, latest_tokens], -1)
-            latest_token_id = latest_tokens[0, 0].item()
-
-        return output_tokens
-
-    @torch.no_grad()
-    def _decode_step(self, output_tokens: torch.Tensor, latest_tokens: torch.Tensor, cache: list):
-        output = self.forward(latest_tokens, cache)
-        cache = output.past_key_values
-        next_tokens = self.sample(output.logits, output_tokens)
-        return next_tokens, cache
-
-    async def async_generate(self, input_ids: torch.Tensor, max_output_len: int = 300) -> AsyncIterator[torch.Tensor]:
-        bsz, seq_len = input_ids.size()
-        if bsz > 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        
-        cache = init_kv_cache(self.config.num_hidden_layers, bsz, self.config.num_key_value_heads, self.config.head_dim,
-                              self.device, self.dtype)
-        output_tokens = input_ids.clone()
-        latest_tokens = input_ids   # shape [bsz, seq_len]
-        max_new = min(self.config.max_position_embeddings - seq_len, max_output_len)
-
-        loop = asyncio.get_running_loop()
-        yield latest_tokens
-
-        num_generated = 0
-        while num_generated < max_new:
-            latest_tokens, cache = await loop.run_in_executor(None, self._decode_step, output_tokens, latest_tokens, list(cache))
-            output_tokens = torch.cat([output_tokens, latest_tokens], -1)
-            latest_token_id = latest_tokens[0, 0].item()
-            num_generated += 1
-
-            yield latest_tokens
-
-            if latest_token_id in self.config.eos_token_id:
-                break
-    
 
 

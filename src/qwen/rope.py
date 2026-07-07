@@ -1,6 +1,6 @@
 import torch
 
-from config import ModelConfig
+from qwen.config import ModelConfig
 
 def apply_rotary(x, cos, sin):
     x1 = x[..., :x.shape[-1] // 2]      # shape [1, 1, seq_len, d/2]

@@ -9,13 +9,14 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 
 ## Status
 
-| Milestone | Scope                                                           | State                                                                        |
-| --------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **M1**    | Forward pass — embed → 24 × decoder block → final norm → logits | ✅ done, logits validated against the `transformers` reference layer-by-layer |
-| **M2**    | KV cache (incremental decode, `past_len` plumbing)              | ✅ done, logits validated against the non-kv-cache mode by pytest             |
-| **M3**    | Streaming HTTP service                                          | ✅ done, introducing FastAPI, async                                           |
-| **M4**    | static batching                                                 | 🔜 next — `bsz`already stubbed with `1`                                      |
-| later     | continuous batching, performance work on 7B / A10               | planned                                                                      |
+| Milestone | Scope                                                           | State                                                                                                                                                          |
+| --------- | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **M1**    | Forward pass — embed → 24 × decoder block → final norm → logits | ✅ done, logits validated against the `transformers` reference layer-by-layer                                                                                   |
+| **M2**    | KV cache (incremental decode, `past_len` plumbing)              | ✅ done, logits validated against the non-kv-cache mode by pytest                                                                                               |
+| **M3**    | Generation loop, Streaming HTTP service                         | ✅ done, introducing FastAPI, async                                                                                                                             |
+| **M4**    | sampling, restructure the project layout                        | ✅ done, repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial; mv source code and test cases into src and tests folders respectively. |
+| **M5**    | static batching                                                 | 🔜 next — `bsz`already stubbed with `1`                                                                                                                        |
+| later     | continuous batching, performance work on 7B / A10               | planned                                                                                                                                                        |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
 
@@ -33,21 +34,27 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 - **Weight loading** — `safetensors` → flat dict, dtype cast, config parsed from `config.json` into a typed dataclass.
 - **KV cache** — `prefill` and `decode` share the same `forward`; `init_kv_cache`while `cache`is None in `forward`function; return `cache` on the end of `forward` for the next iteration.
 - **Streaming HTTP service** — `async_generate`throws `_decode_step`into the current `event loop`, and yields CPU after `_decode_step`returns; `/generate_stream`and `/health`endpoints implemented by FastAPI; `@asynccontextmanager`, `@pytest_asyncio.fixture` and `@pytest.fixture` ensure that the model **Weights** only loads **once** in testing scenarios of sync functions, async functions, and FastAPI endpoints.
+- **Sampling** — parse `generation_conf.json`, apply repetition/frequency/presence penalties just after `forward`, then do sampling if `do_sample` swtich is on; sampling includes temperature, top_k, top_p, multinomial.
+- **Restructure the project layout** — rename `qwen.py` to `model.py`, `main.py` to `api.py`, put sync/async generations into `engine.py`, place source code files in `src/qwen` folder, and unit tests in `tests`.
 
 ---
 
 ## Repository layout
 
-| File                                       | Responsibility                                                                                                                                                                                                                                                                                           |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `config.py`                                | `ModelConfig` dataclass, `from_pretrained` (parse `config.json`), `load_qwen_weights` (safetensors + dtype + tied-embedding handling)                                                                                                                                                                    |
-| `rope.py`                                  | `BaseRoPE` + `Default` / `Linear` / `DynamicNTK` variants, `init_rope` factory                                                                                                                                                                                                                           |
-| `qwen.py`                                  | `QwenModel` — the full forward pass, generation loop and async generation loop                                                                                                                                                                                                                           |
-| `main.py`                                  | FastAPI endpoints                                                                                                                                                                                                                                                                                        |
-| `test_qwen.py`                             | unit tests by pytest for `QwenModel`, including FastAPI endpoints, and comparasons between `prefill(seq)` and `prefill(sub_seq) + decode(rest_seq)` step by step , between `QwenModel` and `modeling_qwen2.py`, between that with `KV cache` and non-`KV cache`, between `generate` and `async_generate` |
-| `test_rope.py`                             | unit tests by pytest for `rope.py`                                                                                                                                                                                                                                                                       |
-| `utils.py`                                 | some functions                                                                                                                                                                                                                                                                                           |
-| `docs/qwen25_inference_alignment_notes.md` | Engineering notes — the pitfalls hit while aligning against HuggingFace, and the methodology used to find them                                                                                                                                                                                           |
+| File                                       | Responsibility                                                                                                                                                                                                                                                  |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/qwen/config.py`                       | `ModelConfig` dataclass, `from_pretrained` (parse `config.json` and `generation_config.json`), `load_qwen_weights` (safetensors + dtype + tied-embedding handling)                                                                                              |
+| `src/qwen/rope.py`                         | `BaseRoPE` + `Default` / `Linear` / `DynamicNTK` variants, `init_rope` factory                                                                                                                                                                                  |
+| `src/qwen/model.py`                        | `QwenModel` — the full forward pass                                                                                                                                                                                                                             |
+| `src/qwen/engine.py`                       | generation loop and async generation loop                                                                                                                                                                                                                       |
+| `src/qwen/api.py`                          | FastAPI endpoints                                                                                                                                                                                                                                               |
+| `src/qwen/sampling.py`                     | repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial;                                                                                                                                                                                 |
+| `src/qwen/utils.py`                        | some common functions                                                                                                                                                                                                                                           |
+| `tests/test_model.py`                      | unit tests by pytest for `QwenModel`, including FastAPI endpoints, and comparasons between `prefill(seq)` and `prefill(sub_seq) + decode(rest_seq)` step by step , between `QwenModel` and `modeling_qwen2.py`, between that with `KV cache` and non-`KV cache` |
+| `tests/test_engine.py`                     | unit tests for generation loop, comparason between `generate` and `async_generate`                                                                                                                                                                              |
+| `tests/test_api.py`                        | unit tests for FastAPI                                                                                                                                                                                                                                          |
+| `tests/test_rope.py`                       | unit tests by pytest for `rope.py`                                                                                                                                                                                                                              |
+| `docs/qwen25_inference_alignment_notes.md` | Engineering notes — the pitfalls hit while aligning against HuggingFace, and the methodology used to find them                                                                                                                                                  |
 
 ---
 
@@ -63,12 +70,22 @@ huggingface-cli download Qwen/Qwen2.5-0.5B --local-dir ../qwen2.5-0.5b
 pytest
 
 # start FastAPI service
-uvicorn main:app --host 0.0.0.0 --port 8001
+uvicorn qwen.api:app --host 0.0.0.0 --port 8001
 
 # test
-curl -N -X POST "http://127.0.0.1:8001/generate_stream_plain"      -H "Content-Type: application/json"      -d '{"prompt": "The capital of France is", "max_output_len": 400}'
-The capital of France is Paris. It was founded in 789 AD by Charlemagne, the last king of the Carolingian dynasty. The city has a long and rich history dating back to the Roman Empire. In fact, it was the first European capital to be built on land that would later become the French Riviera.
-Paris is also home to many famous landmarks such as Notre Dame Cathedral, the Eiffel Tower, the Louvre Museum, the Arc de Triomphe, and the Champs-Élysées. The city is also known for its vibrant culture, including jazz music, ballet, and theater performances. Paris is a popular tourist destination, with millions of visitors each year. Its rich history and beautiful architecture make it an important cultural center in Europe.<|endoftext|>[DONE]
+curl -N -X POST "http://127.0.0.1:8001/generate_stream_plain"      -H "Content-Type: application/json"      -d '{"prompt": "The capital of France is", "max_new_tokens": 400}'
+The capital of France is Paris. The French language belongs to the Romance languages and was spoken in France from 12th century onwards until 1804 when it was banned due to its influence on French culture.
+Paris, the capital city of France, has been a UNESCO World Heritage Site since 1985. It was also listed as a City of History and Culture in 2013 by the Government of France.
+Paris is home to many famous landmarks such as Notre Dame Cathedral, the Louvre Museum, the Eiffel Tower, Champs-Élysées, and the Arc de Triomphe.
+It's important to note that there are many other cities with their own unique cultural attractions. Some examples include:
+- Lyon: Known for its stunning medieval architecture
+- Nice: Famous for its beautiful beaches and historic harbor
+- Marseille: Home to the famous Port du Plein and its vibrant nightlife scene
+- Toulouse: A city known for its wine industry and rich history
+In conclusion, Paris is a major cultural hub and a UNESCO World Heritage site that offers visitors an opportunity to explore its rich history, architecture, and diverse cultural offerings. Its status as a UNESCO World Heritage Site underscores its importance as a global cultural and historical center. Visitors can enjoy breathtaking views of the Seine River, marvel at the iconic Notre Dame Cathedral, or take a stroll through the charming streets of the Latin Quarter. The city is also renowned for its cuisine, art, music, and fashion. Whether you're a fan of French culture, gastronomy, or simply looking for a relaxing destination, Paris is sure to offer something special. So if you ever find yourself in Paris, don't miss out! ���✨
+Note: The information provided here is general and may not reflect current events or specific locations. Always check local authorities' latest updates before visiting any location. #ParisCulture #History #Cuisine #Relaxation #WorldHeritage #UNESCO #France ��[DONE]
+
+
 ```
 
 `pytest` results all pass as expected. The letters from the `curl` response display like a typewriter.
@@ -105,9 +122,8 @@ The full set of pitfalls found this way — RoPE `inv_freq` exponent, `view`/`tr
 
 ## Roadmap
 
-1. **Sampling** — greedy + temperature / top-p, decoupled from the model.
-2. **Batched decode** — padding / position handling for `bsz > 1`.
-3. **Performance** — move to GPU, profile against the 7B / A10 target.
+1. **Batched decode** — padding / position handling for `bsz > 1`.
+2. **Performance** — move to GPU, profile against the 7B / A10 target.
 
 ---
 

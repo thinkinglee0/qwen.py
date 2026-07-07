@@ -5,8 +5,9 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import logging
 
-from qwen import QwenModel
-from config import ModelConfig
+from qwen.model import QwenModel
+from qwen.config import ModelConfig
+from qwen.engine import async_generate
 
 
 logging.basicConfig(
@@ -32,8 +33,13 @@ async def lifespan(app: FastAPI):
 
 class GenRequest(BaseModel):
     prompt: str
-    max_output_len: int = 100
-    # temperature: float = 0.7
+    max_new_tokens: int = 100
+    temperature: float | None = None
+    top_k: float | None = None
+    top_p: float | None = None
+    repetition_penalty: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
 
 app = FastAPI(lifespan=lifespan)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
@@ -50,12 +56,13 @@ async def stream():
             yield w
     return StreamingResponse(gen(), media_type="text/plain")
 
+
 def _generate_stream_imp(req: GenRequest, model: QwenModel,
                          prefix: str="data: ", suffix: str="\n\n"):
     input_ids = tokenizer(req.prompt, return_tensors="pt").input_ids.to(model.device)
 
     async def sse():
-        async for token in model.async_generate(input_ids, req.max_output_len):
+        async for token in async_generate(model, input_ids, max_new_tokens=req.max_new_tokens):
             piece = tokenizer.decode(token[0])
             yield prefix+piece+suffix
         yield prefix+"[DONE]"+suffix

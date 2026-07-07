@@ -31,3 +31,15 @@ def compare(target, ref, name="", rtol=1e-3, atol=1e-3):
         print(f"[FAIL] {name}\n{e}")
         return False
 
+
+def pad_token_ids(seqs, vocab_size, device):
+    # seqs: list[list[int]];空序列(还没生成)给空 list
+    max_len = max((len(s) for s in seqs), default=1)
+    max_len = max(max_len, 1)
+    out = torch.full((len(seqs), max_len), vocab_size,
+                     dtype=torch.long, device=device)
+    for i, s in enumerate(seqs):
+        if s:
+            out[i, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+    return out
+

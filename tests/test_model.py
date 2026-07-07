@@ -1,54 +1,13 @@
 import pytest
-import pytest_asyncio
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
-from httpx import ASGITransport, AsyncClient
-from main import app, get_model_client
 
-from qwen import QwenModel, make_causal_mask
-from utils import resolve_device, default_dtype
-from config import ModelConfig
-
-# constant variables
-MODEL_DIR = "../qwen2.5-0.5b"
-CLASSIC_PROMPT = "The capital of France is"
-MAX_NEW_TOKEN_NUM = 40
+from qwen.model import KVCache, init_kv_cache2, make_causal_mask, init_kv_cache
+from qwen.utils import resolve_device, default_dtype
+from constants import *
 
 
 logger = logging.getLogger(__name__)
-
-@pytest.fixture(scope="module")
-def tokenizer():
-    return AutoTokenizer.from_pretrained(MODEL_DIR)
-
-@pytest.fixture(scope="module")
-def inputs(tokenizer):
-    return tokenizer(CLASSIC_PROMPT, return_tensors="pt")    # transformers.tokenization_utils_base.BatchEncoding {input_ids, attention_mask}
-
-# my implementation
-@pytest.fixture(scope="module")
-def target_config():
-    return ModelConfig.from_pretrained(MODEL_DIR)       # load weights
-
-@pytest.fixture(scope="module")
-def target_model(target_config):
-    return QwenModel(target_config)
-
-@pytest_asyncio.fixture(loop_scope="module")
-async def api_client(target_model):
-    app.dependency_overrides[get_model_client] = lambda: target_model
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    app.dependency_overrides.clear()
-
-# instance of modeling_qwen2.py from transformers
-@pytest.fixture(scope="module")
-def ref_model():
-    ref_model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32, attn_implementation="eager")
-    ref_model.eval()
-    return ref_model
 
 
 def sampling(tok, last_logit):
@@ -117,14 +76,16 @@ def test_causal_mask():
 @pytest.mark.parametrize("use_cache", [True, False])
 def test_forward_and_kv_cache_correctness(target_model, use_cache: bool):
     torch.manual_seed(0)        # ramdom seed, to fix the executing process.
+    bsz = 1
     S, P = 100, 5
-    ids = torch.randint(0, target_model.config.vocab_size, (1, S))
+    ids = torch.randint(0, target_model.config.vocab_size, (bsz, S))
 
     # sample 1: prefill
     full = target_model.forward(ids, cache=None).logits         # [1, S, V], no cache
 
     # sample 2: prefill + decode
-    output = target_model.forward(ids[:, :P], cache=None)       # prefill P tokens
+    cache: KVCache | None = init_kv_cache2(target_model.config, bsz, target_model.device, target_model.dtype) if use_cache else None
+    output = target_model.forward(ids[:, :P], cache=cache)       # prefill P tokens
     cache = output.past_key_values
     incremental = [output.logits[:, -1, :]]     # logit at position P-1
     for t in range(P, S):                       # decode the rest 1-by-1
@@ -177,53 +138,4 @@ def test_forward_comparason_with_reference(target_model, ref_model, tokenizer, i
         # shape [bsz, seq_len]
         input_ids = torch.cat([input_ids, torch.full((1,1), target_new_token_id)], -1)
 
-def test_generation_comparason_with_reference(target_model, ref_model, tokenizer, inputs: float):
-    logger.info(f"input_ids: {inputs.input_ids.shape}")
-    target_output_token_ids = target_model.generate(inputs.input_ids, MAX_NEW_TOKEN_NUM)
-    target_output_tokens = tokenizer.decode(target_output_token_ids[0])
-    logger.info(f"target_output_tokens: |{target_output_tokens}|")
 
-    ref_output = ref_model.generate(
-        **inputs,
-        max_new_tokens=MAX_NEW_TOKEN_NUM,
-        do_sample=False,
-        temperature=None,
-        top_p=None,
-        top_k=None,
-        num_beams=1,
-    )
-    ref_output_tokens = tokenizer.decode(ref_output[0])   # bsz=0
-    logger.info(f"   ref_output_tokens: |{ref_output_tokens}|")
-    if target_output_tokens != ref_output_tokens:
-        logger.info("comparison result: differ")
-    else:
-        logger.info("comparison result: match")
-    
-    assert target_output_tokens == ref_output_tokens
-
-@pytest.mark.asyncio
-async def test_streaming_generation(target_model, tokenizer, inputs):
-    stream_chunks = [tok async for tok in target_model.async_generate(inputs.input_ids, MAX_NEW_TOKEN_NUM)]
-    async_ids = torch.cat([t.reshape(t.shape[0], -1) for t in stream_chunks], dim=1)
-    logger.info(f"async output: |{tokenizer.decode(async_ids[0])}|")
-    
-    sync_ids = target_model.generate(inputs.input_ids, MAX_NEW_TOKEN_NUM)
-    logger.info(f"sync output : |{tokenizer.decode(sync_ids[0])}|")
-
-    assert torch.equal(async_ids, sync_ids)
-
-@pytest.mark.asyncio
-async def test_endpoint_health(api_client):
-    r = await api_client.get("/health")
-    assert r.status_code == 200
-
-@pytest.mark.asyncio
-async def test_endpoint_generate_stream(api_client):
-    chunks = []
-    async with api_client.stream("POST", "/generate_stream", json={"prompt": CLASSIC_PROMPT}) as resp:
-        assert resp.status_code == 200
-        async for line in resp.aiter_lines():
-            if line.startswith("data: "):
-                chunks.append(line.removeprefix("data: ").strip())
-    logger.info(f"fastapi output: |{chunks}|")
-    assert chunks and chunks[-1] == "[DONE]"
