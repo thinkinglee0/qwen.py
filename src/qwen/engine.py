@@ -70,7 +70,7 @@ def _decode_step(model: QwenModel,
             dtype=model.dtype
         )
 
-    output.logits = apply_penalties(output.logits[:, -1, :], prompt_tokens, output_tokens, rep_pen, freq_pen, pres_pen, model.config.vocab_size)
+    output.logits = apply_penalties(output.logits, prompt_tokens, output_tokens, rep_pen, freq_pen, pres_pen, model.config.vocab_size)
     if model.config.do_sample:
         next_tokens = sample(output.logits, temperature=temperature, top_k=top_k, top_p=top_p)
     else:

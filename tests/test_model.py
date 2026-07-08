@@ -81,13 +81,13 @@ def test_forward_and_kv_cache_correctness(target_model, use_cache: bool):
     ids = torch.randint(0, target_model.config.vocab_size, (bsz, S))
 
     # sample 1: prefill
-    full = target_model.forward(ids, cache=None).logits         # [1, S, V], no cache
+    logits_only_prefill = target_model.forward(ids, cache=None).logits         # [bsz, V], no cache
 
     # sample 2: prefill + decode
     cache: KVCache | None = init_kv_cache2(target_model.config, bsz, target_model.device, target_model.dtype) if use_cache else None
     output = target_model.forward(ids[:, :P], cache=cache)       # prefill P tokens
     cache = output.past_key_values
-    incremental = [output.logits[:, -1, :]]     # logit at position P-1
+    logits_prefill_decode = output.logits       # shape [bsz, V]
     for t in range(P, S):                       # decode the rest 1-by-1
         if use_cache:       # kv cache
             output = target_model.forward(ids[:, t:t+1], cache=list(cache))
@@ -95,15 +95,13 @@ def test_forward_and_kv_cache_correctness(target_model, use_cache: bool):
         else:
             output = target_model.forward(ids[:, :t+1], cache=None)
         
-        incremental.append(output.logits[:, -1, :])
+        logits_prefill_decode = output.logits
 
-    # shape [bsz, seq_len, d]
-    full_slice = torch.stack([full[:, p, :] for p in range(P-1, S)], 1)[0]
-    inc_stack  = torch.cat(incremental, 0)
-    diff = (full_slice - inc_stack).abs()
+    # shape [bsz, V]
+    diff = (logits_only_prefill - logits_prefill_decode).abs()
     logger.info(f"max abs logit diff: {diff.max().item():e}")
     assert diff.max().item() < 1e-3          # safe upper bound of FP32 floor
-    assert (full_slice.argmax(-1) != inc_stack.argmax(-1)).sum() == 0
+    assert (logits_only_prefill.argmax(-1) != logits_prefill_decode.argmax(-1)).sum() == 0
 
 # target_model == ref_model?
 def test_forward_comparason_with_reference_on_math(target_model, ref_model):
@@ -114,9 +112,9 @@ def test_forward_comparason_with_reference_on_math(target_model, ref_model):
     for index in range(P, S):
         target_output = target_model.forward(input_ids)
         ref_output = ref_model.forward(input_ids)
-        new_token_id = target_output.logits[0, -1].argmax()
+        new_token_id = target_output.logits[0].argmax()
 
-        torch.testing.assert_close(target_output.logits, ref_output.logits, rtol=1e-3, atol=1e-3,
+        torch.testing.assert_close(target_output.logits, ref_output.logits[:, -1, :], rtol=1e-3, atol=1e-3,
                                    msg=lambda s: f"logits mismatch, index={index}\n{s}")
 
         # shape [bsz, seq_len]
@@ -128,11 +126,11 @@ def test_forward_comparason_with_reference(target_model, ref_model, tokenizer, i
     for index in range(MAX_NEW_TOKEN_NUM):
         target_output = target_model.forward(input_ids)
         ref_output = ref_model.forward(input_ids)
-        target_new_token, target_new_token_id = sampling(tokenizer, target_output.logits[0, -1])
-        ref_new_token, ref_new_token_id = sampling(tokenizer, ref_output.logits[0, -1])
+        target_new_token, target_new_token_id = sampling(tokenizer, target_output.logits[0])
+        ref_new_token, ref_new_token_id = sampling(tokenizer, ref_output.logits[0])
         logger.info(f"index: {index}, target: {target_new_token_id} - |{target_new_token}| <-> ref: {ref_new_token_id} - |{ref_new_token}|")
 
-        torch.testing.assert_close(target_output.logits, ref_output.logits, rtol=1e-3, atol=1e-3,
+        torch.testing.assert_close(target_output.logits, ref_output.logits[:, -1, :], rtol=1e-3, atol=1e-3,
                                    msg=lambda s: f"logits mismatch, index={index}\n{s}")
 
         # shape [bsz, seq_len]

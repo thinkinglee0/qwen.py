@@ -156,8 +156,10 @@ class QwenModel(nn.Module):
             # residual connection
             hidden_states = residual + hidden_states
 
-        hidden_states = RMSNorm(hidden_states, self.weights['model.norm.weight'], eps=self.config.rms_norm_eps)
-        logits = self.unembed(hidden_states)
+        # lm head, hidden_states shape [bsz, seq_len, hidden_size]
+        # last_hidden_states shape [bsz, hidden_size]
+        last_hidden_states = RMSNorm(hidden_states[:, -1, :], self.weights['model.norm.weight'], eps=self.config.rms_norm_eps)
+        logits = self.unembed(last_hidden_states)
 
         # output
         output = CausalLMOutputWithPast()
