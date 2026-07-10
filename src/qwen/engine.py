@@ -4,7 +4,8 @@ import torch
 import asyncio
 from typing import AsyncIterator
 
-from qwen.model import QwenModel, init_kv_cache2
+from qwen.model import QwenModel
+from qwen.cache import init_kv_cache2
 from qwen.sampling import apply_penalties, sample
 
 logger = logging.getLogger(__name__)

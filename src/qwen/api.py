@@ -15,7 +15,7 @@ logging.basicConfig(
     format="{asctime} [{levelname}] {filename}:{lineno} - {message}",
     style="{",
     handlers=[
-        logging.FileHandler("t.log"),
+        logging.FileHandler("log/app.log"),
         logging.StreamHandler(),
     ],
 )

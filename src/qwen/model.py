@@ -1,3 +1,4 @@
+import dataclasses
 import math
 import torch
 from torch import nn
@@ -5,53 +6,14 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 import logging
 
 from qwen.config import ModelConfig
+from qwen.decode_layer import DecoderLayer
 from qwen.rope import init_rope
-from qwen.utils import resolve_device, default_dtype
-
-# index: cache[layer_idx] = (k, v)
-# k, v shape: (B, n_kv_heads, seq_len_so_far, head_dim)
-KVCache = list[tuple[torch.Tensor, torch.Tensor]]
+from qwen.cache import KVCache
+from qwen.utils import RMSNorm
 
 logger = logging.getLogger(__name__)
 
-def init_kv_cache2(config: ModelConfig,
-                   bsz: int,
-                   device: torch.device,
-                   dtype: torch.dtype):
-    return init_kv_cache(config.num_hidden_layers, bsz, config.num_key_value_heads, config.head_dim, device, dtype)
-
-def init_kv_cache(n_layers: int,
-                  bsz: int,
-                  n_kv_heads: int,
-                  head_dim: int,
-                  device: torch.device,
-                  dtype: torch.dtype,
-                  ):
-    return [
-        (
-            # seq_len = 0
-            torch.zeros(bsz, n_kv_heads, 0, head_dim, device=device, dtype=dtype),
-            torch.zeros(bsz, n_kv_heads, 0, head_dim, device=device, dtype=dtype),
-        )
-        for _ in range(n_layers)
-    ]
-
-def RMSNorm(hidden_states : torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    in_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)     # upcast to float32
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + eps)
-    return weight * hidden_states.to(in_dtype)
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return hidden_states
-    
-    bsz, num_key_value_heads, slen, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(bsz, num_key_value_heads, n_rep, slen, head_dim).contiguous().view(bsz, num_key_value_heads * n_rep, slen, head_dim)
-    return hidden_states
-
-def make_causal_mask(q_len: int, k_len: int, device: torch.device, dtype: torch.dtype,) -> torch.Tensor:
+def bottom_right_causal_bias(q_len: int, k_len: int, device: torch.device, dtype: torch.dtype,) -> torch.Tensor:
     # position_ids: the i-th query token maps to global position (k_len - q_len + i)
     # allow attending to j <= k_len - q_len + i, i.e. mask out j > k_len - q_len + i  <=>  j - i >= k_len - q_len + 1
     mask = torch.full((q_len, k_len), float("-inf"), device=device, dtype=dtype)
@@ -61,35 +23,34 @@ def make_causal_mask(q_len: int, k_len: int, device: torch.device, dtype: torch.
 class QwenModel(nn.Module):
     def __init__(self, config: ModelConfig, max_bsz: int = 1):
         super().__init__()
-        self.config = config
+
+        # isolate from the session-scoped pytest fixture `target_config` to avoid cross-test mutation
+        self.config = dataclasses.replace(config, weights=None)
+        self.config.weights = config.weights
         self.weights = config.weights
+
+        self.device = self.config.device     # resolved in config
+        self.dtype = self.config.dtype
 
         self.rope = init_rope(self.config)
 
-        # Initialize model parameters based on config
-        self.attn_dim = self.config.hidden_size
-        self.num_query_heads = self.config.num_attention_heads
-        self.num_key_value_heads = self.config.num_key_value_heads
-        self.head_dim = self.config.head_dim
-
-        self.max_bsz = max_bsz
-        self.device = resolve_device()
-        self.dtype = default_dtype(self.device)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(self.config, layer_idx, self.rope) for layer_idx in range(self.config.num_hidden_layers)]
+        )
 
     def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.weights['model.embed_tokens.weight'][input_ids]
 
-    def unembed(self, hidden_states: torch.torch) -> torch.Tensor:
+    def unembed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # logits
         return hidden_states @ self.weights['lm_head.weight'].transpose(-2, -1)
-    
-    def attention(self, query_states: torch.Tensor, key_states: torch.Tensor, value_states: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
-        attn_scores = query_states @ key_states.transpose(-2, -1) /  math.sqrt(self.head_dim)
-        attn_scores = attn_scores + causal_mask
 
-        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = attn_weights @ value_states
-        return attn_output
+    def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # lm head, hidden_states shape [bsz, seq_len, hidden_size]
+        # last_hidden_states shape [bsz, hidden_size]
+        last_hidden_states = RMSNorm(hidden_states[:, -1, :], self.weights['model.norm.weight'], eps=self.config.rms_norm_eps)
+        logits = self.unembed(last_hidden_states)
+        return logits
 
     @torch.no_grad()
     def forward(self, input_ids: torch.Tensor, cache: KVCache | None = None) -> CausalLMOutputWithPast:
@@ -97,69 +58,12 @@ class QwenModel(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         past_len = 0 if cache is None else cache[0][0].shape[2]
 
-        causal_mask = make_causal_mask(q_len, q_len+past_len, hidden_states.device, hidden_states.dtype)
+        causal_bias = bottom_right_causal_bias(q_len, q_len+past_len, hidden_states.device, hidden_states.dtype)
 
-        for layer in range(self.config.num_hidden_layers):
-            # pre-attention norm
-            residual = hidden_states
-            hidden_states = RMSNorm(hidden_states, self.weights[f'model.layers.{layer}.input_layernorm.weight'], eps=self.config.rms_norm_eps)
+        for layer in self.layers:
+            hidden_states, cache = layer.forward(hidden_states, cache, causal_bias, past_len)
 
-            # projection
-            query_states = hidden_states @ self.weights[f'model.layers.{layer}.self_attn.q_proj.weight'].transpose(-2, -1) + self.weights[f'model.layers.{layer}.self_attn.q_proj.bias']
-            key_states = hidden_states @ self.weights[f'model.layers.{layer}.self_attn.k_proj.weight'].transpose(-2, -1) + self.weights[f'model.layers.{layer}.self_attn.k_proj.bias']
-            value_states = hidden_states @ self.weights[f'model.layers.{layer}.self_attn.v_proj.weight'].transpose(-2, -1) + self.weights[f'model.layers.{layer}.self_attn.v_proj.bias']
-
-            # reshape for multi-head attention
-            query_states = query_states.view(bsz, q_len, self.num_query_heads, self.head_dim).transpose(1, 2)
-            key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-            # rope
-            query_states, key_states = self.rope(query_states, key_states, past_len)
-
-            #kv cache
-            if cache is not None:
-                keys, vals = cache[layer]
-                key_states = torch.cat([keys, key_states], 2)
-                value_states = torch.cat([vals, value_states], 2)
-                cache[layer] = (key_states, value_states)  # upate cache
-
-            # repeat k,v for grouped-query attention (GQA)
-            if self.num_query_heads % self.config.num_key_value_heads != 0:
-                raise ValueError(f"num_query_heads ({self.num_query_heads}) must be divisible by num_key_value_heads ({self.config.num_key_value_heads})")
-            n_rep = self.num_query_heads // self.config.num_key_value_heads
-        
-            key_states = repeat_kv(key_states, n_rep)
-            value_states = repeat_kv(value_states, n_rep)
-
-            # attention
-            hidden_states = self.attention(query_states, key_states, value_states, causal_mask)
-            # return key_states, value_states
-
-            # output projection
-            hidden_states = hidden_states.transpose(1, 2).contiguous().reshape(bsz, q_len, self.attn_dim)
-            hidden_states = hidden_states @ self.weights[f'model.layers.{layer}.self_attn.o_proj.weight'].transpose(-2, -1)
-
-            #residual connection
-            hidden_states = residual + hidden_states
-
-            # pre-mlp norm
-            residual = hidden_states
-            hidden_states = RMSNorm(hidden_states, self.weights[f'model.layers.{layer}.post_attention_layernorm.weight'], eps=self.config.rms_norm_eps)
-
-            # mlp
-            gate = hidden_states @ self.weights[f'model.layers.{layer}.mlp.gate_proj.weight'].transpose(-2, -1)
-            up = hidden_states @ self.weights[f'model.layers.{layer}.mlp.up_proj.weight'].transpose(-2, -1)
-            mlp_act = torch.nn.functional.silu(gate) * up
-            hidden_states = mlp_act @ self.weights[f'model.layers.{layer}.mlp.down_proj.weight'].transpose(-2, -1)
-
-            # residual connection
-            hidden_states = residual + hidden_states
-
-        # lm head, hidden_states shape [bsz, seq_len, hidden_size]
-        # last_hidden_states shape [bsz, hidden_size]
-        last_hidden_states = RMSNorm(hidden_states[:, -1, :], self.weights['model.norm.weight'], eps=self.config.rms_norm_eps)
-        logits = self.unembed(last_hidden_states)
+        logits = self.lm_head(hidden_states)
 
         # output
         output = CausalLMOutputWithPast()
@@ -167,7 +71,5 @@ class QwenModel(nn.Module):
             output.past_key_values = tuple(cache)
         output.logits = logits
         return output
-
-
 
 

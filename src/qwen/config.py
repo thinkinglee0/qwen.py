@@ -8,6 +8,8 @@ from safetensors.torch import load_file
 import dataclasses
 import logging
 
+from qwen.utils import resolve_device, default_dtype
+
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,9 @@ class ModelConfig():
     # other
     model_dir: str = ""
     weights: Any | None = None
-    
+    device: torch.device | None = None
+    dtype: torch.dtype | None = None
+
     def __post_init__(self):
         if self.head_dim == 0:
             self.head_dim = self.hidden_size // self.num_attention_heads
@@ -71,9 +75,10 @@ class ModelConfig():
         if self.rope_scaling is None:
             self.rope_scaling = {"rope_type": "default"}
 
-        logger.info(f"config: {self}")
-
-        self.weights = load_qwen_weights(self)
+        if self.device is None:
+            self.device = resolve_device()
+        if self.dtype is None:
+            self.dtype = default_dtype(self.device)
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":
@@ -88,7 +93,13 @@ class ModelConfig():
 
         # keep only the fields declared on the dataclass; silently drop any extra keys
         valid = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in raw.items() if k in valid})
+        config = cls(**{k: v for k, v in raw.items() if k in valid})
+
+        logger.info(f"config: {config}")
+
+        config.weights = load_qwen_weights(config, config.dtype)
+
+        return config
 
 def load_qwen_weights(config: ModelConfig, dtype=torch.float32):
     logger.info(f"load_qwen_weights, dir: {config.model_dir}")

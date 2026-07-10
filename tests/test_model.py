@@ -2,7 +2,8 @@ import pytest
 import torch
 import logging
 
-from qwen.model import KVCache, init_kv_cache2, make_causal_mask, init_kv_cache
+from qwen.model import KVCache, bottom_right_causal_bias
+from qwen.cache import init_kv_cache2
 from qwen.utils import resolve_device, default_dtype
 from constants import *
 
@@ -35,7 +36,7 @@ def test_causal_mask():
     m = float("-inf")   # masked
     z = 0.0             # zero
 
-    mask = make_causal_mask(2, 2, 
+    mask = bottom_right_causal_bias(2, 2, 
                             device=get_expected_value("device"), 
                             dtype=get_expected_value("dtype"))
     expected = torch.tensor([[[
@@ -44,7 +45,7 @@ def test_causal_mask():
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
-    mask = make_causal_mask(3, 3, 
+    mask = bottom_right_causal_bias(3, 3, 
                             device=get_expected_value("device"), 
                             dtype=get_expected_value("dtype"))
     expected = torch.tensor([[[
@@ -54,7 +55,7 @@ def test_causal_mask():
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
-    mask = make_causal_mask(1, 2, 
+    mask = bottom_right_causal_bias(1, 2, 
                             device=get_expected_value("device"), 
                             dtype=get_expected_value("dtype"))
     # expected = torch.zeros(1, 1, 1, 2)
@@ -63,7 +64,7 @@ def test_causal_mask():
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
-    mask = make_causal_mask(2, 3, 
+    mask = bottom_right_causal_bias(2, 3, 
                             device=get_expected_value("device"), 
                             dtype=get_expected_value("dtype"))
     expected = torch.tensor([[[
@@ -72,8 +73,41 @@ def test_causal_mask():
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
+# target_model == ref_model?
+def test_forward_compared_with_reference_on_math(target_model, ref_model):
+    torch.manual_seed(0)        # ramdom seed, to fix the executing process.
+    S, P = 100, 5
+    input_ids = torch.randint(0, target_model.config.vocab_size, (1, P))
+
+    for index in range(P, S):
+        target_output = target_model.forward(input_ids)
+        ref_output = ref_model.forward(input_ids)
+        new_token_id = target_output.logits[0].argmax()
+
+        torch.testing.assert_close(target_output.logits, ref_output.logits[:, -1, :], rtol=1e-3, atol=1e-3,
+                                   msg=lambda s: f"logits mismatch, index={index}\n{s}")
+
+        # shape [bsz, seq_len]
+        input_ids = torch.cat([input_ids, torch.full((1,1), new_token_id)], -1)
+
+# fixed inputs, (e.g.: The capital of France is)
+def test_forward_compared_with_reference(target_model, ref_model, tokenizer, inputs):
+    input_ids = inputs.input_ids.detach().clone()
+    for index in range(MAX_NEW_TOKEN_NUM):
+        target_output = target_model.forward(input_ids)
+        ref_output = ref_model.forward(input_ids)
+        target_new_token, target_new_token_id = sampling(tokenizer, target_output.logits[0])
+        ref_new_token, ref_new_token_id = sampling(tokenizer, ref_output.logits[0])
+        logger.info(f"index: {index}, target: {target_new_token_id} - |{target_new_token}| <-> ref: {ref_new_token_id} - |{ref_new_token}|")
+
+        torch.testing.assert_close(target_output.logits, ref_output.logits[:, -1, :], rtol=1e-3, atol=1e-3,
+                                   msg=lambda s: f"logits mismatch, index={index}\n{s}")
+
+        # shape [bsz, seq_len]
+        input_ids = torch.cat([input_ids, torch.full((1,1), target_new_token_id)], -1)
+
 # prefill(S) == prefill(P) + decode(range(P, S))?
-@pytest.mark.parametrize("use_cache", [True, False])
+@pytest.mark.parametrize("use_cache", [False, True])
 def test_forward_and_kv_cache_correctness(target_model, use_cache: bool):
     torch.manual_seed(0)        # ramdom seed, to fix the executing process.
     bsz = 1
@@ -102,38 +136,5 @@ def test_forward_and_kv_cache_correctness(target_model, use_cache: bool):
     logger.info(f"max abs logit diff: {diff.max().item():e}")
     assert diff.max().item() < 1e-3          # safe upper bound of FP32 floor
     assert (logits_only_prefill.argmax(-1) != logits_prefill_decode.argmax(-1)).sum() == 0
-
-# target_model == ref_model?
-def test_forward_comparason_with_reference_on_math(target_model, ref_model):
-    torch.manual_seed(0)        # ramdom seed, to fix the executing process.
-    S, P = 100, 5
-    input_ids = torch.randint(0, target_model.config.vocab_size, (1, P))
-
-    for index in range(P, S):
-        target_output = target_model.forward(input_ids)
-        ref_output = ref_model.forward(input_ids)
-        new_token_id = target_output.logits[0].argmax()
-
-        torch.testing.assert_close(target_output.logits, ref_output.logits[:, -1, :], rtol=1e-3, atol=1e-3,
-                                   msg=lambda s: f"logits mismatch, index={index}\n{s}")
-
-        # shape [bsz, seq_len]
-        input_ids = torch.cat([input_ids, torch.full((1,1), new_token_id)], -1)
-
-# fixed inputs, (e.g.: The capital of France is)
-def test_forward_comparason_with_reference(target_model, ref_model, tokenizer, inputs):
-    input_ids = inputs.input_ids.detach().clone()
-    for index in range(MAX_NEW_TOKEN_NUM):
-        target_output = target_model.forward(input_ids)
-        ref_output = ref_model.forward(input_ids)
-        target_new_token, target_new_token_id = sampling(tokenizer, target_output.logits[0])
-        ref_new_token, ref_new_token_id = sampling(tokenizer, ref_output.logits[0])
-        logger.info(f"index: {index}, target: {target_new_token_id} - |{target_new_token}| <-> ref: {ref_new_token_id} - |{ref_new_token}|")
-
-        torch.testing.assert_close(target_output.logits, ref_output.logits[:, -1, :], rtol=1e-3, atol=1e-3,
-                                   msg=lambda s: f"logits mismatch, index={index}\n{s}")
-
-        # shape [bsz, seq_len]
-        input_ids = torch.cat([input_ids, torch.full((1,1), target_new_token_id)], -1)
 
 

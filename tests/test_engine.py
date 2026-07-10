@@ -9,21 +9,15 @@ from constants import MAX_NEW_TOKEN_NUM
 logger = logging.getLogger(__name__)
 
 
-def test_generation_compared_with_reference(target_model, ref_model, tokenizer, inputs):
+def test_generation_compared_with_reference(target_model_with_function_scope, ref_model, tokenizer, inputs):
     rep_pen_off = 1.
     temp_greedy = 0.
-    try:
-        original_repetition_penalty = target_model.config.repetition_penalty
-        original_temperature = target_model.config.temperature
 
-        target_model.config.repetition_penalty = rep_pen_off
-        target_model.config.temperature = temp_greedy
-        target_output_token_ids = generate(target_model, inputs.input_ids, max_new_tokens=MAX_NEW_TOKEN_NUM)
-        target_output_tokens = tokenizer.decode(target_output_token_ids[0])
-        logger.info(f"target_output_tokens: |{target_output_tokens}|")
-    finally:
-        target_model.config.repetition_penalty = original_repetition_penalty
-        target_model.config.temperature = original_temperature
+    target_model_with_function_scope.config.repetition_penalty = rep_pen_off
+    target_model_with_function_scope.config.temperature = temp_greedy
+    target_output_token_ids = generate(target_model_with_function_scope, inputs.input_ids, max_new_tokens=MAX_NEW_TOKEN_NUM)
+    target_output_tokens = tokenizer.decode(target_output_token_ids[0])
+    logger.info(f"target_output_tokens: |{target_output_tokens}|")
 
     try:
         original_repetition_penalty = ref_model.generation_config.repetition_penalty
