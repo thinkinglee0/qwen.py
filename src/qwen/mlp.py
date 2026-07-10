@@ -4,16 +4,18 @@ from torch import nn
 from qwen.config import ModelConfig
 
 class MLP(nn.Module):
-    def __init__(self, cfg: ModelConfig, layer_index: int):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.weights = cfg.weights
-        self.layer_index = layer_index
+
+        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, hidden_states):
         # mlp
-        gate = hidden_states @ self.weights[f'model.layers.{self.layer_index}.mlp.gate_proj.weight'].transpose(-2, -1)
-        up = hidden_states @ self.weights[f'model.layers.{self.layer_index}.mlp.up_proj.weight'].transpose(-2, -1)
+        gate = self.gate_proj(hidden_states)
+        up = self.up_proj(hidden_states)
         mlp_act = torch.nn.functional.silu(gate) * up
-        hidden_states = mlp_act @ self.weights[f'model.layers.{self.layer_index}.mlp.down_proj.weight'].transpose(-2, -1)
+        hidden_states = self.down_proj(mlp_act)
 
         return hidden_states

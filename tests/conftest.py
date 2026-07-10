@@ -4,7 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from constants import *
 from qwen.config import ModelConfig
-from qwen.model import QwenModel
+from qwen.model import QwenForCausalLM
 
 
 @pytest.fixture(scope="session")
@@ -23,11 +23,11 @@ def target_config():
 
 @pytest.fixture(scope="session")
 def target_model(target_config):
-    return QwenModel(target_config)
+    return QwenForCausalLM(target_config)
 
 @pytest.fixture(scope="function")
 def target_model_with_function_scope(target_config):
-    return QwenModel(target_config)
+    return QwenForCausalLM(target_config)
 
 # instance of modeling_qwen2.py from transformers
 @pytest.fixture(scope="session")

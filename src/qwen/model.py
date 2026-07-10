@@ -7,7 +7,6 @@ import logging
 
 from qwen.config import ModelConfig
 from qwen.decode_layer import DecoderLayer
-from qwen.rope import init_rope
 from qwen.cache import KVCache
 from qwen.utils import RMSNorm
 
@@ -24,35 +23,12 @@ class QwenModel(nn.Module):
     def __init__(self, config: ModelConfig, max_bsz: int = 1):
         super().__init__()
 
-        # isolate from the session-scoped pytest fixture `target_config` to avoid cross-test mutation
-        self.config = dataclasses.replace(config, weights=None)
-        self.config.weights = config.weights
-        self.weights = config.weights
-
-        self.device = self.config.device     # resolved in config
-        self.dtype = self.config.dtype
-
-        self.rope = init_rope(self.config)
-
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.layers = nn.ModuleList(
-            [DecoderLayer(self.config, layer_idx, self.rope) for layer_idx in range(self.config.num_hidden_layers)]
+            [DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
 
-    def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.weights['model.embed_tokens.weight'][input_ids]
-
-    def unembed(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # logits
-        return hidden_states @ self.weights['lm_head.weight'].transpose(-2, -1)
-
-    def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # lm head, hidden_states shape [bsz, seq_len, hidden_size]
-        # last_hidden_states shape [bsz, hidden_size]
-        last_hidden_states = RMSNorm(hidden_states[:, -1, :], self.weights['model.norm.weight'], eps=self.config.rms_norm_eps)
-        logits = self.unembed(last_hidden_states)
-        return logits
-
-    @torch.no_grad()
     def forward(self, input_ids: torch.Tensor, cache: KVCache | None = None) -> CausalLMOutputWithPast:
         hidden_states = self.embed_tokens(input_ids)    # [bsz, seq_len, hidden_size]
         bsz, q_len, _ = hidden_states.size()
@@ -63,7 +39,32 @@ class QwenModel(nn.Module):
         for layer in self.layers:
             hidden_states, cache = layer.forward(hidden_states, cache, causal_bias, past_len)
 
-        logits = self.lm_head(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
+class QwenForCausalLM(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.config = dataclasses.replace(cfg, weights=None)
+        self.device = self.config.device     # resolved in config
+        self.dtype = self.config.dtype
+
+        self.model = QwenModel(cfg)
+        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+        missing, unexpected = self.load_state_dict(cfg.weights, strict=False)
+        assert not unexpected, f"stale/renamed keys: {unexpected[:5]}"
+        assert missing in ([], ["lm_head.weight"]), f"missing: {missing}"
+
+        if cfg.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+    @torch.inference_mode()
+    def forward(self, input_ids: torch.Tensor, cache: KVCache | None = None) -> CausalLMOutputWithPast:
+        hidden_states = self.model.forward(input_ids, cache)
+
+        logits = self.lm_head(hidden_states[:, -1, :])
 
         # output
         output = CausalLMOutputWithPast()
@@ -71,5 +72,3 @@ class QwenModel(nn.Module):
             output.past_key_values = tuple(cache)
         output.logits = logits
         return output
-
-

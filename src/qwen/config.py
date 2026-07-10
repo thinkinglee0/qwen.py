@@ -107,12 +107,9 @@ def load_qwen_weights(config: ModelConfig, dtype=torch.float32):
     # cast to desired dtype
     flat = {k: v.to(dtype) if v.is_floating_point() else v for k, v in flat.items()}
 
-    if config.tie_word_embeddings and "lm_head.weight" not in flat:
-        flat["lm_head.weight"] = flat["model.embed_tokens.weight"]
-
     return flat
 
 if __name__ == "__main__":
     model_dir = "../qwen2.5-0.5b"
     config = ModelConfig.from_pretrained(model_dir)
-    print(config)
+    print(config.weights.keys())

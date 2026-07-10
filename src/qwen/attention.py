@@ -10,6 +10,7 @@ import math
 from qwen.config import ModelConfig
 from qwen.rope import BaseRoPE
 from qwen.cache import KVCache
+from qwen.rope import init_rope
 
 logger = logging.getLogger(__name__)
 
@@ -30,24 +31,28 @@ class AttentionMetadata:
 
 
 class Attention(nn.Module):
-    def __init__(self, cfg: ModelConfig, layer_index: int, rope: BaseRoPE):
+    def __init__(self, cfg: ModelConfig, layer_index: int):
         super().__init__()
-        self.weights = cfg.weights
         self.layer_index = layer_index
-        self.rope = rope
+        self.rope = init_rope(cfg)
 
-        self.num_query_heads = cfg.num_attention_heads      # 14
-        self.num_key_value_heads = cfg.num_key_value_heads      # 2   (GQA)
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads  # 64
+        self.num_query_heads = cfg.num_attention_heads
+        self.num_key_value_heads = cfg.num_key_value_heads
+        self.head_dim = cfg.head_dim
         self.attn_dim = cfg.hidden_size
+
+        self.q_proj = nn.Linear(cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim, bias=True)
+        self.k_proj = nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, bias=True)
+        self.v_proj = nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, bias=True)
+        self.o_proj = nn.Linear(cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size, bias=False)
 
     def forward(self, hidden_states: Tensor, meta: AttentionMetadata) -> Tensor:
         bsz, q_len, _ = hidden_states.size()
 
         # projection
-        query_states = hidden_states @ self.weights[f'model.layers.{self.layer_index}.self_attn.q_proj.weight'].transpose(-2, -1) + self.weights[f'model.layers.{self.layer_index}.self_attn.q_proj.bias']
-        key_states = hidden_states @ self.weights[f'model.layers.{self.layer_index}.self_attn.k_proj.weight'].transpose(-2, -1) + self.weights[f'model.layers.{self.layer_index}.self_attn.k_proj.bias']
-        value_states = hidden_states @ self.weights[f'model.layers.{self.layer_index}.self_attn.v_proj.weight'].transpose(-2, -1) + self.weights[f'model.layers.{self.layer_index}.self_attn.v_proj.bias']
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
         # reshape for multi-head attention
         query_states = query_states.view(bsz, q_len, self.num_query_heads, self.head_dim).transpose(1, 2)
@@ -81,7 +86,7 @@ class Attention(nn.Module):
 
         # output projection
         hidden_states = hidden_states.transpose(1, 2).contiguous().reshape(bsz, q_len, self.attn_dim)
-        hidden_states = hidden_states @ self.weights[f'model.layers.{self.layer_index}.self_attn.o_proj.weight'].transpose(-2, -1)
+        hidden_states = self.o_proj(hidden_states)
 
         return hidden_states
 

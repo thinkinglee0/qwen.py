@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import logging
 
-from qwen.model import QwenModel
+from qwen.model import QwenForCausalLM
 from qwen.config import ModelConfig
 from qwen.engine import async_generate
 
@@ -27,7 +27,7 @@ MODEL_DIR = "../qwen2.5-0.5b"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = ModelConfig.from_pretrained(MODEL_DIR)
-    model = QwenModel(cfg)
+    model = QwenForCausalLM(cfg)
     app.state.model_client = model
     yield
 
@@ -46,7 +46,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 
 logger.info("Qwen HTTP service is starting...")
 
-def get_model_client(request: Request) -> QwenModel:
+def get_model_client(request: Request) -> QwenForCausalLM:
     return request.app.state.model_client
 
 @app.get("/health")
@@ -57,7 +57,7 @@ async def stream():
     return StreamingResponse(gen(), media_type="text/plain")
 
 
-def _generate_stream_imp(req: GenRequest, model: QwenModel,
+def _generate_stream_imp(req: GenRequest, model: QwenForCausalLM,
                          prefix: str="data: ", suffix: str="\n\n"):
     input_ids = tokenizer(req.prompt, return_tensors="pt").input_ids.to(model.device)
 
@@ -70,11 +70,11 @@ def _generate_stream_imp(req: GenRequest, model: QwenModel,
     return StreamingResponse(sse(), media_type="text/plain")
 
 @app.post("/generate_stream")
-async def generate_stream(req: GenRequest, model: QwenModel = Depends(get_model_client)):
+async def generate_stream(req: GenRequest, model: QwenForCausalLM = Depends(get_model_client)):
     return _generate_stream_imp(req, model)
 
 # curl -N -X POST
 @app.post("/generate_stream_plain")
-async def generate_stream_plain(req: GenRequest, model: QwenModel = Depends(get_model_client)):
+async def generate_stream_plain(req: GenRequest, model: QwenForCausalLM = Depends(get_model_client)):
     return _generate_stream_imp(req, model, prefix="", suffix="")
 

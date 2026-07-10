@@ -4,7 +4,7 @@ import torch
 import asyncio
 from typing import AsyncIterator
 
-from qwen.model import QwenModel
+from qwen.model import QwenForCausalLM
 from qwen.cache import init_kv_cache2
 from qwen.sampling import apply_penalties, sample
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
-def _decode_step(model: QwenModel,
+def _decode_step(model: QwenForCausalLM,
                     latest_tokens: torch.Tensor,
                     prompt_tokens: torch.Tensor,
                     output_tokens: torch.Tensor,
@@ -79,7 +79,7 @@ def _decode_step(model: QwenModel,
     
     return next_tokens.unsqueeze(0), cache
 
-def generate(model: QwenModel,
+def generate(model: QwenForCausalLM,
                 input_ids: torch.Tensor,
                 temperature: torch.Tensor | None = None,
                 top_k: torch.Tensor | None = None,
@@ -115,7 +115,7 @@ def generate(model: QwenModel,
 
     return torch.cat([input_ids, output_tokens], -1)
 
-async def async_generate(model: QwenModel,
+async def async_generate(model: QwenForCausalLM,
                         input_ids: torch.Tensor,
                         temperature: torch.Tensor | None = None,
                         top_k: torch.Tensor | None = None,
