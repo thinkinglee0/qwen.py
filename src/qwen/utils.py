@@ -44,14 +44,6 @@ def pad_token_ids(seqs, vocab_size, device):
             out[i, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
     return out
 
-
-# def RMSNorm(hidden_states : torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-#     in_dtype = hidden_states.dtype
-#     hidden_states = hidden_states.to(torch.float32)     # upcast to float32
-#     variance = hidden_states.pow(2).mean(-1, keepdim=True)
-#     hidden_states = hidden_states * torch.rsqrt(variance + eps)
-#     return weight * hidden_states.to(in_dtype)
-
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
