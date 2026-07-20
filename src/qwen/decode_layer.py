@@ -18,13 +18,12 @@ class DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    def forward(self, hidden_states, cache: KVCache | None = None, causal_bias: torch.Tensor | None = None, past_len: int = 0):
+    def forward(self, hidden_states, meta: AttentionMetadata):
         # pre-attention norm
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         # self attention
-        meta = AttentionMetadata(cache=cache, causal_bias=causal_bias, past_len=past_len)
         hidden_states = self.self_attn.forward(hidden_states, meta)
         hidden_states = residual + hidden_states
 
@@ -35,4 +34,4 @@ class DecoderLayer(nn.Module):
         hidden_states = self.mlp.forward(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, meta.cache
+        return hidden_states

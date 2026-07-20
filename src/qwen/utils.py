@@ -1,5 +1,8 @@
 import torch
 from torch import nn
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_device(prefer: str | None = None) -> torch.device:
@@ -15,7 +18,7 @@ def default_dtype(device: torch.device) -> torch.dtype:
         return torch.bfloat16        # A10
     return torch.float32             # CPU
 
-def compare(target, ref, name="", rtol=1e-3, atol=1e-3):
+def compare(target, ref, name="", rtol=0, atol=1e-3):
     try:
         torch.testing.assert_close(
             target, ref,
@@ -23,13 +26,13 @@ def compare(target, ref, name="", rtol=1e-3, atol=1e-3):
             check_dtype=False, check_device=False,   # ignore dtype and device
         )
         if isinstance(target, torch.Tensor):
-            print(f"[PASS] {name}, shape={tuple(target.shape)}")
+            logger.info(f"[PASS] {name}, shape={tuple(target.shape)}")
         else:
-            print(f"[PASS] {name}, type={type(target)}")
+            logger.info(f"[PASS] {name}, type={type(target)}")
         return True
     except AssertionError as e:
         # assert_close error messages include shape mismatch / Mismatched elements
-        print(f"[FAIL] {name}\n{e}")
+        logger.error(f"[FAIL] {name}, {e}")
         return False
 
 

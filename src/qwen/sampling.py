@@ -1,27 +1,108 @@
 import logging
 import torch
+from dataclasses import dataclass, InitVar
+
+from qwen.config import ModelConfig
 
 _EPS = 1e-5
 
 
 logger = logging.getLogger(__name__)
 
-def bin_counts_and_mask(tokens, vocab_size, bsz):
-    # tokens: [bsz, max_len], fill it with vocab_size for len(seq)<max_len while padding
-    bc = torch.zeros((bsz, vocab_size + 1),    # padding dimension for padded tokens
-                     dtype=torch.long, device=tokens.device)
-    bc.scatter_add_(1, tokens, torch.ones_like(tokens))     # to count
-    bc = bc[:, :vocab_size]     # remove padding dimension
-    return bc, bc > 0
+@dataclass
+class SamplingMetadata:
+    config: InitVar[ModelConfig]
+    bsz: InitVar[int]
 
-def apply_penalties(logits, prompt_tokens, output_tokens,
+    temperature: torch.Tensor | None = None
+    top_k: torch.Tensor | None = None
+    top_p: torch.Tensor | None = None
+    rep_pen: torch.Tensor | None = None
+    freq_pen: torch.Tensor | None = None
+    pres_pen: torch.Tensor | None = None
+
+    def __post_init__(self, config: ModelConfig, bsz: int):
+        if self.temperature is None:
+            self.temperature = torch.full(
+                size=(bsz,), 
+                fill_value=config.temperature, 
+                device=config.device,
+                dtype=config.dtype
+            )
+        if self.top_k is None:
+            self.top_k = torch.full(
+                size=(bsz,), 
+                fill_value=config.top_k, 
+                device=config.device,
+                dtype=torch.int64
+            )
+        if self.top_p is None:
+            self.top_p = torch.full(
+                size=(bsz,), 
+                fill_value=config.top_p, 
+                device=config.device,
+                dtype=config.dtype
+            )
+        if self.rep_pen is None:
+            self.rep_pen = torch.full(
+                size=(bsz,), 
+                fill_value=config.repetition_penalty, 
+                device=config.device,
+                dtype=config.dtype
+            )
+        if self.freq_pen is None:
+            self.freq_pen = torch.full(
+                size=(bsz,), 
+                fill_value=config.frequency_penalty, 
+                device=config.device,
+                dtype=config.dtype
+            )
+        if self.pres_pen is None:
+            self.pres_pen = torch.full(
+                size=(bsz,), 
+                fill_value=config.presence_penalty, 
+                device=config.device,
+                dtype=config.dtype
+            )
+
+
+def bin_counts_and_mask(
+    token_ids: list[list[int]],
+    vocab_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bin-count token ids per sequence, no padding involved.
+
+    token_ids: one variable-length id list per seq; empty lists are allowed.
+    Returns (counts, mask), both [bsz, vocab_size], counts is int32.
+    """
+    bsz = len(token_ids)
+
+    # Row-major linearization on the CPU: one H2D copy instead of bsz of them.
+    # flat_idx max is bsz * vocab_size, but scatter_add_ requires an int64 index.
+    flat_idx = [row * vocab_size + t for row, seq in enumerate(token_ids) for t in seq]
+
+    counts = torch.zeros(bsz * vocab_size, dtype=torch.int32, device=device)
+    if flat_idx:    # all-empty on the first decode step -> nothing to scatter
+        idx = torch.tensor(flat_idx, dtype=torch.int64).to(device, non_blocking=True)
+        counts.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.int32))
+    counts = counts.view(bsz, vocab_size)    # contiguous, unlike the old narrow()
+
+    return counts, counts > 0
+
+def apply_penalties2(logits, prompt_tokens: list[list[int]], output_tokens: list[list[int]],
+                     sampling_meta: SamplingMetadata, vocab_size: int):
+    return apply_penalties(logits, prompt_tokens, output_tokens,
+                           sampling_meta.rep_pen, sampling_meta.freq_pen, sampling_meta.pres_pen, vocab_size)
+
+def apply_penalties(logits, prompt_tokens: list[list[int]], output_tokens: list[list[int]],
                     rep_pen, freq_pen, pres_pen, vocab_size):
     # logits [bsz, vocab_size]
     bsz = logits.shape[0]
 
     # mask now means presence/existing, shape [bsz, vocab_size]
-    _,            prompt_mask  = bin_counts_and_mask(prompt_tokens, vocab_size, bsz)  # ditch the count of prompt
-    out_counts,   output_mask  = bin_counts_and_mask(output_tokens, vocab_size, bsz)
+    _,            prompt_mask  = bin_counts_and_mask(prompt_tokens, vocab_size, logits.device)  # ditch the count of prompt
+    out_counts,   output_mask  = bin_counts_and_mask(output_tokens, vocab_size, logits.device)
 
     # -> shape [bsz, vocab_size]
     rep = rep_pen[:, None].repeat(1, vocab_size)
@@ -68,6 +149,9 @@ def apply_top_p(logits, top_p):
     remove = torch.zeros_like(sorted_remove)
     remove.scatter_(1, sorted_idx, sorted_remove)
     return logits.masked_fill(remove, float("-inf"))
+
+def sample2(logits, sampling_meta: SamplingMetadata):
+    return sample(logits, sampling_meta.temperature, sampling_meta.top_k, sampling_meta.top_p)
 
 def sample(logits, temperature, top_k, top_p):
     # logits: [n, vocab] (penalties already applied); all three params are [n]

@@ -17,15 +17,12 @@ def test_apply_penalties():
     prompts = [[101, 202, 303], [55, 66], [777]]
     outputs = [[202],           [66, 66, 66], []]   # seq2 not yet generated
 
-    prompt_tokens = pad_token_ids(prompts, vocab_size, device)   # [3, 3]
-    output_tokens = pad_token_ids(outputs, vocab_size, device)   # [3, 3]
-
     # three reqs: 0 repetition only; 1 frequency only; 2 all closed
     rep_pen  = torch.tensor([1.15, 1.0, 1.0], device=device)
     freq_pen = torch.tensor([0.0,  0.5, 0.0], device=device)
     pres_pen = torch.tensor([0.0,  0.0, 0.0], device=device)
 
-    new_logits = apply_penalties(logits, prompt_tokens, output_tokens,
+    new_logits = apply_penalties(logits, prompts, outputs,
                             rep_pen, freq_pen, pres_pen, vocab_size)
 
     assert new_logits.shape == torch.Size([bsz, vocab_size])

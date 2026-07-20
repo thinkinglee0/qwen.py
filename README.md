@@ -15,8 +15,9 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M2**    | KV cache (incremental decode, `past_len` plumbing)              | ✅ done, logits validated against the non-kv-cache mode by pytest                                                                                                                                                                                                         |
 | **M3**    | Generation loop, Streaming HTTP service                         | ✅ done, introduce FastAPI, async                                                                                                                                                                                                                                         |
 | **M4**    | sampling, restructure the project layout                        | ✅ done, add repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial; isolate source code from unit tests; extract attention/mlp/decode_layer/norm from model.py, and bind weights to the `nn.Module` tree through the `load_state_dict` function. |
-| **M5**    | static batching                                                 | 🔜 next — `bsz`already stubbed with `1`                                                                                                                                                                                                                                  |
-| later     | continuous batching, performance work on 7B / A10               | planned                                                                                                                                                                                                                                                                  |
+| **M5**    | static batching                                                 | ✅done. pack a list of **variable-length** id sequences into a 1-dim id list, opt for SDPA attention in my local macbook for quick functional verifications.                                                                                                              |
+| **M6**    | performance work on 7B / A10                                    | 🔜 next — focus on `flash_attn` and performance.                                                                                                                                                                                                                         |
+| later     | continuous batching,                                            | planned                                                                                                                                                                                                                                                                  |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
 
@@ -35,28 +36,30 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 - **KV cache** — `prefill` and `decode` share the same `forward`; `init_kv_cache`while `cache`is None in `forward`function; return `cache` on the end of `forward` for the next iteration.
 - **Streaming HTTP service** — `async_generate`throws `_decode_step`into the current `event loop`, and yields CPU after `_decode_step`returns; `/generate_stream`and `/health`endpoints implemented by FastAPI; `@asynccontextmanager`, `@pytest_asyncio.fixture` and `@pytest.fixture` ensure that the model **Weights** only loads **once** in testing scenarios of sync functions, async functions, and FastAPI endpoints.
 - **Sampling** — parse `generation_conf.json`, apply repetition/frequency/presence penalties just after `forward`, then do sampling if `do_sample` swtich is on; sampling includes temperature, top_k, top_p, multinomial.
-- **Restructure the project layout** — rename `qwen.py` to `model.py`, `main.py` to `api.py`, put sync/async generations into `engine.py`, place source code files in `src/qwen` folder, and unit tests in `tests`.
+- **Restructure the project layout** — rename `qwen.py` to `model.py`, `main.py` to `api.py`, put sync/async generations into `engine.py`, place source code files in the `src/qwen` folder, and unit tests in `tests`.
+- **Static batching** — pack a list of **variable-length** id sequence into an 1-dim id list by `pack_sequences`, `scatter_to_kv_cache` after the projection and rope of K and V; select flash_attn for cloud A10 VPS, falls back to SDPA attention in my locl macbook for quick functional verifications.
 
 ---
 
 ## Repository layout
 
-| File                                          | Responsibility                                                                                                                                                                                                                                                  |
-| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/qwen/config.py`                          | `ModelConfig` dataclass, `from_pretrained` (parse `config.json` and `generation_config.json`), `load_qwen_weights` (safetensors + dtype + tied-embedding handling)                                                                                              |
-| `src/qwen/rope.py`                            | `BaseRoPE` + `Default` / `Linear` / `DynamicNTK` variants, `init_rope` factory                                                                                                                                                                                  |
-| `src/qwen/model.py`                           | `QwenForCausalLM` holds the Module tree, `QwenModel`, the main Module node with norm, embed_tokens, and layers.                                                                                                                                                 |
-| `src/qwen/{decoder_layer, attention, mlp}.py` | an iteration including attention and mlp, output normalized hidden_state.                                                                                                                                                                                       |
-| `src/qwen/cache.py`                           | KV cache                                                                                                                                                                                                                                                        |
-| `src/qwen/engine.py`                          | generation loop and async generation loop                                                                                                                                                                                                                       |
-| `src/qwen/api.py`                             | FastAPI endpoints                                                                                                                                                                                                                                               |
-| `src/qwen/sampling.py`                        | repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial;                                                                                                                                                                                 |
-| `src/qwen/utils.py`                           | some common functions                                                                                                                                                                                                                                           |
-| `tests/test_model.py`                         | unit tests by pytest for `QwenModel`, including FastAPI endpoints, and comparasons between `prefill(seq)` and `prefill(sub_seq) + decode(rest_seq)` step by step , between `QwenModel` and `modeling_qwen2.py`, between that with `KV cache` and non-`KV cache` |
-| `tests/test_engine.py`                        | unit tests for generation loop, comparason between `generate` and `async_generate`                                                                                                                                                                              |
-| `tests/test_api.py`                           | unit tests for FastAPI                                                                                                                                                                                                                                          |
-| `tests/test_rope.py`                          | unit tests by pytest for `rope.py`                                                                                                                                                                                                                              |
-| `docs/qwen25_inference_alignment_notes.md`    | Engineering notes — the pitfalls hit while aligning against HuggingFace, and the methodology used to find them                                                                                                                                                  |
+| File                                       | Responsibility                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/qwen/config.py`                       | `ModelConfig` dataclass, `from_pretrained` (parse `config.json` and `generation_config.json`), `load_qwen_weights` (safetensors + dtype + tied-embedding handling)                                                                                                                                           |
+| `src/qwen/rope.py`                         | `BaseRoPE` + `Default` / `Linear` / `DynamicNTK` variants, `init_rope` factory                                                                                                                                                                                                                               |
+| `src/qwen/model.py`                        | `QwenForCausalLM` holds the Module tree, `QwenModel`, the main Module node with norm, embed_tokens, and layers.                                                                                                                                                                                              |
+| `src/qwen/attention.py`                    |                                                                                                                                                                                                                                                                                                              |
+| `src/qwen/{decoder_layer, mlp}.py`         | an iteration including attention and mlp, output normalized hidden_state.                                                                                                                                                                                                                                    |
+| `src/qwen/cache.py`                        | KV cache                                                                                                                                                                                                                                                                                                     |
+| `src/qwen/engine.py`                       | generation loop and async generation loop; pack varlen id sequence and build `AttentionMetadata` for prefill and decode                                                                                                                                                                                      |
+| `src/qwen/api.py`                          | FastAPI endpoints                                                                                                                                                                                                                                                                                            |
+| `src/qwen/sampling.py`                     | repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial;                                                                                                                                                                                                                              |
+| `src/qwen/utils.py`                        | some common functions                                                                                                                                                                                                                                                                                        |
+| `tests/test_model.py`                      | unit tests by pytest for `QwenModel` and `QwenForCausalLM`, including comparasons `logits and activation` against HF `modeling_qwen2.py` on `prefill` with different lengths, and `prefill+decode` on solo prompt and ragged batch prompts; self-comparason of `prefill(L-P)+decode(P)` against `prefill(L). |
+| `tests/test_engine.py`                     | unit tests for generation loop, comparason between `generate` and `async_generate`                                                                                                                                                                                                                           |
+| `tests/test_api.py`                        | unit tests for FastAPI                                                                                                                                                                                                                                                                                       |
+| `tests/test_rope.py`                       | unit tests by pytest for `rope.py`                                                                                                                                                                                                                                                                           |
+| `docs/qwen25_inference_alignment_notes.md` | Engineering notes — the pitfalls hit while aligning against HuggingFace, and the methodology used to find them                                                                                                                                                                                               |
 
 ---
 
@@ -95,13 +98,18 @@ Note: The information provided here is general and may not reflect current event
 The engine is validated by **layer-by-layer activation alignment** against
 `transformers.models.qwen2.modeling_qwen2`: run both models on the same input, capture intermediate tensors, and compare in execution order. The first mismatch localizes the bug; everything downstream is just propagation.
 
-Capture uses PyTorch forward hooks for `nn.Module` outputs and module-level monkey-patching for inline functions like `apply_rotary_pos_emb` that aren't hookable. Comparison uses `torch.testing.assert_close` (which reports mismatch fraction and the largest abs/rel diff with its index). Two requirements make the comparison valid:
+Capture uses PyTorch forward hooks for `nn.Module` outputs and module-level monkey-patching for inline functions like `apply_rotary_pos_emb` that aren't hookable. Comparison uses `torch.testing.assert_close` on tensors (which reports mismatch fraction and the largest abs/rel diff with its index) and `==` on integers. Two requirements make the comparison valid:
 
-- Load the reference with `attn_implementation="eager"` — the fused SDPA/FlashAttention
-  kernels differ in accumulation order and produce benign ~1e-3 diffs that masquerade as bugs.
+- Load the reference with `attn_implementation="eager"` — the fused SDPA/FlashAttention kernels differ in accumulation order and produce benign ~1e-3 diffs that masquerade as bugs.
 - Match dtype on both sides (fp32 ↔ fp32 here) so tolerances stay tight.
 
-The full set of pitfalls found this way — RoPE `inv_freq` exponent, `view`/`transpose` memory layout, GELU-vs-SiLU, hook signatures, batch-dim indexing, and more — is written up in [`qwen25_inference_alignment_notes.md`](./docs/qwen25_inference_alignment_notes.md).
+The full set of pitfalls found this way — RoPE `inv_freq` exponent, `view`/`transpose` memory layout, GELU-vs-SiLU, hook signatures, batch-dim indexing, and more — is written up in [`qwen25_inference_alignment_notes.md`](./docs/qwen25_inference_alignment_notes.md) on **M1** milestone.
+
+Other following verifications see `tests/` folder for details. The main ones `test/test_model.py` include:
+
+**Against reference**: `test_prefill_matches_reference_on_math`, `test_prefill_matches_reference` and `test_decode_matches_reference`. **Troubleshoot** on ligits mismatch sees `HookManager` for details.
+
+**Against self**: `test_kv_cache_correctness` (`prefill(L) == prefill(L-P) + decode(1)*P steps`). **Troubleshoot** on ligits mismatch sees `compare_cache_against_kv_after_rope` for details.
 
 ---
 
@@ -122,10 +130,8 @@ The full set of pitfalls found this way — RoPE `inv_freq` exponent, `view`/`tr
 
 ## Roadmap
 
-1. **Batched decode** — padding / position handling for `bsz > 1`.
-2. **Performance** — move to GPU, profile against the 7B / A10 target.
-
----
+1. **Performance** — move to GPU, profile against the 7B / A10 target.
+2. **Continuous batching** — evict finished requests and add waiting request in flight.
 
 ## License
 

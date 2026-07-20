@@ -12,15 +12,15 @@ def test_inv_freq_values():
 
 def test_cache_shapes():
     rope = BaseRoPE(dim=8, max_seq_len=16)
-    assert rope.cos_cached.shape == (1, 1, 16, 4)
-    assert rope.sin_cached.shape == (1, 1, 16, 4)
+    assert rope.cos_cached.shape == (16, 1, 4) # shape [seq_len, H=1, d/2]
+    assert rope.sin_cached.shape == (16, 1, 4)
 
 def test_position_zero_is_identity():
     # t=0 → freqs=0 → cos=1, sin=0 → remain equal
     rope = BaseRoPE(dim=8, max_seq_len=16)
-    q = torch.randn(1, 1, 1, 8)
-    k = torch.randn(1, 1, 1, 8)
-    q_out, k_out = rope(q, k, offset=0)
+    q = torch.randn(1, 1, 8)   # q,k [T, H, D]
+    k = torch.randn(1, 1, 8)
+    q_out, k_out = rope(q, k, position_ids=torch.arange(1))
     torch.testing.assert_close(q_out, q)
     torch.testing.assert_close(k_out, k)
 
@@ -28,14 +28,15 @@ def test_relative_position_invariance():
     # RoPE core property: <q_m, k_n> depends only on the relative displacement (m-n)
     # That is, the dot product of q at position m and k at position n is equal to the dot product of each translated by Δ.
     rope = BaseRoPE(dim=64, max_seq_len=256)
-    q = torch.randn(1, 1, 1, 64)
-    k = torch.randn(1, 1, 1, 64)
+    q = torch.randn(1, 1, 64)   # q,k [T, H, D]
+    k = torch.randn(1, 1, 64)
 
-    def dot_at(m, n):
-        qm, _ = rope(q, q, offset=m)
-        kn, _ = rope(k, k, offset=n)
+    def dot_at(m: int, n: int):
+        qm, _ = rope(q, q, position_ids=torch.tensor([m], dtype=torch.long))
+        kn, _ = rope(k, k, position_ids=torch.tensor([n], dtype=torch.long))
         return (qm * kn).sum().item()
 
     base = dot_at(10, 5)        # Δ = 5
     shifted = dot_at(20, 15)    # Δ = 5
     assert abs(base - shifted) < 1e-4
+

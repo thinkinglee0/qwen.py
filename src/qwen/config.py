@@ -64,6 +64,8 @@ class ModelConfig():
     weights: Any | None = None
     device: torch.device | None = None
     dtype: torch.dtype | None = None
+    cache_len: int = 1000
+    max_seqs: int = 20
 
     def __post_init__(self):
         if self.head_dim == 0:
@@ -79,6 +81,8 @@ class ModelConfig():
             self.device = resolve_device()
         if self.dtype is None:
             self.dtype = default_dtype(self.device)
+
+        assert self.cache_len <= self.max_position_embeddings
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":

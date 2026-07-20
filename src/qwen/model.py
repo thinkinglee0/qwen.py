@@ -6,20 +6,15 @@ import logging
 
 from qwen.config import ModelConfig
 from qwen.decode_layer import DecoderLayer
-from qwen.cache import KVCache
+from qwen.attention import AttentionMetadata
 from qwen.utils import RMSNorm
+from qwen.sampling import apply_penalties2, sample2, SamplingMetadata
 
 logger = logging.getLogger(__name__)
 
-def bottom_right_causal_bias(q_len: int, k_len: int, device: torch.device, dtype: torch.dtype,) -> torch.Tensor:
-    # position_ids: the i-th query token maps to global position (k_len - q_len + i)
-    # allow attending to j <= k_len - q_len + i, i.e. mask out j > k_len - q_len + i  <=>  j - i >= k_len - q_len + 1
-    mask = torch.full((q_len, k_len), float("-inf"), device=device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=k_len - q_len + 1)
-    return mask[None, None]  # (1, 1, q_len, k_len)
 
 class QwenModel(nn.Module):
-    def __init__(self, config: ModelConfig, max_bsz: int = 1):
+    def __init__(self, config: ModelConfig):
         super().__init__()
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -28,24 +23,21 @@ class QwenModel(nn.Module):
             [DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
 
-    def forward(self, input_ids: torch.Tensor, cache: KVCache | None = None) -> CausalLMOutputWithPast:
-        hidden_states = self.embed_tokens(input_ids)    # [bsz, seq_len, hidden_size]
-        bsz, q_len, _ = hidden_states.size()
-        past_len = 0 if cache is None else cache[0][0].shape[2]
-
-        causal_bias = bottom_right_causal_bias(q_len, q_len+past_len, hidden_states.device, hidden_states.dtype)
+    def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> CausalLMOutputWithPast:
+        # input_ids [T], hidden_states [T, hidden_size]
+        hidden_states = self.embed_tokens(input_ids)
 
         for layer in self.layers:
-            hidden_states, cache = layer.forward(hidden_states, cache, causal_bias, past_len)
+            hidden_states = layer.forward(hidden_states, meta)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
 class QwenForCausalLM(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, max_seqs: int = 20, cache_len: int = 500):
         super().__init__()
-        self.config = dataclasses.replace(cfg, weights=None)
+        self.config = dataclasses.replace(cfg, weights=None, max_seqs=max_seqs, cache_len=cache_len)
         self.device = self.config.device     # resolved in config
         self.dtype = self.config.dtype
 
@@ -59,15 +51,25 @@ class QwenForCausalLM(nn.Module):
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, cache: KVCache | None = None) -> CausalLMOutputWithPast:
-        hidden_states = self.model.forward(input_ids, cache)
+    def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> CausalLMOutputWithPast:
+        # input_ids: packed varlen, shape [T]
+        hidden_states = self.model.forward(input_ids, meta)
 
-        logits = self.lm_head(hidden_states[:, -1, :])
+        return hidden_states    # shape [T, hidden_size]
+    
+    def compute_logits(self, hidden_states: torch.Tensor):
+        return self.lm_head(hidden_states)  # shape [T, vocab_size]
 
-        # output
-        output = CausalLMOutputWithPast()
-        if cache is not None:
-            output.past_key_values = tuple(cache)
-        output.logits = logits
-        return output
+    def sampler(self, logits, prompt_tokens, output_tokens, sampling_meta: SamplingMetadata | None = None):
+        if sampling_meta is None:
+            B, _ = logits.size()
+            sampling_meta = SamplingMetadata(config=self.config, bsz=B)
+        
+        logits = apply_penalties2(logits, prompt_tokens, output_tokens, sampling_meta, self.config.vocab_size)
+        if self.config.do_sample:
+            next_tokens = sample2(logits, sampling_meta)
+        else:
+            next_tokens = logits.argmax(dim=-1)
+
+        return next_tokens
+

@@ -6,7 +6,7 @@ import pytest
 
 from httpx import ASGITransport, AsyncClient
 from qwen.api import app, get_model_client
-from constants import CLASSIC_PROMPT
+from constants import PROMPT_BATCH_1
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ async def test_endpoint_health(api_client):
 @pytest.mark.asyncio
 async def test_endpoint_generate_stream(api_client):
     chunks = []
-    async with api_client.stream("POST", "/generate_stream", json={"prompt": CLASSIC_PROMPT}) as resp:
+    async with api_client.stream("POST", "/generate_stream", json={"prompts": PROMPT_BATCH_1}) as resp:
         assert resp.status_code == 200
         async for line in resp.aiter_lines():
             if line.startswith("data: "):
