@@ -1,10 +1,11 @@
 import pytest
 import torch
 import logging
+from typing import Any
 
 import transformers.models.qwen2.modeling_qwen2 as qwen2_modeling
 
-import qwen
+import qwen.attention
 from qwen.cache import init_kv_cache2
 from qwen.attention import build_prefill_metadata, build_decode_metadata, AttentionMetadata
 from qwen.rope import DefaultRoPE
@@ -21,6 +22,8 @@ def sampling_batch(tok, last_logits):
     return [tok.decode(token_id.item()) for token_id in new_token_ids], new_token_ids
 
 class HookManager:
+    hooks: dict[str, list[Any]]
+
     def __init__(self):
         self.hooks = {}
 
@@ -36,34 +39,35 @@ class HookManager:
         return hook
     
     def patch_rope(self):
+        hooks = self.hooks
         # ref
         original_ref_rope = qwen2_modeling.apply_rotary_pos_emb
         def patched_ref_func(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-            self.hooks.setdefault("ref_model.q_before_rope", []).append(q.detach().clone())
-            self.hooks.setdefault("ref_model.k_before_rope", []).append(k.detach().clone())
+            hooks.setdefault("ref_model.q_before_rope", []).append(q.detach().clone())
+            hooks.setdefault("ref_model.k_before_rope", []).append(k.detach().clone())
             if position_ids is not None:
-                self.hooks.setdefault("ref_model.position_ids_on_rope", []).append(position_ids.detach().clone())
+                hooks.setdefault("ref_model.position_ids_on_rope", []).append(position_ids.detach().clone())
             else:
-                self.hooks.setdefault("ref_model.position_ids_on_rope", []).append(None)
+                hooks.setdefault("ref_model.position_ids_on_rope", []).append(None)
             q_embed, k_embed = original_ref_rope(q, k, cos, sin, position_ids, unsqueeze_dim)
-            self.hooks.setdefault("ref_model.q_embed_returned", []).append(q_embed.detach().clone())
-            self.hooks.setdefault("ref_model.k_embed_returned", []).append(k_embed.detach().clone())
+            hooks.setdefault("ref_model.q_embed_returned", []).append(q_embed.detach().clone())
+            hooks.setdefault("ref_model.k_embed_returned", []).append(k_embed.detach().clone())
             return q_embed, k_embed
 
         qwen2_modeling.apply_rotary_pos_emb = patched_ref_func
 
         # target, rope
         original_target_rope = DefaultRoPE.forward
-        def patched_target_func(slf, q, k, position_ids):
-            self.hooks.setdefault("target_model.q_before_rope", []).append(q.detach().clone())
-            self.hooks.setdefault("target_model.k_before_rope", []).append(k.detach().clone())
+        def patched_target_func(self, q, k, position_ids):
+            hooks.setdefault("target_model.q_before_rope", []).append(q.detach().clone())
+            hooks.setdefault("target_model.k_before_rope", []).append(k.detach().clone())
             if position_ids is not None:
-                self.hooks.setdefault("target_model.position_ids_on_rope", []).append(position_ids.detach().clone())
+                hooks.setdefault("target_model.position_ids_on_rope", []).append(position_ids.detach().clone())
             else:
-                self.hooks.setdefault("target_model.position_ids_on_rope", []).append(None)
-            q_embed, k_embed = original_target_rope(slf, q, k, position_ids)
-            self.hooks.setdefault("target_model.q_embed_returned", []).append(q_embed.detach().clone())
-            self.hooks.setdefault("target_model.k_embed_returned", []).append(k_embed.detach().clone())
+                hooks.setdefault("target_model.position_ids_on_rope", []).append(None)
+            q_embed, k_embed = original_target_rope(self, q, k, position_ids)
+            hooks.setdefault("target_model.q_embed_returned", []).append(q_embed.detach().clone())
+            hooks.setdefault("target_model.k_embed_returned", []).append(k_embed.detach().clone())
             return q_embed, k_embed
 
         DefaultRoPE.forward = patched_target_func
@@ -71,11 +75,11 @@ class HookManager:
         # target, sdpa_one_seq
         original_target_sdpa = qwen.attention.sdpa_one_seq
         def patched_target_sdpa(q, k, v):
-            self.hooks.setdefault("target_model.q_before_sdpa", []).append(q.detach().clone())
-            self.hooks.setdefault("target_model.k_before_sdpa", []).append(k.detach().clone())
-            self.hooks.setdefault("target_model.v_before_sdpa", []).append(v.detach().clone())
+            hooks.setdefault("target_model.q_before_sdpa", []).append(q.detach().clone())
+            hooks.setdefault("target_model.k_before_sdpa", []).append(k.detach().clone())
+            hooks.setdefault("target_model.v_before_sdpa", []).append(v.detach().clone())
             out = original_target_sdpa(q, k, v)
-            self.hooks.setdefault("target_model.out_after_sdpa", []).append(out.detach().clone())
+            hooks.setdefault("target_model.out_after_sdpa", []).append(out.detach().clone())
             return out
 
         qwen.attention.sdpa_one_seq = patched_target_sdpa
@@ -202,8 +206,11 @@ def compare_cache_against_kv_after_rope(B: int, meta: AttentionMetadata, cfg: Mo
         logger.error("compare_cache_against_kv_after_rope is only implemented for B=1")
         return
 
-    start, end = 0, 0
+    assert meta.cache is not None, "cache is None, please turn on use_cache in build_prefill_metadata/build_decode_metadata"
+    assert meta.debug_k_list is not None and meta.debug_v_list is not None, "debug_k_list/debug_v_list are None, please turn on debug in build_prefill_metadata/build_decode_metadata"
     logger.info(f"compare_cache_against_kv_after_rope, debug_k_list.len: {len(meta.debug_k_list)}")
+
+    start, end = 0, 0
     for i, (k, v) in enumerate(zip(meta.debug_k_list, meta.debug_v_list)):
         # k, v [T, H, D]
         logger.info(f"compare_cache_against_kv_after_rope, shape, k: {k.shape}, v: {v.shape}")
@@ -290,7 +297,25 @@ def test_kv_cache_correctness(target_model, B:int):
     ],
 )
 @torch.inference_mode()
-def test_decode_matches_reference(target_model, ref_model, request, encoding_fixture, list_fixture):
+def test_decode_matches_reference(target_model, ref_model, request, encoding_fixture, list_fixture, tokenizer):
+    def check_and_show_next_tokens(target_next_ids, ref_next_ids, B):
+        logger.info(f"after prefill/decode: target_next_ids: {target_next_ids.tolist()}, ref_next_ids: {ref_next_ids.tolist()}")
+        for batch_idx in range(B):
+            target_output_text = tokenizer.decode(target_next_ids[batch_idx])
+            ref_output_text = tokenizer.decode(ref_next_ids[batch_idx])
+            logger.info(f"target_output_text[{batch_idx}]: |{target_output_text}|")
+            logger.info(f"   ref_output_text[{batch_idx}]: |{ref_output_text}|")
+            if target_output_text != ref_output_text:
+                logger.info(f"comparison result for batch_idx={batch_idx}: differ")
+            else:
+                logger.info(f"comparison result for batch_idx={batch_idx}: match")
+
+            # assert text
+            assert target_output_text == ref_output_text
+
+            # assert ids
+            assert target_next_ids[batch_idx].item() == ref_next_ids[batch_idx].item()
+            
     encoding = request.getfixturevalue(encoding_fixture)
     input_list = request.getfixturevalue(list_fixture)
     # target model
@@ -306,13 +331,6 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
 
     assert len(input_list) == len(target_next_ids)
 
-    # target model's decode
-    past_lens = md_prefill.cache_seqlens
-    md_decode = build_decode_metadata(past_lens, cache, target_model.config.cache_len)   # is_prefill=False, fresh each step
-    hidden = target_model.forward(target_next_ids, md_decode)  # input_ids = [B], one token per seq -> list[int]
-    target_logits = target_model.compute_logits(hidden)    # [B, vocab]  (decode: every row is a last token)
-    target_next_ids = target_logits.argmax(dim=-1)
-
     # reference's prefill
     ref_output = ref_model.forward(encoding.input_ids,
                                     attention_mask=encoding.attention_mask,
@@ -322,6 +340,15 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
     ref_logits = ref_output.logits[:, -1, :]        # [bsz, vocab], last one
     ref_next_ids = ref_logits.argmax(dim=-1)
     past_key_values = ref_output.past_key_values
+
+    check_and_show_next_tokens(target_next_ids, ref_next_ids, B)
+
+    # target model's decode
+    past_lens = md_prefill.cache_seqlens
+    md_decode = build_decode_metadata(past_lens, cache, target_model.config.cache_len)   # is_prefill=False, fresh each step
+    hidden = target_model.forward(target_next_ids, md_decode)  # input_ids = [B], one token per seq -> list[int]
+    target_logits = target_model.compute_logits(hidden)    # [B, vocab]  (decode: every row is a last token)
+    target_next_ids = target_logits.argmax(dim=-1)
 
     # reference's decode
     old_mask = encoding.attention_mask
@@ -333,6 +360,9 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
                                     past_key_values=past_key_values
                                     )        # [bsz, seq_len, vocab]
     ref_logits = ref_output.logits[:, -1, :]        # [bsz, vocab], last one
+    ref_next_ids = ref_logits.argmax(dim=-1)
+
+    check_and_show_next_tokens(target_next_ids, ref_next_ids, B)
 
     # assert logits
     assert (target_logits - ref_logits).abs().max() < 1e-3

@@ -44,6 +44,7 @@ class QwenForCausalLM(nn.Module):
         self.model = QwenModel(cfg)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
+        assert cfg.weights is not None, "weights must be provided to QwenForCausalLM"
         missing, unexpected = self.load_state_dict(cfg.weights, strict=False)
         assert not unexpected, f"stale/renamed keys: {unexpected[:5]}"
         assert missing in ([], ["lm_head.weight"]), f"missing: {missing}"
@@ -60,7 +61,7 @@ class QwenForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor):
         return self.lm_head(hidden_states)  # shape [T, vocab_size]
 
-    def sampler(self, logits, prompt_tokens, output_tokens, sampling_meta: SamplingMetadata | None = None):
+    def sampler(self, logits, prompt_tokens, output_tokens, sampling_meta: SamplingMetadata | None = None) -> torch.Tensor:
         if sampling_meta is None:
             B, _ = logits.size()
             sampling_meta = SamplingMetadata(config=self.config, bsz=B)

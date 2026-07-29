@@ -75,6 +75,7 @@ class LinearRoPE(BaseRoPE):
 #         return super().__call__(q, k, offset)
     
 def init_rope(config: ModelConfig) -> BaseRoPE:
+    assert config.rope_scaling is not None, "rope_scaling must be provided in config"
     match config.rope_scaling.get("rope_type", "default"):
         case "default":
             return DefaultRoPE(config.head_dim, config.cache_len, config.rope_theta)
@@ -83,4 +84,4 @@ def init_rope(config: ModelConfig) -> BaseRoPE:
         # case "dynamic":
         #     return DynamicNTKRoPE(config.head_dim, config.cache_len, config.rope_theta, scale=config.rope_scaling["factor"])
         case _:
-            return None
+            raise ValueError(f"unsupported rope_type: {config.rope_scaling.get('rope_type')}")

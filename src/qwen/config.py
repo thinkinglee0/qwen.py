@@ -58,6 +58,7 @@ class ModelConfig():
 
     # derived
     head_dim: int = 0
+    eos: torch.Tensor | None = None # from eos_token_id, shape [num_eos]
 
     # other
     model_dir: str = ""
@@ -84,6 +85,9 @@ class ModelConfig():
 
         assert self.cache_len <= self.max_position_embeddings
 
+        if self.eos_token_id:
+            self.eos = torch.tensor(self.eos_token_id, dtype=torch.int32, device=self.device)
+
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":
         with open(Path(model_dir) / "config.json") as f:
@@ -101,6 +105,7 @@ class ModelConfig():
 
         logger.info(f"config: {config}")
 
+        assert config.dtype in [torch.float16, torch.bfloat16, torch.float32], f"unsupported dtype: {config.dtype}"
         config.weights = load_qwen_weights(config, config.dtype)
 
         return config
@@ -116,4 +121,5 @@ def load_qwen_weights(config: ModelConfig, dtype=torch.float32):
 if __name__ == "__main__":
     model_dir = "../qwen2.5-0.5b"
     config = ModelConfig.from_pretrained(model_dir)
+    assert config.weights is not None
     print(config.weights.keys())

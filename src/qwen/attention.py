@@ -43,21 +43,21 @@ def _bottom_right_causal_bias(q_len: int, k_len: int, device: torch.device, dtyp
 @dataclass
 class AttentionMetadata:
     is_prefill: bool
-    cache: KVCache
+    cache: KVCache | None
 
     # query side
-    cu_seqlens_q: Tensor | None = None   # (num_seqs + 1,) prefix-sum of query lengths
-    max_seqlen_q: int | None = None
+    cu_seqlens_q: Tensor   # (num_seqs + 1,) prefix-sum of query lengths
+    max_seqlen_q: int
 
     # key side
-    cu_seqlens_k: Tensor | None = None   # (num_seqs,) per-request KV length
-    max_seqlen_k: int | None = None
+    cu_seqlens_k: Tensor   # (num_seqs,) per-request KV length
+    max_seqlen_k: int
 
     # same info as cu_seqlens_k, plain (non-cumulative) form for flash_attn_with_kvcache
-    cache_seqlens: Tensor | None = None
+    cache_seqlens: Tensor
 
-    position_ids: Tensor | None = None
-    slot_mapping: Tensor | None = None
+    position_ids: Tensor
+    slot_mapping: Tensor
 
     # debug cache issue
     debug_k_list: list[Tensor] | None = None
@@ -101,7 +101,7 @@ def pack_sequences(seqs, device, cache_len):
 
     return packed_ids, cu_seqlens, position_ids, slot_mapping, max_seqlen, lengths
 
-def build_prefill_metadata(seqs, cache: KVCache, device, cache_len):
+def build_prefill_metadata(seqs, cache: KVCache | None, device, cache_len):
     packed_ids, cu_seqlens, position_ids, slot_mapping, max_seqlen, lengths = \
         pack_sequences(seqs, device, cache_len)
     return packed_ids, AttentionMetadata(
@@ -112,7 +112,7 @@ def build_prefill_metadata(seqs, cache: KVCache, device, cache_len):
         cache_seqlens=lengths,                              # post-prefill KV depth per req
     )
 
-def build_decode_metadata(past_lens, cache: KVCache, cache_len):
+def build_decode_metadata(past_lens, cache: KVCache | None, cache_len):
     B = past_lens.numel()
     rows = torch.arange(B, device=past_lens.device)
     kv_lens = past_lens.to(torch.int32) + 1                       # post-write depth
@@ -222,6 +222,7 @@ class Attention(nn.Module):
         if meta.is_prefill:
             # full prefill: packed k/v IS the complete KV (cu_seqlens_q == cu_seqlens_k).
             # The cache is write-only here; varlen cannot express the slab stride anyway.
+            assert flash_attn_varlen_func is not None, "flash_attn not installed"
             return flash_attn_varlen_func(
                 q, k, v,
                 meta.cu_seqlens_q, meta.cu_seqlens_k,
@@ -231,6 +232,7 @@ class Attention(nn.Module):
 
         # decode: the new token is already in the cache (scatter ran above), so k=v=None.
         # cache_batch_idx maps batch slot -> physical cache row; required once B != max_seqs.
+        assert flash_attn_with_kvcache is not None, "flash_attn not installed"
         return flash_attn_with_kvcache(
             q.unsqueeze(1), k_cache, v_cache,
             cache_seqlens=meta.cache_seqlens,
