@@ -3,11 +3,19 @@ import torch
 from dataclasses import dataclass, InitVar
 
 from qwen.config import ModelConfig
-
-_EPS = 1e-5
+from qwen.constants import EPS
 
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class Sampling:
+    temperature: float | None = None
+    top_k: int | None = None
+    top_p: float | None = None
+    rep_pen: float | None = None
+    freq_pen: float | None = None
+    pres_pen: float | None = None
 
 @dataclass
 class SamplingMetadata:
@@ -65,6 +73,18 @@ class SamplingMetadata:
                 dtype=config.dtype
             )
 
+    @classmethod
+    def from_sampling_list(cls, samplings: list[Sampling], config: ModelConfig, bsz: int):
+        return cls(
+            config=config,
+            bsz=bsz,
+            temperature=torch.tensor([sampling.temperature if sampling is not None and sampling.temperature is not None else config.temperature for sampling in samplings], device=config.device, dtype=config.dtype),
+            top_k=torch.tensor([sampling.top_k if sampling is not None and sampling.top_k is not None else config.top_k for sampling in samplings], device=config.device, dtype=torch.int64),
+            top_p=torch.tensor([sampling.top_p if sampling is not None and sampling.top_p is not None else config.top_p for sampling in samplings], device=config.device, dtype=config.dtype),
+            rep_pen=torch.tensor([sampling.rep_pen if sampling is not None and sampling.rep_pen is not None else config.repetition_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
+            freq_pen=torch.tensor([sampling.freq_pen if sampling is not None and sampling.freq_pen is not None else config.frequency_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
+            pres_pen=torch.tensor([sampling.pres_pen if sampling is not None and sampling.pres_pen is not None else config.presence_penalty for sampling in samplings], device=config.device, dtype=config.dtype)
+        )
 
 def bin_counts_and_mask(
     token_ids: list[list[int]],
@@ -155,7 +175,7 @@ def sample2(logits, sampling_meta: SamplingMetadata):
 
 def sample(logits, temperature, top_k, top_p):
     # logits: [n, vocab] (penalties already applied); all three params are [n]
-    greedy = temperature <= _EPS
+    greedy = temperature <= EPS
     t = torch.where(greedy, torch.ones_like(temperature), temperature)
     logits = logits / t[:, None]                             # temperature; greedy rows unscaled
 

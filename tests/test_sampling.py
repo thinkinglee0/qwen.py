@@ -145,7 +145,7 @@ def test_top_p_scatter_back_to_original_order():
 # ---------- sample ----------
 
 def test_sample_greedy_takes_argmax():
-    # temperature <= _EPS -> greedy; result must be argmax and not random
+    # temperature <= EPS -> greedy; result must be argmax and not random
     logits = torch.tensor([[1., 9., 3.]])
     out = sample(logits, torch.tensor([0.0]),
                  torch.tensor([0]), torch.tensor([1.0]))  # top_k/p no-op

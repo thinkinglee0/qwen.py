@@ -41,7 +41,7 @@ class ModelConfig():
     do_sample: bool
     bos_token_id: int
     pad_token_id: int
-    eos_token_id: list[int]
+    eos_token_id: set[int]
     top_p: float
     top_k: float
 
@@ -58,7 +58,6 @@ class ModelConfig():
 
     # derived
     head_dim: int = 0
-    eos: torch.Tensor | None = None # from eos_token_id, shape [num_eos]
 
     # other
     model_dir: str = ""
@@ -67,6 +66,7 @@ class ModelConfig():
     dtype: torch.dtype | None = None
     cache_len: int = 1000
     max_seqs: int = 20
+    max_waiting: int = 20
 
     def __post_init__(self):
         if self.head_dim == 0:
@@ -84,9 +84,6 @@ class ModelConfig():
             self.dtype = default_dtype(self.device)
 
         assert self.cache_len <= self.max_position_embeddings
-
-        if self.eos_token_id:
-            self.eos = torch.tensor(self.eos_token_id, dtype=torch.int32, device=self.device)
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":

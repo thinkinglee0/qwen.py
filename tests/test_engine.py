@@ -45,8 +45,8 @@ def test_generation_compared_with_reference(target_model_with_function_scope, re
     for batch_idx in range(B):
         ref_output_text = tokenizer.decode(ref_output[batch_idx, padding_count[batch_idx]:])
         target_output_text = tokenizer.decode(target_output_token_ids[batch_idx])
-        logger.info(f"target_output_text[{batch_idx}]: |{target_output_text}|")
-        logger.info(f"   ref_output_text[{batch_idx}]: |{ref_output_text}|")
+        logger.info(f"target_output_text[{batch_idx}]: |{target_output_text}|, len: {len(target_output_token_ids[batch_idx])}")
+        logger.info(f"   ref_output_text[{batch_idx}]: |{ref_output_text}|, len: {len(ref_output[batch_idx, padding_count[batch_idx]:])}")
         if target_output_text != ref_output_text:
             logger.info(f"comparison result for batch_idx={batch_idx}: differ")
         else:
@@ -61,29 +61,17 @@ def test_generation_compared_with_reference(target_model_with_function_scope, re
         pytest.param("batch_input_ids_list", id="batch"),
     ],
 )
-@pytest.mark.asyncio
-async def test_streaming_generation(target_model_with_function_scope, tokenizer, request, list_fixture):
-    input_ids_list = request.getfixturevalue(list_fixture)
-    B = len(input_ids_list)
+def test_generations_differentiation(target_model, tokenizer, list_fixture, request):
+    input_list = request.getfixturevalue(list_fixture)
 
-    temp_greedy = 0.
-    target_model_with_function_scope.config.temperature = temp_greedy
+    sync_ids0 = generate(target_model, input_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
+    sync_ids1 = generate(target_model, input_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
 
-    # async
-    stream_chunks = [tok async for tok in async_generate(target_model_with_function_scope, input_ids_list, max_new_tokens=MAX_NEW_TOKEN_NUM)]
-    async_ids = [[] for _ in range(B)]
-    for chunk in stream_chunks:
-        async_ids = [old_id + new_id for old_id, new_id in zip(async_ids, chunk)]
-    # async_ids = [old_id + new_id for chunk in stream_chunks for old_id, new_id in zip(async_ids, chunk)]  # error
-    for batch_idx in range(B):
-        logger.info(f"async output: |{tokenizer.decode(async_ids[batch_idx])}|, len: {len(async_ids[batch_idx])}")
-    
-    # sync
-    sync_ids = generate(target_model_with_function_scope, input_ids_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
-    for batch_idx in range(B):
-        logger.info(f"sync output: |{tokenizer.decode(sync_ids[batch_idx])}|, len: {len(sync_ids[batch_idx])}")
+    for batch_idx in range(len(input_list)):
+        logger.info(f"batch_idx: {batch_idx}, output-0: |{tokenizer.decode(sync_ids0[batch_idx])}|, len: {len(sync_ids0[batch_idx])}")
+        logger.info(f"batch_idx: {batch_idx}, output-1: |{tokenizer.decode(sync_ids1[batch_idx])}|, len: {len(sync_ids1[batch_idx])}")
 
-    assert async_ids == sync_ids
+    assert sync_ids0 != sync_ids1
 
 @pytest.mark.parametrize(
     ("list_fixture"),
@@ -92,14 +80,24 @@ async def test_streaming_generation(target_model_with_function_scope, tokenizer,
         pytest.param("batch_input_ids_list", id="batch"),
     ],
 )
-def test_generations_differentiation(target_model, tokenizer, list_fixture, request):
-    input_ids_list = request.getfixturevalue(list_fixture)
+@pytest.mark.asyncio
+async def test_streaming_generation(target_engine_with_function_scope, tokenizer, request, list_fixture):
+    input_list = request.getfixturevalue(list_fixture)
+    B = len(input_list)
 
-    sync_ids0 = generate(target_model, input_ids_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
-    sync_ids1 = generate(target_model, input_ids_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
+    temp_greedy = 0.
+    target_engine_with_function_scope.model.config.temperature = temp_greedy
 
-    for batch_idx in range(len(input_ids_list)):
-        logger.info(f"batch_idx: {batch_idx}, output-0: |{tokenizer.decode(sync_ids0[batch_idx])}|")
-        logger.info(f"batch_idx: {batch_idx}, output-1: |{tokenizer.decode(sync_ids1[batch_idx])}|")
+    # async
+    async_ids = [[] for _ in range(B)]
+    for batch_idx in range(B):
+        tokens = [tok async for tok in async_generate(target_engine_with_function_scope, input_list[batch_idx], sampling=None, max_new_tokens=MAX_NEW_TOKEN_NUM)]
+        async_ids[batch_idx] = tokens
+        logger.info(f"async output: |{tokenizer.decode(async_ids[batch_idx])}|, len: {len(async_ids[batch_idx])}")
+    
+    # sync
+    sync_ids = generate(target_engine_with_function_scope.model, input_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
+    for batch_idx in range(B):
+        logger.info(f"sync output: |{tokenizer.decode(sync_ids[batch_idx])}|, len: {len(sync_ids[batch_idx])}")
 
-    assert sync_ids0 != sync_ids1
+    assert async_ids == sync_ids

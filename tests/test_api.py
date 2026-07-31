@@ -5,15 +5,15 @@ import pytest_asyncio
 import pytest
 
 from httpx import ASGITransport, AsyncClient
-from qwen.api import app, get_model_client
-from constants import PROMPT_BATCH_1
+from qwen.api import app, get_engine
+from constants import PROMPT_CLASSICAL
 
 logger = logging.getLogger(__name__)
 
 
 @pytest_asyncio.fixture(loop_scope="module")
-async def api_client(target_model):
-    app.dependency_overrides[get_model_client] = lambda: target_model
+async def api_client(target_engine):
+    app.dependency_overrides[get_engine] = lambda: target_engine
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -28,7 +28,7 @@ async def test_endpoint_health(api_client):
 @pytest.mark.asyncio
 async def test_endpoint_generate_stream(api_client):
     chunks = []
-    async with api_client.stream("POST", "/generate_stream", json={"prompts": PROMPT_BATCH_1}) as resp:
+    async with api_client.stream("POST", "/generate_stream", json={"prompt": PROMPT_CLASSICAL}) as resp:
         assert resp.status_code == 200
         async for line in resp.aiter_lines():
             if line.startswith("data: "):

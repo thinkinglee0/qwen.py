@@ -21,5 +21,4 @@ LONG_BATCH = [LONG_PROMPT_1,]
 LONG_BATCH_2 = [LONG_PROMPT_1, LONG_PROMPT_2]
 
 
-_EPS = 1e-5
 NINF = float("-inf")
