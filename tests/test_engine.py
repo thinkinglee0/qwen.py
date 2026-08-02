@@ -1,9 +1,9 @@
 import pytest
-import torch
 import logging
 
 from qwen.engine import async_generate, generate
 from constants import MAX_NEW_TOKEN_NUM
+from qwen.engine import ServingDriver
 
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,8 @@ def test_generation_compared_with_reference(target_model_with_function_scope, re
         ref_model.generation_config.repetition_penalty = original_repetition_penalty
 
     # compare with reference model
-    logger.info(f"attention_mask: {encoding.attention_mask}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"attention_mask: {encoding.attention_mask}")
     padding_count = (encoding.attention_mask == 0).sum(dim=1).tolist()      # [B]
     for batch_idx in range(B):
         ref_output_text = tokenizer.decode(ref_output[batch_idx, padding_count[batch_idx]:])
@@ -81,22 +82,22 @@ def test_generations_differentiation(target_model, tokenizer, list_fixture, requ
     ],
 )
 @pytest.mark.asyncio
-async def test_streaming_generation(target_engine_with_function_scope, tokenizer, request, list_fixture):
+async def test_streaming_generation(target_driver_with_function_scope: ServingDriver, tokenizer, request, list_fixture):
     input_list = request.getfixturevalue(list_fixture)
     B = len(input_list)
 
     temp_greedy = 0.
-    target_engine_with_function_scope.model.config.temperature = temp_greedy
+    target_driver_with_function_scope.engine.model.config.temperature = temp_greedy
 
     # async
     async_ids = [[] for _ in range(B)]
     for batch_idx in range(B):
-        tokens = [tok async for tok in async_generate(target_engine_with_function_scope, input_list[batch_idx], sampling=None, max_new_tokens=MAX_NEW_TOKEN_NUM)]
+        tokens = [tok async for tok in async_generate(target_driver_with_function_scope, input_list[batch_idx], sampling=None, max_new_tokens=MAX_NEW_TOKEN_NUM)]
         async_ids[batch_idx] = tokens
         logger.info(f"async output: |{tokenizer.decode(async_ids[batch_idx])}|, len: {len(async_ids[batch_idx])}")
     
     # sync
-    sync_ids = generate(target_engine_with_function_scope.model, input_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
+    sync_ids = generate(target_driver_with_function_scope.engine.model, input_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
     for batch_idx in range(B):
         logger.info(f"sync output: |{tokenizer.decode(sync_ids[batch_idx])}|, len: {len(sync_ids[batch_idx])}")
 

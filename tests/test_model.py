@@ -208,12 +208,15 @@ def compare_cache_against_kv_after_rope(B: int, meta: AttentionMetadata, cfg: Mo
 
     assert meta.cache is not None, "cache is None, please turn on use_cache in build_prefill_metadata/build_decode_metadata"
     assert meta.debug_k_list is not None and meta.debug_v_list is not None, "debug_k_list/debug_v_list are None, please turn on debug in build_prefill_metadata/build_decode_metadata"
-    logger.info(f"compare_cache_against_kv_after_rope, debug_k_list.len: {len(meta.debug_k_list)}")
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"compare_cache_against_kv_after_rope, debug_k_list.len: {len(meta.debug_k_list)}")
 
     start, end = 0, 0
     for i, (k, v) in enumerate(zip(meta.debug_k_list, meta.debug_v_list)):
         # k, v [T, H, D]
-        logger.info(f"compare_cache_against_kv_after_rope, shape, k: {k.shape}, v: {v.shape}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"compare_cache_against_kv_after_rope, shape, k: {k.shape}, v: {v.shape}")
         layer_index = i % cfg.num_hidden_layers
         if layer_index == 0:
             seq_len = k.shape[0]
@@ -222,8 +225,9 @@ def compare_cache_against_kv_after_rope(B: int, meta: AttentionMetadata, cfg: Mo
         # k_cache/v_cache [B, T, H, D], B=1
         k_cache, v_cache = meta.cache.data[layer_index]
         k_cache, v_cache = k_cache[0, start:end], v_cache[0, start:end]
-        logger.info(f"compare_cache_against_kv_after_rope, i: {i}, layer_index: {layer_index}, start: {start}, end: {end}")
-        logger.info(f"compare_cache_against_kv_after_rope, max, k: {k.abs().max().item()}, k_cache: {k_cache.abs().max().item()}, v: {v.abs().max().item()}, v_cache: {v_cache.abs().max().item()}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"compare_cache_against_kv_after_rope, i: {i}, layer_index: {layer_index}, start: {start}, end: {end}")
+            logger.debug(f"compare_cache_against_kv_after_rope, max, k: {k.abs().max().item()}, k_cache: {k_cache.abs().max().item()}, v: {v.abs().max().item()}, v_cache: {v_cache.abs().max().item()}")
         assert (k-k_cache).abs().max() < 1e-3
         assert (v-v_cache).abs().max() < 1e-3
 

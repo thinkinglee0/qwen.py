@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 from qwen.model import QwenForCausalLM
 from qwen.config import ModelConfig
-from qwen.engine import async_generate, LLMEngine
+from qwen.engine import async_generate, ServingDriver, LLMEngine
 from qwen.constants import MODEL_DIR
 from qwen.sampling import Sampling
 from qwen.scheduler import StaticScheduler
@@ -32,10 +32,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     cfg = ModelConfig.from_pretrained(MODEL_DIR)
     model = QwenForCausalLM(cfg)
-    scheduler = StaticScheduler(max_seqs=cfg.max_seqs, max_waiting=cfg.max_waiting)
+    scheduler = StaticScheduler(cfg)
     engine = LLMEngine(model, scheduler)
-    engine.start()      # start the run_loop in a separate thread
-    app.state.engine = engine
+    driver = ServingDriver(engine)
+    driver.start()      # start the run_loop in a separate thread
+    app.state.driver = driver
     yield
 
 class GenRequest(BaseModel):
@@ -48,8 +49,8 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 
 logger.info("Qwen HTTP service is starting...")
 
-def get_engine(request: Request) -> LLMEngine:
-    return request.app.state.engine
+def get_driver(request: Request) -> ServingDriver:
+    return request.app.state.driver
 
 @app.get("/health")
 async def stream():
@@ -59,14 +60,14 @@ async def stream():
     return StreamingResponse(gen(), media_type="text/plain")
 
 
-def _generate_stream_imp(http_req: HTTPRequest, req: GenRequest, engine: LLMEngine,
+def _generate_stream_imp(http_req: HTTPRequest, req: GenRequest, driver: ServingDriver,
                          payload_generate: Callable[[str], bytes] = lambda text: orjson.dumps({"text": text}),
                          prefix: bytes=b"data: ", suffix: bytes=b"\n\n"):
     input_ids = tokenizer(req.prompt).input_ids     # convert prompt to token ids
 
     async def sse():
         try:
-            async for token in async_generate(engine, input_ids, req.sampling):
+            async for token in async_generate(driver, input_ids, req.sampling):
                 if await http_req.is_disconnected():      # client closed connection
                     break
                 text = tokenizer.decode(token)
@@ -80,20 +81,20 @@ def _generate_stream_imp(http_req: HTTPRequest, req: GenRequest, engine: LLMEngi
     return StreamingResponse(sse(), media_type="text/event-stream")
 
 @app.post("/generate_stream")
-async def generate_stream(http_req: HTTPRequest, req: GenRequest, engine: LLMEngine = Depends(get_engine)):
+async def generate_stream(http_req: HTTPRequest, req: GenRequest, driver: ServingDriver = Depends(get_driver)):
     return _generate_stream_imp(
-        http_req, req, engine,
+        http_req, req, driver,
         payload_generate=lambda text: orjson.dumps({"text": text}),
         prefix=b"data: ", suffix=b"\n\n",
     )
 
 # curl -N -X POST
 @app.post("/generate_stream_plain")
-async def generate_stream_plain(http_req: HTTPRequest, req: GenRequest, engine: LLMEngine = Depends(get_engine)):
+async def generate_stream_plain(http_req: HTTPRequest, req: GenRequest, driver: ServingDriver = Depends(get_driver)):
     assert req.prompt is not None, "Prompt is required"
 
     return _generate_stream_imp(
-        http_req, req, engine,
+        http_req, req, driver,
         payload_generate=lambda text: text.encode(),
         prefix=b"", suffix=b"",
     )

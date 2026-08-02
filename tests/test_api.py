@@ -5,15 +5,15 @@ import pytest_asyncio
 import pytest
 
 from httpx import ASGITransport, AsyncClient
-from qwen.api import app, get_engine
+from qwen.api import app, get_driver
 from constants import PROMPT_CLASSICAL
 
 logger = logging.getLogger(__name__)
 
 
 @pytest_asyncio.fixture(loop_scope="module")
-async def api_client(target_engine):
-    app.dependency_overrides[get_engine] = lambda: target_engine
+async def api_client(target_driver):
+    app.dependency_overrides[get_driver] = lambda: target_driver
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -33,5 +33,7 @@ async def test_endpoint_generate_stream(api_client):
         async for line in resp.aiter_lines():
             if line.startswith("data: "):
                 chunks.append(line.removeprefix("data: ").strip())
-    logger.info(f"fastapi output: |{chunks}|")
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"fastapi output: |{chunks}|")
     assert chunks and chunks[-1] == "[DONE]"

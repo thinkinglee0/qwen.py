@@ -6,7 +6,7 @@ from constants import *
 from qwen.config import ModelConfig
 from qwen.model import QwenForCausalLM
 from qwen.constants import MODEL_DIR
-from qwen.engine import LLMEngine
+from qwen.engine import ServingDriver, LLMEngine
 from qwen.scheduler import StaticScheduler
 
 
@@ -92,23 +92,26 @@ def target_model(target_config):
 
 @pytest.fixture(scope="session")
 def target_scheduler(target_config):
-    return StaticScheduler(max_seqs=target_config.max_seqs, max_waiting=target_config.max_waiting)
+    return StaticScheduler(target_config)
 
 @pytest.fixture(scope="session")
-def target_engine(target_model, target_scheduler):
+def target_driver(target_model, target_scheduler):
     engine = LLMEngine(target_model, target_scheduler)
-    engine.start()
-    return engine
+    driver = ServingDriver(engine)
+    driver.start()
+    return driver
 
 @pytest.fixture(scope="function")
 def target_model_with_function_scope(target_config):
     return QwenForCausalLM(target_config)
 
 @pytest.fixture(scope="function")
-def target_engine_with_function_scope(target_model, target_scheduler):
-    engine = LLMEngine(target_model, target_scheduler)
-    engine.start()
-    return engine
+def target_driver_with_function_scope(target_model_with_function_scope):
+    scheduler = StaticScheduler(target_model_with_function_scope.config)
+    engine = LLMEngine(target_model_with_function_scope, scheduler)
+    driver = ServingDriver(engine)
+    driver.start()
+    return driver
 
 
 # instance of modeling_qwen2.py from transformers

@@ -183,7 +183,8 @@ def test_sample_all_neg_inf_row_does_not_crash():
     out = sample(logits, torch.tensor([1.0]),
                  torch.tensor([0]), torch.tensor([1.0]))
     assert out.shape == (1,)
-    logger.info(f"Sampled index: {out.item()}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Sampled index: {out.item()}")
     assert 0 <= out.item() < 5  # valid index, not out of bounds
 
 

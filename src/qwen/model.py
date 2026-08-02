@@ -23,7 +23,7 @@ class QwenModel(nn.Module):
             [DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
 
-    def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> CausalLMOutputWithPast:
+    def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> torch.Tensor:
         # input_ids [T], hidden_states [T, hidden_size]
         hidden_states = self.embed_tokens(input_ids)
 
@@ -52,7 +52,7 @@ class QwenForCausalLM(nn.Module):
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> CausalLMOutputWithPast:
+    def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> torch.Tensor:
         # input_ids: packed varlen, shape [T]
         hidden_states = self.model.forward(input_ids, meta)
 
