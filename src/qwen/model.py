@@ -37,19 +37,21 @@ class QwenModel(nn.Module):
 class QwenForCausalLM(nn.Module):
     def __init__(self, cfg: ModelConfig, max_seqs: int = 20, cache_len: int = 500):
         super().__init__()
-        self.config = dataclasses.replace(cfg, weights=None, max_seqs=max_seqs, cache_len=cache_len)
+        self.config = dataclasses.replace(cfg, weights=None, max_seqs=max_seqs, cache_len=cache_len)    # deep copy without weights
+        self.config.weights = cfg.weights   # shallow copy, keep the original weights
+
         self.device = self.config.device     # resolved in config
         self.dtype = self.config.dtype
 
-        self.model = QwenModel(cfg)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.model = QwenModel(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
-        assert cfg.weights is not None, "weights must be provided to QwenForCausalLM"
-        missing, unexpected = self.load_state_dict(cfg.weights, strict=False)
+        assert self.config.weights, "weights must be provided to QwenForCausalLM"
+        missing, unexpected = self.load_state_dict(self.config.weights, strict=False)
         assert not unexpected, f"stale/renamed keys: {unexpected[:5]}"
         assert missing in ([], ["lm_head.weight"]), f"missing: {missing}"
 
-        if cfg.tie_word_embeddings:
+        if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> torch.Tensor:
@@ -62,11 +64,16 @@ class QwenForCausalLM(nn.Module):
         return self.lm_head(hidden_states)  # shape [T, vocab_size]
 
     def sampler(self, logits, prompt_tokens, output_tokens, sampling_meta: SamplingMetadata | None = None) -> torch.Tensor:
+        if not self.config.do_penalities and not self.config.do_sample:     # shortcut for greedy decoding without penalties
+            return logits.argmax(dim=-1)
+        
         if sampling_meta is None:
             B, _ = logits.size()
             sampling_meta = SamplingMetadata(config=self.config, bsz=B)
-        
-        logits = apply_penalties2(logits, prompt_tokens, output_tokens, sampling_meta, self.config.vocab_size)
+
+        if self.config.do_penalities:
+            logits = apply_penalties2(logits, prompt_tokens, output_tokens, sampling_meta, self.config.vocab_size)
+
         if self.config.do_sample:
             next_tokens = sample2(logits, sampling_meta)
         else:

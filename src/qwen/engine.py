@@ -1,18 +1,17 @@
-import copy
+import schedule
 import logging
 import threading
+import time
 import torch
 import asyncio
 from typing import AsyncIterator
 
-from qwen import sampling
 from qwen.model import QwenForCausalLM
 from qwen.cache import init_kv_cache2
-from qwen.sampling import SamplingMetadata
 from qwen.attention import build_prefill_metadata, build_decode_metadata
-from qwen.request import ModelRequest
 from qwen.sampling import Sampling
-from qwen.scheduler import Scheduler, BatchRequest
+from qwen.scheduler import Scheduler, BatchRequest, ModelRequest
+from qwen.constants import DEFAULT_MAX_NEW_TOKEN
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ def _decode_step(model: QwenForCausalLM, batch: BatchRequest, cache):
 def generate(
     model: QwenForCausalLM,
     input_ids: list[list[int]],    # raw tokenizer output, list of variable-length id sequences
-    max_new_tokens: int = 300,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN,
     temperatures: list[float] | None = None,
     use_cache: bool = True,
 ) -> list[list[int]]:
@@ -79,6 +78,8 @@ def _generate(
             for request in batch_requests.reqs
         ]
     max_cycles = min(new_token_budget)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"_generate: max_cycles: {max_cycles}, cache_len: {model.config.cache_len}, new_token_budget: {new_token_budget}")
     if use_cache:
         cycles_prefill_loop, cycles_decode_loop = 1,  max_cycles- 1
         cache = init_kv_cache2(model.config, batch_requests.batch_size, model.config.cache_len)
@@ -101,37 +102,47 @@ def _generate(
 
         _decode_step(model=model, batch=batch_requests, cache=cache)
 
-class LLMEngine:
-    def __init__(self, model, scheduler: Scheduler):
-        self.model = model
-        self.scheduler = scheduler          # single shared instance
+    # finalize: if scheduler is present, notify it that this batch is done
+    if batch_requests.scheduler is not None:
+            batch_requests.scheduler.finish_running_batch()
 
-def run_to_completion(engine: LLMEngine, batch_input_ids: list[list[int]], sampling: Sampling | None = None, max_new_tokens: int = 300) -> list[list[int]]:
+class LLMEngine:
+    def __init__(self, model: QwenForCausalLM, scheduler: Scheduler):
+        self.model: QwenForCausalLM = model
+        self.scheduler: Scheduler = scheduler          # single shared instance
+
+    def run_to_completion(self) -> list[list[int]]:
+        output_ids = []
+        while self.scheduler.has_unfinished():          # closed queue → terminates
+            batch_requests = self.scheduler.schedule()
+            try:
+                _generate(model=self.model, batch_requests=batch_requests, use_cache=True,)
+                output_ids.extend(batch_requests.output_ids)       # read results directly, no Future
+            except Exception as e:
+                logger.exception(f"Error occurred while generating")
+
+        return output_ids
+
+def benchmark(engine: LLMEngine, batch_input_ids: list[list[int]],
+              sampling: Sampling | None = None, max_new_tokens: int = 300) -> tuple[list[list[int]], float]:
     """Run all requests to completion without blocking, for benchmarking."""
+    assert len(batch_input_ids) > 0 and len(batch_input_ids) <= engine.scheduler.max_waiting, "batch_input_ids must not be empty or longer than max_waiting queue"
     queues = []
     for input_ids in batch_input_ids:
-        loop = asyncio.get_running_loop()
+        loop = None
         req = ModelRequest(loop, input_ids, sampling, max_new_tokens)
         if engine.scheduler.add_request(req):       # very unlikely to reject in this test scenario
             queues.append(req.token_queue)
         else:
             raise RuntimeError("Request rejected: too many waiting requests")
 
-    # output generated tokens
-    batch_output_ids = []
-    for queue in queues:
-        output_ids = []
-        while True:
-            tok = queue.get_nowait()
-            if tok is None:                              # sentinel = stream end
-                break
-            elif isinstance(tok, Exception):
-                raise tok
-            else:
-                output_ids.append(tok)
-        batch_output_ids.append(output_ids)
+    t0 = time.perf_counter()
+    output_ids = engine.run_to_completion()         # drains the whole queue synchronously
+    elapsed = time.perf_counter() - t0
 
-    return batch_output_ids
+    engine.scheduler.log_stats(is_exitting=True)    # for last stats but the logging interval does not elapse.
+
+    return output_ids, elapsed
 
 
 class ServingDriver:
@@ -142,8 +153,12 @@ class ServingDriver:
         self.cond = threading.Condition(self.lock)
 
     def start(self):
+        logger.info("run_loop thread is starting")
         self._thread = threading.Thread(target=self.run_loop, daemon=True)
         self._thread.start()
+
+    def stop(self):
+        self._shutdown = True
 
     def submit(self, input_ids, sampling, max_new_tokens: int)  -> asyncio.Queue[int | None | Exception] | None:
         with self.cond:
@@ -162,7 +177,7 @@ class ServingDriver:
             with self.cond:
                 while not self.engine.scheduler.has_unfinished() and not self._shutdown:
                     self.cond.wait()
-                batch_requests = self.engine.scheduler.scheduler()      # called by run_loop when idle with lock held, returns BatchRequest
+                batch_requests = self.engine.scheduler.schedule()      # called by run_loop when idle with lock held, returns BatchRequest
 
             if not batch_requests:
                 if logger.isEnabledFor(logging.DEBUG):
@@ -172,15 +187,15 @@ class ServingDriver:
             try:
                 _generate(model=self.engine.model, batch_requests=batch_requests, use_cache=True,)
             except Exception as e:
-                logger.error(f"Error occurred while generating: {e}")
+                logger.exception(f"Error occurred while generating")
                 for req in batch_requests.reqs:
-                    req.loop.call_soon_threadsafe(req.token_queue.put_nowait, e)
+                    req.loop.call_soon_threadsafe(req.token_queue.put_nowait, e) if req.loop is not None else None
 
 async def async_generate(
     driver: ServingDriver,
     input_ids: list[int],    # one variable-length id sequence
     sampling: Sampling | None = None,
-    max_new_tokens: int = 300,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN,
 ) -> AsyncIterator[int]:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"async_generate: input_ids: {input_ids}, sampling: {sampling}")

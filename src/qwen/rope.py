@@ -75,7 +75,7 @@ class LinearRoPE(BaseRoPE):
 #         return super().__call__(q, k, offset)
     
 def init_rope(config: ModelConfig) -> BaseRoPE:
-    assert config.rope_scaling is not None, "rope_scaling must be provided in config"
+    assert config.rope_scaling, "rope_scaling must be provided in config"
     match config.rope_scaling.get("rope_type", "default"):
         case "default":
             return DefaultRoPE(config.head_dim, config.cache_len, config.rope_theta)

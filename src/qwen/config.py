@@ -9,7 +9,7 @@ import dataclasses
 import logging
 
 from qwen.utils import resolve_device, default_dtype
-
+from qwen.constants import DEFAULT_CACHE_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class ModelConfig():
     temperature: float = 1.
     top_k: float = 0.
     top_p: float = 1.
+    do_penalities: bool = True
     repetition_penalty: float = 1.
     frequency_penalty: float = 0.
     presence_penalty: float = 0.
@@ -64,9 +65,10 @@ class ModelConfig():
     weights: Any | None = None
     device: torch.device | None = None
     dtype: torch.dtype | None = None
-    cache_len: int = 1000
-    max_seqs: int = 20
-    max_waiting: int = 20
+    cache_len: int = DEFAULT_CACHE_LEN
+    max_seqs: int = 8
+    max_waiting: int = 64
+    stat_interval: float = 60
 
     def __post_init__(self):
         if self.head_dim == 0:
@@ -112,11 +114,12 @@ def load_qwen_weights(config: ModelConfig, dtype=torch.float32):
     flat = load_file(Path(config.model_dir) / "model.safetensors", device="cpu")
     # cast to desired dtype
     flat = {k: v.to(dtype) if v.is_floating_point() else v for k, v in flat.items()}
+    logger.info(f"load_qwen_weights finished")
 
     return flat
 
 if __name__ == "__main__":
     model_dir = "../qwen2.5-0.5b"
     config = ModelConfig.from_pretrained(model_dir)
-    assert config.weights is not None
+    assert config.weights
     print(config.weights.keys())

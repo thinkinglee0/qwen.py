@@ -222,7 +222,7 @@ class Attention(nn.Module):
         if meta.is_prefill:
             # full prefill: packed k/v IS the complete KV (cu_seqlens_q == cu_seqlens_k).
             # The cache is write-only here; varlen cannot express the slab stride anyway.
-            assert flash_attn_varlen_func is not None, "flash_attn not installed"
+            assert flash_attn_varlen_func, "flash_attn not installed"
             return flash_attn_varlen_func(
                 q, k, v,
                 meta.cu_seqlens_q, meta.cu_seqlens_k,
@@ -232,7 +232,7 @@ class Attention(nn.Module):
 
         # decode: the new token is already in the cache (scatter ran above), so k=v=None.
         # cache_batch_idx maps batch slot -> physical cache row; required once B != max_seqs.
-        assert flash_attn_with_kvcache is not None, "flash_attn not installed"
+        assert flash_attn_with_kvcache, "flash_attn not installed"
         return flash_attn_with_kvcache(
             q.unsqueeze(1), k_cache, v_cache,
             cache_seqlens=meta.cache_seqlens,

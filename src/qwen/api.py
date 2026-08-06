@@ -91,7 +91,7 @@ async def generate_stream(http_req: HTTPRequest, req: GenRequest, driver: Servin
 # curl -N -X POST
 @app.post("/generate_stream_plain")
 async def generate_stream_plain(http_req: HTTPRequest, req: GenRequest, driver: ServingDriver = Depends(get_driver)):
-    assert req.prompt is not None, "Prompt is required"
+    assert req.prompt, "Prompt is required"
 
     return _generate_stream_imp(
         http_req, req, driver,

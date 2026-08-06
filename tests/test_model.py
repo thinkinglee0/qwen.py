@@ -206,8 +206,8 @@ def compare_cache_against_kv_after_rope(B: int, meta: AttentionMetadata, cfg: Mo
         logger.error("compare_cache_against_kv_after_rope is only implemented for B=1")
         return
 
-    assert meta.cache is not None, "cache is None, please turn on use_cache in build_prefill_metadata/build_decode_metadata"
-    assert meta.debug_k_list is not None and meta.debug_v_list is not None, "debug_k_list/debug_v_list are None, please turn on debug in build_prefill_metadata/build_decode_metadata"
+    assert meta.cache, "cache is None, please turn on use_cache in build_prefill_metadata/build_decode_metadata"
+    assert meta.debug_k_list and meta.debug_v_list, "debug_k_list/debug_v_list are None, please turn on debug in build_prefill_metadata/build_decode_metadata"
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"compare_cache_against_kv_after_rope, debug_k_list.len: {len(meta.debug_k_list)}")

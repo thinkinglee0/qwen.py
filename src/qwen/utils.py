@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import logging
+import orjson, random
 
 logger = logging.getLogger(__name__)
 
@@ -59,3 +60,37 @@ class RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+def sample_sharegpt(path, tokenizer, num_requests=256, max_p_len=1024, cache_len=2048, seed=0) -> list[list[int]]:
+    with open(path) as f:
+        raw = orjson.loads(f.read())
+    raw = [d for d in raw if len(d["conversations"]) >= 2]
+    random.Random(seed).shuffle(raw)
+
+    reqs = []
+    for d in raw:
+        prompt, completion = d["conversations"][0]["value"], d["conversations"][1]["value"]
+        p_input_ids = tokenizer(prompt).input_ids
+        p_len = len(p_input_ids)
+        o_len = len(tokenizer(completion).input_ids)
+        # vLLM-compatible filter — must match exactly for a valid A/B
+        if p_len < 4 or o_len < 4:          # degenerate turns skew the tail
+            continue
+        if p_len >= max_p_len or p_len + o_len > cache_len:   # keep every request inside one cache slab
+            continue
+        reqs.append(p_input_ids)
+        if len(reqs) == num_requests:
+            break
+    return reqs
+
+
+# nested dict/list: round recursively before dumps, since default won't help
+def round_floats(o, nd=2):
+    if isinstance(o, float):
+        return round(o, nd)
+    if isinstance(o, dict):
+        return {k: round_floats(v, nd) for k, v in o.items()}
+    if isinstance(o, list):
+        return [round_floats(v, nd) for v in o]
+    return o

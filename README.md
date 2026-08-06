@@ -16,8 +16,8 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M3**    | Generation loop, Streaming HTTP service                         | ✅ done, introduce FastAPI, async                                                                                                                                                                                                                                         |
 | **M4**    | sampling, restructure the project layout                        | ✅ done, add repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial; isolate source code from unit tests; extract attention/mlp/decode_layer/norm from model.py, and bind weights to the `nn.Module` tree through the `load_state_dict` function. |
 | **M5**    | static batching                                                 | ✅done. pack a list of **variable-length** id sequences into a 1-dim id list, opt for SDPA attention in my local macbook for quick functional verifications; add request to `StaticScheduler`, and then scheduler in a fixed batch.                                       |
-| **M6**    | performance work on 7B / A10                                    | 🔜 next — focus on `flash_attn` and performance.                                                                                                                                                                                                                         |
-| later     | continuous batching,                                            | planned                                                                                                                                                                                                                                                                  |
+| **M6**    | continuous batching                                             | 🔜 next                                                                                                                                                                                                                                                                  |
+| later     | performance of static and continuous batchings on 7B / A10      | planed                                                                                                                                                                                                                                                                   |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
 
@@ -38,28 +38,55 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 - **Sampling** — parse `generation_conf.json`, apply repetition/frequency/presence penalties just after `forward`, then do sampling if `do_sample` swtich is on; sampling includes temperature, top_k, top_p, multinomial.
 - **Restructure the project layout** — rename `qwen.py` to `model.py`, `main.py` to `api.py`, put sync/async generations into `engine.py`, place source code files in the `src/qwen` folder, and unit tests in `tests`.
 - **Static batching** — pack a list of **variable-length** id sequence into an 1-dim id list by `pack_sequences`, `scatter_to_kv_cache` after the projection and rope of K and V; select flash_attn for cloud A10 VPS, falls back to SDPA attention in my locl macbook for quick functional verifications.
+- **Benchmarking and statistic** — statisticize `TTFT`, `TPOT`, and `ITL` for each request, and triggered periodically after each step; add a regular benchmark for functionality verification and ShareGPT benchmark for performance profiling.
 
 ---
 
-## Repository layout
+## Performance profiling
 
-| File                                       | Responsibility                                                                                                                                                                                                                                                                                               |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `src/qwen/config.py`                       | `ModelConfig` dataclass, `from_pretrained` (parse `config.json` and `generation_config.json`), `load_qwen_weights` (safetensors + dtype + tied-embedding handling)                                                                                                                                           |
-| `src/qwen/rope.py`                         | `BaseRoPE` + `Default` / `Linear` / `DynamicNTK` variants, `init_rope` factory                                                                                                                                                                                                                               |
-| `src/qwen/model.py`                        | `QwenForCausalLM` holds the Module tree, `QwenModel`, the main Module node with norm, embed_tokens, and layers.                                                                                                                                                                                              |
-| `src/qwen/attention.py`                    |                                                                                                                                                                                                                                                                                                              |
-| `src/qwen/{decoder_layer, mlp}.py`         | an iteration including attention and mlp, output normalized hidden_state.                                                                                                                                                                                                                                    |
-| `src/qwen/cache.py`                        | KV cache                                                                                                                                                                                                                                                                                                     |
-| `src/qwen/engine.py`                       | generation loop and async generation loop; pack varlen id sequence and build `AttentionMetadata` for prefill and decode                                                                                                                                                                                      |
-| `src/qwen/api.py`                          | FastAPI endpoints                                                                                                                                                                                                                                                                                            |
-| `src/qwen/sampling.py`                     | repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial;                                                                                                                                                                                                                              |
-| `src/qwen/utils.py`                        | some common functions                                                                                                                                                                                                                                                                                        |
-| `tests/test_model.py`                      | unit tests by pytest for `QwenModel` and `QwenForCausalLM`, including comparasons `logits and activation` against HF `modeling_qwen2.py` on `prefill` with different lengths, and `prefill+decode` on solo prompt and ragged batch prompts; self-comparason of `prefill(L-P)+decode(P)` against `prefill(L). |
-| `tests/test_engine.py`                     | unit tests for generation loop, comparason between `generate` and `async_generate`                                                                                                                                                                                                                           |
-| `tests/test_api.py`                        | unit tests for FastAPI                                                                                                                                                                                                                                                                                       |
-| `tests/test_rope.py`                       | unit tests by pytest for `rope.py`                                                                                                                                                                                                                                                                           |
-| `docs/qwen25_inference_alignment_notes.md` | Engineering notes — the pitfalls hit while aligning against HuggingFace, and the methodology used to find them                                                                                                                                                                                               |
+**Dataset**: `ShareGPT_V3_unfiltered_cleaned_split.json`
+
+**Random seed for shuffle**: 0
+
+### 1. Static Batching
+
+#### 1.1 Platform: CPU Intel Core i7
+
+**Max number of output tokens**: 512
+
+**Conclusion**: 
+
+1. **Compute-bound in Prefill phase**: `Prefill_mean ∝ batch_size`, and it degrades along `batch_size` increasing, so it's compute-bound.
+
+2. **Sweet point** lies in batch size 16 - 32.
+   
+   Given `decode throughput = 1000*batch_size/ITL_mean`,
+   
+   `decode throughputs`: [8.13, 17.24, 31.24, 52.76, 70.08, 84.89, 90.57]
+   
+   `decode throughput ratio`: [**1.12**, 0.81, 0.69, **0.33**, **0.21**, 0.07], 
+   
+   `ITL ratio`: [-0.06, 0.1, 0.18, **0.51**, **0.65**, 0.87]
+
+3. **Anomaly analisis**: decode throughput ratio is 1.12 from batch_isze 1 to 2, greater than 1. It was caused by CPU existing from Turbo mode due to my operations (1. `caffeinate -i -m`; 2. run benchmark; 3. press power button of my MacBook).
+
+| Batch size /<br/>Request number | Prefill<br/>=TTFT - Queue_delay                                                                                                                            | TPOT                                                                                                                                                | ITL                                                                                                                                                     |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1/16                            | {<br/> "n": 512,<br/> "mean": 132.789,<br/> "std": 20.351,<br/> "p50": 123.835,<br/> "p90": 158.678,<br/> "p99": 200.014,<br/> "max": 238.765<br/> }       | {<br/> "n": 512,<br/> "mean": 123.055,<br/> "std": 6.967,<br/> "p50": 125.854,<br/> "p90": 127.2,<br/> "p99": 128.289,<br/> "max": 136.474<br/> }   | {<br/> "n": 53223,<br/> "mean": 123.057,<br/> "std": 10.703,<br/> "p50": 126.926,<br/> "p90": 130.222,<br/> "p99": 132.54,<br/> "max": 718.706<br/> }   |
+| 2/32                            | {<br/> "n": 512,<br/> "mean": 154.021,<br/> "std": 32.566,<br/> "p50": 142.686,<br/> "p90": 198.823,<br/> "p99": 268.931,<br/> "max": 304.286<br/> }       | {<br/> "n": 512,<br/> "mean": 116.047,<br/> "std": 1.061,<br/> "p50": 115.814,<br/> "p90": 117.372,<br/> "p99": 120.021,<br/> "max": 121.719<br/> } | {<br/> "n": 50226,<br/> "mean": 116.033,<br/> "std": 5.726,<br/> "p50": 115.211,<br/> "p90": 119.312,<br/> "p99": 133.598,<br/> "max": 293.065<br/> }   |
+| 4/64                            | {<br/> "n": 512,<br/> "mean": 248.721,<br/> "std": 72.967,<br/> "p50": 236.974,<br/> "p90": 351.284,<br/> "p99": 461.978,<br/> "max": 493.999<br/> }       | {<br/> "n": 512,<br/> "mean": 128.17,<br/> "std": 2.515,<br/> "p50": 128.205,<br/> "p90": 130.687,<br/> "p99": 133.46,<br/> "max": 138.427<br/> }   | {<br/> "n": 46170,<br/> "mean": 128.044,<br/> "std": 11.133,<br/> "p50": 127.213,<br/> "p90": 132.165,<br/> "p99": 149.898,<br/> "max": 1086.059<br/> } |
+| 8/64                            | {<br/> "n": 512,<br/> "mean": 522.491,<br/> "std": 114.651,<br/> "p50": 504.209,<br/> "p90": 657.909,<br/> "p99": 809.124,<br/> "max": 809.124<br/> }      | {<br/> "n": 512,<br/> "mean": 151.551,<br/> "std": 3.149,<br/> "p50": 151.117,<br/> "p90": 156.75,<br/> "p99": 160.548,<br/> "max": 160.548<br/> }  | {<br/> "n": 41722,<br/> "mean": 151.636,<br/> "std": 9.636,<br/> "p50": 149.803,<br/> "p90": 159.913,<br/> "p99": 185.699,<br/> "max": 317.199<br/> }   |
+| 16/64                           | {<br/> "n": 512,<br/> "mean": 993.516,<br/> "std": 148.212,<br/> "p50": 1009.939,<br/> "p90": 1172.503,<br/> "p99": 1313.25,<br/> "max": 1313.25<br/> }    | {<br/> "n": 512,<br/> "mean": 228.547,<br/> "std": 6.539,<br/> "p50": 227.93,<br/> "p90": 237.638,<br/> "p99": 243.826,<br/> "max": 243.826<br/> }  | {<br/> "n": 38854,<br/> "mean": 228.307,<br/> "std": 12.012,<br/> "p50": 226.788,<br/> "p90": 239.941,<br/> "p99": 276.275,<br/> "max": 351.846<br/> }  |
+| 32/96                           | {<br/> "n": 512,<br/> "mean": 1871.921,<br/> "std": 191.012,<br/> "p50": 1918.657,<br/> "p90": 2165.994,<br/> "p99": 2214.558,<br/> "max": 2214.558<br/> } | {<br/> "n": 512,<br/> "mean": 376.967,<br/> "std": 7.716,<br/> "p50": 378.624,<br/> "p90": 384.873,<br/> "p99": 391.298,<br/> "max": 391.729<br/> } | {<br/> "n": 35717,<br/> "mean": 376.976,<br/> "std": 18.841,<br/> "p50": 376.089,<br/> "p90": 391.813,<br/> "p99": 447.585,<br/> "max": 595.678<br/> }  |
+| 64/256                          | {<br/> "n": 512,<br/> "mean": 3860.661,<br/> "std": 375.43,<br/> "p50": 3868.442,<br/> "p90": 4454.093,<br/> "p99": 4454.093,<br/> "max": 4454.093<br/> }  | {<br/> "n": 512,<br/> "mean": 706.547,<br/> "std": 7.933,<br/> "p50": 707.658,<br/> "p90": 718.253,<br/> "p99": 718.253,<br/> "max": 718.253<br/> } | {<br/> "n": 33484,<br/> "mean": 706.657,<br/> "std": 32.015,<br/> "p50": 701.086,<br/> "p90": 739.056,<br/> "p99": 808.442,<br/> "max": 1032.269<br/> } |
+
+#### 1.2 Platform: NVIDIA A10
+
+later
+
+### 2 Continuous Batching
+
+later
 
 ---
 

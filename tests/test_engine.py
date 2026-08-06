@@ -1,13 +1,20 @@
 import pytest
 import logging
+from pathlib import Path
+from datetime import datetime
 
-from qwen.engine import async_generate, generate
-from constants import MAX_NEW_TOKEN_NUM
-from qwen.engine import ServingDriver
-
+from constants import *
+from qwen.engine import async_generate, generate, benchmark
+from constants import MAX_NEW_TOKEN_NUM, REP_PEN_OFF, TEMP_GREEDY, LOG_DIR
+from qwen.engine import ServingDriver, LLMEngine
+from qwen.metrics import analyze_stats
+from qwen.model import QwenForCausalLM
+from qwen.scheduler import StaticScheduler
+from qwen.utils import sample_sharegpt
 
 logger = logging.getLogger(__name__)
 
+# target model == reference model?
 @pytest.mark.parametrize(
     ("encoding_fixture", "list_fixture"),
     [
@@ -20,16 +27,13 @@ def test_generation_compared_with_reference(target_model_with_function_scope, re
     input_list = request.getfixturevalue(list_fixture)
     B = len(input_list)
 
-    rep_pen_off = 1.
-    temp_greedy = 0.
-
-    target_model_with_function_scope.config.repetition_penalty = rep_pen_off
-    target_model_with_function_scope.config.temperature = temp_greedy
+    target_model_with_function_scope.config.repetition_penalty = REP_PEN_OFF
+    target_model_with_function_scope.config.temperature = TEMP_GREEDY
     target_output_token_ids = generate(target_model_with_function_scope, input_list, max_new_tokens=MAX_NEW_TOKEN_NUM)
 
     try:
         original_repetition_penalty = ref_model.generation_config.repetition_penalty
-        ref_model.generation_config.repetition_penalty = rep_pen_off
+        ref_model.generation_config.repetition_penalty = REP_PEN_OFF
         ref_output = ref_model.generate(        # tensor output, shape [B, T]
             **encoding,
             max_new_tokens=MAX_NEW_TOKEN_NUM,
@@ -74,6 +78,7 @@ def test_generations_differentiation(target_model, tokenizer, list_fixture, requ
 
     assert sync_ids0 != sync_ids1
 
+# synchronous == asynchronous for target model?
 @pytest.mark.parametrize(
     ("list_fixture"),
     [
@@ -86,8 +91,8 @@ async def test_streaming_generation(target_driver_with_function_scope: ServingDr
     input_list = request.getfixturevalue(list_fixture)
     B = len(input_list)
 
-    temp_greedy = 0.
-    target_driver_with_function_scope.engine.model.config.temperature = temp_greedy
+    TEMP_GREEDY = 0.
+    target_driver_with_function_scope.engine.model.config.temperature = TEMP_GREEDY
 
     # async
     async_ids = [[] for _ in range(B)]
@@ -102,3 +107,62 @@ async def test_streaming_generation(target_driver_with_function_scope: ServingDr
         logger.info(f"sync output: |{tokenizer.decode(sync_ids[batch_idx])}|, len: {len(sync_ids[batch_idx])}")
 
     assert async_ids == sync_ids
+
+
+def _test_benchmark(engine: LLMEngine, input_ids:list[list[int]], tok):
+    assert engine.scheduler.is_benchmarking
+
+    # clean
+    input_ids = [
+        i for i in input_ids if len(i) < engine.model.config.cache_len
+    ]
+
+    num_reqs = len(input_ids)
+    time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_name_flag = f'{engine.model.config.device}.{engine.model.config.max_seqs}.{num_reqs}.{time_str}'
+    engine.scheduler.log_name_flag = log_name_flag      # pass to `scheduler` for `stats.xxx` log
+
+    logger.info(f"Starting benchmark..., number of requests: {num_reqs}, max_seqs: {engine.model.config.max_seqs}, cache_len: {engine.model.config.cache_len}")
+    output_ids, elapsed = benchmark(engine, input_ids, max_new_tokens=1024)
+    assert num_reqs == len(output_ids)
+
+    log_path = Path(LOG_DIR)
+    log_path.mkdir(parents=True, exist_ok=True)
+
+    # write input+out to file
+    output_file = log_path / f'output.{log_name_flag}'
+    with open(output_file, "wb") as f:
+        for idx, (input, out) in enumerate(zip(input_ids, output_ids)):
+            line = f"idx: {idx}, len: {len(input)}-{len(out)}, ||{tok.decode(input)}||\n||{tok.decode(out)}||\n"
+            f.write(line.encode())
+
+    # write stats to file
+    assert len(engine.scheduler.total_metrics) > 0
+    json_bytes = analyze_stats(engine.scheduler.total_metrics)
+    logger.info(f"benchmark_stats: {json_bytes.decode()}")
+    stats_log_file = log_path / f'benchmark_stats.{log_name_flag}'
+    with open(stats_log_file, "wb") as f:
+        f.write(json_bytes)
+
+    num_output_ids = sum([sum(o) for o in output_ids])
+    logger.info(f"Benchmark results: {elapsed} seconds, rate: {num_output_ids/elapsed/1000} r/s")
+
+def test_benchmark_regularly(target_engine_for_regular_benchmarking, batch_for_regular_benchmarking, tokenizer):
+    _test_benchmark(target_engine_for_regular_benchmarking, batch_for_regular_benchmarking, tokenizer)
+
+# pytest -x --log-file-level=DEBUG tests/test_engine.py::test_benchmark_sharegpt --cache_len=256 --req_num=512
+# excluded from execution from file, only allowed from specified execution.
+@pytest.mark.parametrize("B", [
+    1, 
+    # 2, 4, 8, 16, 32, 64,
+])
+def test_benchmark_sharegpt(target_config, shareGPT_batch_for_sharegpt_benchmarking, tokenizer, req_num:int, B:int, cache_len:int):
+
+    model = QwenForCausalLM(target_config, max_seqs=B, cache_len=cache_len)  # overwrite max_seqs and cache_len for benchmarking
+    model.config.stat_interval = 60.
+
+    scheduler = StaticScheduler(model.config, is_benchmarking=True)
+    scheduler.max_waiting=req_num
+    engine = LLMEngine(model, scheduler)
+
+    _test_benchmark(engine, shareGPT_batch_for_sharegpt_benchmarking, tokenizer)

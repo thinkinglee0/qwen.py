@@ -5,3 +5,4 @@ playgrounds/
 *.egg-info/
 *.bak
 test_playground.py
+data/

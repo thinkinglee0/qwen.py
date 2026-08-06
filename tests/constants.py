@@ -1,7 +1,22 @@
 # tests/constants.py
 
 # constant variables
+NINF = float("-inf")
 MAX_NEW_TOKEN_NUM = 40
+
+# benchmark
+SHARE_GPT_FILE_NAME = "./data/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHARE_GPT_REQ_NUM = 128
+SHARE_GPT_MAX_SEQS = 8
+
+DATA_DIR = "./data"
+LOG_DIR = "./log"
+
+# sampler
+REP_PEN_OFF = 1.
+TEMP_GREEDY = 0.
+
+# prompt
 PROMPT_CLASSICAL = "The capital of France is"
 PROMPT_BATCH_1 = [PROMPT_CLASSICAL]
 PROMPT_BATCH_2 = [PROMPT_CLASSICAL, "Hi"]
@@ -21,4 +36,31 @@ LONG_BATCH = [LONG_PROMPT_1,]
 LONG_BATCH_2 = [LONG_PROMPT_1, LONG_PROMPT_2]
 
 
-NINF = float("-inf")
+BATCH_FOR_BENCHMARKING = [
+    PROMPT_CLASSICAL,
+    "Hi",
+    "Hello",
+    "How are you?",
+    "What is your name?",
+    "Where are you from?",
+    "What do you do?",
+    "What is your favorite color?",
+    "What is your favorite food?",
+    "What is your favorite movie?",
+    "What do you know about me?",
+    "What is the meaning of life?",
+    "What is the purpose of existence?",
+    "What is the nature of reality?",
+    "What is the nature of consciousness?",
+    "What is the nature of the universe?",
+    "What is the nature of time?",
+    "What is the nature of space?",
+    "What is the nature of matter?",
+    "What is the nature of energy?",
+    "What is the nature of light?",
+    "What is the nature of sound?",
+    "What is the nature of gravity?",
+    "1+1=?",
+    "123*456=?",
+]
+
