@@ -154,7 +154,7 @@ def test_benchmark_regularly(target_engine_for_regular_benchmarking, batch_for_r
 # excluded from execution from file, only allowed from specified execution.
 @pytest.mark.parametrize("B", [
     1, 
-    # 2, 4, 8, 16, 32, 64,
+    2, 4, 8, 16, 32, 64,
 ])
 def test_benchmark_sharegpt(target_config, shareGPT_batch_for_sharegpt_benchmarking, tokenizer, req_num:int, B:int, cache_len:int):
 

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 MODULE_ORDER = ["test_rope", "test_sampling", "test_attention", "test_model", "test_engine", "test_api"]
 
 def pytest_collection_modifyitems(session, config, items):
-    excluded_names_from_file = {"test_benchmark_sharegpt"}
+    excluded_names_from_file = ["test_benchmark_sharegpt"]
 
     explicitly_called = any(fun_name in arg for fun_name in excluded_names_from_file for arg in config.args)
     if not explicitly_called:
@@ -26,7 +26,8 @@ def pytest_collection_modifyitems(session, config, items):
         deselected = []
         
         for item in items:
-            if item.name in excluded_names_from_file:
+            test_name = getattr(item, "originalname", None) or item.name
+            if test_name in excluded_names_from_file:
                 deselected.append(item)
             else:
                 selected.append(item)
