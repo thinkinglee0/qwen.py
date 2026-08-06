@@ -54,6 +54,8 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 
 **Max number of output tokens**: 512
 
+**Attention**: SDPA(Scaled Dot-Product Attention)
+
 **Conclusion**: 
 
 1. **Compute-bound in Prefill phase**: `Prefill_mean ∝ batch_size`, and it degrades along `batch_size` increasing, so it's compute-bound.
