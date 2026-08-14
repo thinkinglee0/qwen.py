@@ -2,16 +2,24 @@
 
 import json, torch
 from typing import Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from safetensors.torch import load_file
 import dataclasses
 import logging
+from collections.abc import Iterable
 
 from qwen.utils import resolve_device, default_dtype
-from qwen.constants import DEFAULT_CACHE_LEN
 
 logger = logging.getLogger(__name__)
+
+def _normalize_eos(value: int | Iterable[int] | None) -> frozenset[int]:
+    """HF configs expose eos_token_id as int, list[int], or None."""
+    if value is None:
+        return frozenset()
+    if isinstance(value, int):  # note: bool is a subclass of int, harmless here
+        return frozenset((value,))
+    return frozenset(value)
 
 @dataclass
 class ModelConfig():
@@ -41,16 +49,14 @@ class ModelConfig():
     do_sample: bool
     bos_token_id: int
     pad_token_id: int
-    eos_token_id: set[int]
-    top_p: float
-    top_k: float
+    eos_token_id: list[int] | int | None
 
     # optional from config.json
     rope_scaling: dict | None = None
 
     # optional from generation_config.json
     temperature: float = 1.
-    top_k: float = 0.
+    top_k: int = 0
     top_p: float = 1.
     do_penalities: bool = True
     repetition_penalty: float = 1.
@@ -59,16 +65,34 @@ class ModelConfig():
 
     # derived
     head_dim: int = 0
+    eos_token_id_set: frozenset[int] = field(init=False)
 
     # other
     model_dir: str = ""
     weights: Any | None = None
     device: torch.device | None = None
     dtype: torch.dtype | None = None
-    cache_len: int = DEFAULT_CACHE_LEN
-    max_seqs: int = 8
-    max_waiting: int = 64
-    stat_interval: float = 60
+
+    # continuous batching
+    use_d_first_schedule: bool=True         # D_first_preemptive_schedule if True else preemptive_schedule
+    max_model_len: int = 512                # todo: find a suitable value.
+    max_num_batched_tokens: int = 1024      # idem
+    long_prefill_token_threshold: int = 256 # idem
+    max_num_seqs: int = 128                 # batch size; idem
+    max_waiting: int = 64                   # idem
+
+    # paged cache
+    num_blocks: int = 1024*32   # 2 * 24 * 1024*32 * 16 * 2 * 64 * 2 B = 6442450944 B ≈ 6.4 GB
+    block_size: int = 16
+
+    # backoff after preempted
+    backoff_base: int = 2
+    backoff_cap: int = 64
+
+    # timing tasks
+    is_benchmarking: bool=False
+    stat_interval: float = 60               # sec
+    cache_verification_interval: float = 60 # sec
 
     def __post_init__(self):
         if self.head_dim == 0:
@@ -85,7 +109,9 @@ class ModelConfig():
         if self.dtype is None:
             self.dtype = default_dtype(self.device)
 
-        assert self.cache_len <= self.max_position_embeddings
+        assert self.max_model_len <= self.max_position_embeddings
+
+        self.eos_token_id_set = _normalize_eos(self.eos_token_id)
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":

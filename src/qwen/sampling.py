@@ -18,7 +18,7 @@ class Sampling:
     pres_pen: float | None = None
 
 @dataclass
-class SamplingMetadata:
+class TensorSampling:
     config: InitVar[ModelConfig]
     bsz: InitVar[int]
 
@@ -74,7 +74,7 @@ class SamplingMetadata:
             )
 
     @classmethod
-    def from_sampling_list(cls, samplings: list[Sampling], config: ModelConfig, bsz: int):
+    def from_sampling_list(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
         return cls(
             config=config,
             bsz=bsz,
@@ -111,12 +111,13 @@ def bin_counts_and_mask(
     return counts, counts > 0
 
 def apply_penalties2(logits, prompt_tokens: list[list[int]], output_tokens: list[list[int]],
-                     sampling_meta: SamplingMetadata, vocab_size: int):
+                     tensor_sampling: TensorSampling, vocab_size: int):
+    assert tensor_sampling.rep_pen is not None and tensor_sampling.freq_pen is not None and tensor_sampling.pres_pen is not None
     return apply_penalties(logits, prompt_tokens, output_tokens,
-                           sampling_meta.rep_pen, sampling_meta.freq_pen, sampling_meta.pres_pen, vocab_size)
+                           tensor_sampling.rep_pen, tensor_sampling.freq_pen, tensor_sampling.pres_pen, vocab_size)
 
 def apply_penalties(logits, prompt_tokens: list[list[int]], output_tokens: list[list[int]],
-                    rep_pen, freq_pen, pres_pen, vocab_size):
+                    rep_pen: torch.Tensor, freq_pen: torch.Tensor, pres_pen: torch.Tensor, vocab_size: int):
     # logits [bsz, vocab_size]
     bsz = logits.shape[0]
 
@@ -136,7 +137,7 @@ def apply_penalties(logits, prompt_tokens: list[list[int]], output_tokens: list[
     logits = logits - pres_pen[:, None] * output_mask
     return logits
 
-def apply_top_k(logits, top_k):
+def apply_top_k(logits: torch.Tensor, top_k: torch.Tensor):
     # logits [n, vocab]
     # top_k: [n] int; <=0 or >=vocab treated as no-op (disabled)
     n, vocab = logits.shape
@@ -158,7 +159,7 @@ def apply_top_k(logits, top_k):
                       torch.full_like(kth, float("-inf")), kth)
     return torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)    # <kth, set to -inf, otherwise keep
 
-def apply_top_p(logits, top_p):
+def apply_top_p(logits: torch.Tensor, top_p: torch.Tensor):
     # top_p: [n] float in (0,1]; 1.0 treated as no-op
     sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
     probs = sorted_logits.softmax(dim=-1)                    # softmax must be on the sorted logits, ensuring the first token is the most likely
@@ -170,10 +171,11 @@ def apply_top_p(logits, top_p):
     remove.scatter_(1, sorted_idx, sorted_remove)
     return logits.masked_fill(remove, float("-inf"))
 
-def sample2(logits, sampling_meta: SamplingMetadata):
-    return sample(logits, sampling_meta.temperature, sampling_meta.top_k, sampling_meta.top_p)
+def sample2(logits: torch.Tensor, tensor_sampling: TensorSampling):
+    assert tensor_sampling.temperature is not None and tensor_sampling.top_k is not None and tensor_sampling.top_p is not None
+    return sample(logits, tensor_sampling.temperature, tensor_sampling.top_k, tensor_sampling.top_p)
 
-def sample(logits, temperature, top_k, top_p):
+def sample(logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor):
     # logits: [n, vocab] (penalties already applied); all three params are [n]
     greedy = temperature <= EPS
     t = torch.where(greedy, torch.ones_like(temperature), temperature)

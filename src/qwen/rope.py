@@ -28,14 +28,16 @@ class BaseRoPE(nn.Module):
         inv_freq = self._compute_inv_freq(base or self.base)
         t = torch.arange(seq_len).float()
         freqs = torch.outer(t, inv_freq)
-        self.cos_cached = freqs.cos()[:, None, :]   # shape [seq_len, H=1, d/2]
-        self.sin_cached = freqs.sin()[:, None, :]
+        # self.cos_cached = freqs.cos()[:, None, :]   # shape [seq_len, H=1, d/2]
+        # self.sin_cached = freqs.sin()[:, None, :]
+        self.register_buffer("cos_cached", freqs.cos()[:, None, :], persistent=False)   # shape [seq_len, H=1, d/2]
+        self.register_buffer("sin_cached", freqs.sin()[:, None, :], persistent=False)
 
     def forward(self, q, k, position_ids):
         # q,k [T, H, D]
         # position_ids [T]
         if self.fixed_max_seq_len:
-            assert position_ids.max() <= self.cos_cached.shape[0], \
+            assert position_ids.max() < self.cos_cached.shape[0], \
                 f"seq overflow: position_ids={position_ids.max()}, max={self.max_seq_len}"
         cos = self.cos_cached[position_ids]
         sin = self.sin_cached[position_ids]
@@ -78,10 +80,10 @@ def init_rope(config: ModelConfig) -> BaseRoPE:
     assert config.rope_scaling, "rope_scaling must be provided in config"
     match config.rope_scaling.get("rope_type", "default"):
         case "default":
-            return DefaultRoPE(config.head_dim, config.cache_len, config.rope_theta)
+            return DefaultRoPE(config.head_dim, config.max_position_embeddings, config.rope_theta)
         case "linear":
-            return LinearRoPE(config.head_dim, config.cache_len, config.rope_theta, scale=config.rope_scaling["factor"])
+            return LinearRoPE(config.head_dim, config.max_position_embeddings, config.rope_theta, scale=config.rope_scaling["factor"])
         # case "dynamic":
-        #     return DynamicNTKRoPE(config.head_dim, config.cache_len, config.rope_theta, scale=config.rope_scaling["factor"])
+        #     return DynamicNTKRoPE(config.head_dim, config.max_position_embeddings, config.rope_theta, scale=config.rope_scaling["factor"])
         case _:
             raise ValueError(f"unsupported rope_type: {config.rope_scaling.get('rope_type')}")

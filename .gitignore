@@ -6,3 +6,4 @@ playgrounds/
 *.bak
 test_playground.py
 data/
+benchmark/

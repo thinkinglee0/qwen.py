@@ -1,4 +1,3 @@
-import numpy as np
 from fastapi import FastAPI, Request, Depends
 from fastapi.responses import StreamingResponse
 from fastapi import Request as HTTPRequest
@@ -14,7 +13,7 @@ from qwen.config import ModelConfig
 from qwen.engine import async_generate, ServingDriver, LLMEngine
 from qwen.constants import MODEL_DIR
 from qwen.sampling import Sampling
-from qwen.scheduler import StaticScheduler
+from qwen.scheduler import Scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,9 +30,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = ModelConfig.from_pretrained(MODEL_DIR)
-    model = QwenForCausalLM(cfg)
-    scheduler = StaticScheduler(cfg)
-    engine = LLMEngine(model, scheduler)
+    engine = LLMEngine(config=cfg)
     driver = ServingDriver(engine)
     driver.start()      # start the run_loop in a separate thread
     app.state.driver = driver

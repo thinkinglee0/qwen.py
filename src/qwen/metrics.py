@@ -3,6 +3,7 @@ import numpy as np
 import logging
 import orjson
 import time
+import math
 
 from qwen.utils import round_floats
 
@@ -51,9 +52,9 @@ def summarize(samples: list[float], scale: float = 1e3) -> dict[str, float]:
 def analyze_stats(metrics_list: "list[Metrics]") -> bytes:
     req_cnt = len(metrics_list)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"metrics_list, req_cnt:{req_cnt}, {metrics_list}")
+        logger.debug(f"req_cnt:{req_cnt}, metrics_list: {metrics_list}")
     else:
-        logger.info(f"metrics_list, req_cnt:{req_cnt}")
+        logger.info(f"req_cnt:{req_cnt}")
 
     queueing, prefill, ttft, tpot, itls = [], [], [], [], []
     input_token_num, output_token_num = 0, 0
@@ -63,7 +64,7 @@ def analyze_stats(metrics_list: "list[Metrics]") -> bytes:
 
         input_token_num += metrics.input_token_num
         output_token_num += metrics.output_token_num
-        start_time = min(start_time, metrics.schedule_time)
+        start_time = min(start_time, metrics.arrival_time)
         
         queueing.append(metrics.schedule_time-metrics.arrival_time)
         if metrics.first_token_time is not None:    # check for zero token
@@ -72,7 +73,7 @@ def analyze_stats(metrics_list: "list[Metrics]") -> bytes:
 
             assert metrics.last_token_time is not None
             finish_time = max(finish_time, metrics.last_token_time)
-            assert metrics.last_token_time-metrics.first_token_time == sum(metrics.itls)
+            math.isclose(metrics.last_token_time-metrics.first_token_time, sum(metrics.itls), rel_tol=1e-9)
             tpot.append((metrics.last_token_time-metrics.first_token_time)/len(metrics.itls)) if metrics.itls else None     # for only one single token scenario
 
         itls.extend(metrics.itls)

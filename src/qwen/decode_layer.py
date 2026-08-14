@@ -1,19 +1,17 @@
-import torch
 from torch import nn
 
-from qwen.cache import KVCache
 from qwen.config import ModelConfig
 from qwen.attention import Attention, AttentionMetadata
 from qwen.mlp import MLP
 from qwen.utils import RMSNorm
-
+from qwen.rope import BaseRoPE
 
 class DecoderLayer(nn.Module):
-    def __init__(self, cfg: ModelConfig, layer_index: int):
+    def __init__(self, cfg: ModelConfig, layer_index: int, rope: BaseRoPE):
         super().__init__()
         self.layer_index = layer_index
 
-        self.self_attn = Attention(cfg, layer_index)
+        self.self_attn = Attention(cfg, layer_index, rope)
         self.mlp = MLP(cfg)
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)

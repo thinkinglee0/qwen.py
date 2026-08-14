@@ -8,7 +8,9 @@ from qwen.config import ModelConfig
 from qwen.decode_layer import DecoderLayer
 from qwen.attention import AttentionMetadata
 from qwen.utils import RMSNorm
-from qwen.sampling import apply_penalties2, sample2, SamplingMetadata
+from qwen.sampling import apply_penalties2, sample2, TensorSampling
+from qwen.scheduler import SchedulerOutput
+from qwen.rope import init_rope
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +19,11 @@ class QwenModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
 
+        self.rope = init_rope(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.layers = nn.ModuleList(
-            [DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [DecoderLayer(config, layer_idx, self.rope) for layer_idx in range(config.num_hidden_layers)]
         )
 
     def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> torch.Tensor:
@@ -35,10 +38,10 @@ class QwenModel(nn.Module):
 
 
 class QwenForCausalLM(nn.Module):
-    def __init__(self, cfg: ModelConfig, max_seqs: int = 20, cache_len: int = 500):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.config = dataclasses.replace(cfg, weights=None, max_seqs=max_seqs, cache_len=cache_len)    # deep copy without weights
-        self.config.weights = cfg.weights   # shallow copy, keep the original weights
+        self.config = dataclasses.replace(config, weights=None)    # deep copy without weights
+        self.config.weights = config.weights   # shallow copy, keep the original weights
 
         self.device = self.config.device     # resolved in config
         self.dtype = self.config.dtype
@@ -48,6 +51,8 @@ class QwenForCausalLM(nn.Module):
 
         assert self.config.weights, "weights must be provided to QwenForCausalLM"
         missing, unexpected = self.load_state_dict(self.config.weights, strict=False)
+        self.to(device=self.config.device, dtype=self.config.dtype)   # to device
+
         assert not unexpected, f"stale/renamed keys: {unexpected[:5]}"
         assert missing in ([], ["lm_head.weight"]), f"missing: {missing}"
 
@@ -63,19 +68,21 @@ class QwenForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor):
         return self.lm_head(hidden_states)  # shape [T, vocab_size]
 
-    def sampler(self, logits, prompt_tokens, output_tokens, sampling_meta: SamplingMetadata | None = None) -> torch.Tensor:
+    def sampler(self, logits: torch.Tensor, sch_out: SchedulerOutput) -> torch.Tensor:
         if not self.config.do_penalities and not self.config.do_sample:     # shortcut for greedy decoding without penalties
             return logits.argmax(dim=-1)
-        
-        if sampling_meta is None:
-            B, _ = logits.size()
-            sampling_meta = SamplingMetadata(config=self.config, bsz=B)
+
+        prompt_tokens = []
+        output_tokens = []
+        for req in sch_out.reqs:
+            prompt_tokens.append(req.input_ids)
+            output_tokens.append(req.output_ids)
 
         if self.config.do_penalities:
-            logits = apply_penalties2(logits, prompt_tokens, output_tokens, sampling_meta, self.config.vocab_size)
+            logits = apply_penalties2(logits, prompt_tokens, output_tokens, sch_out.tensor_sampling, self.config.vocab_size)
 
         if self.config.do_sample:
-            next_tokens = sample2(logits, sampling_meta)
+            next_tokens = sample2(logits, sch_out.tensor_sampling)
         else:
             next_tokens = logits.argmax(dim=-1)
 

@@ -3,6 +3,7 @@
 # constant variables
 NINF = float("-inf")
 MAX_NEW_TOKEN_NUM = 40
+MAX_MODEL_LEN = 512
 
 # benchmark
 SHARE_GPT_FILE_NAME = "./data/ShareGPT_V3_unfiltered_cleaned_split.json"

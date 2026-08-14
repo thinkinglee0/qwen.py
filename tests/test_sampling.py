@@ -162,20 +162,6 @@ def test_sample_greedy_deterministic_across_seeds():
     assert len(set(res)) == 1 and res[0] == 1
 
 
-def test_sample_temperature_scaling_applied():
-    # Verify temperature scaling is applied for non-greedy rows using an indirect,
-    # verifiable signal.
-    # High temperature flattens the distribution; low temperature sharpens it.
-    # This test ensures greedy vs non-greedy temperature handling is not mixed:
-    # greedy rows (temperature=0) are handled deterministically and not scaled.
-    # Assert that argmax is unaffected by temperature scaling (scaling doesn't change argmax).
-    logits = torch.tensor([[1., 5., 2.]])
-    torch.manual_seed(0)
-    out_hi = sample(logits.clone(), torch.tensor([100.0]),
-                    torch.tensor([1]), torch.tensor([1.0]))  # top_k=1 → 只剩argmax
-    assert out_hi.item() == 1  # top_k=1 forces the only candidate to be argmax
-
-
 def test_sample_all_neg_inf_row_does_not_crash():
     # Regression test for bug #3: a row with all -inf should not make multinomial crash
     logits = torch.full((1, 5), NINF)

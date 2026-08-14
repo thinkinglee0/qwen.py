@@ -2,32 +2,38 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
+import dataclasses
 
 from constants import *
 from qwen.config import ModelConfig
 from qwen.model import QwenForCausalLM
 from qwen.constants import MODEL_DIR
 from qwen.engine import ServingDriver, LLMEngine
-from qwen.scheduler import StaticScheduler
+from qwen.scheduler import Scheduler
+from qwen.cache import KVCache
 from qwen.utils import sample_sharegpt
-from qwen.constants import DEFAULT_CACHE_LEN
+from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
 # Enforce custom module execution order, independent of filename sorting.
-MODULE_ORDER = ["test_rope", "test_sampling", "test_attention", "test_model", "test_engine", "test_api"]
+MODULE_ORDER = ["test_rope", "test_sampling", "test_cache", "test_attention", "test_model", "test_scheduler", "test_engine", "test_api"]
 
 def pytest_collection_modifyitems(session, config, items):
-    excluded_names_from_file = ["test_benchmark_sharegpt"]
+    excluded_fun_names = ["test_benchmark_sharegpt"]
+    excluded_module_names = ["test_playground"]
 
-    explicitly_called = any(fun_name in arg for fun_name in excluded_names_from_file for arg in config.args)
+    explicitly_called = any(fun_name in arg for fun_name in excluded_fun_names for arg in config.args)
+    explicitly_called |= any(module_name in arg for module_name in excluded_module_names for arg in config.args)
+
     if not explicitly_called:
         selected = []
         deselected = []
         
         for item in items:
-            test_name = getattr(item, "originalname", None) or item.name
-            if test_name in excluded_names_from_file:
+            module_name = item.module.__name__.rsplit(".", 1)[-1]
+            fun_name = getattr(item, "originalname", None) or item.name
+            if fun_name in excluded_fun_names or module_name in excluded_module_names:
                 deselected.append(item)
             else:
                 selected.append(item)
@@ -58,17 +64,17 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--max_seqs",
+        "--max_num_seqs",
         action="store",
         default=SHARE_GPT_MAX_SEQS,
         type=int,
-        help="The maximum of sequences for benchmark (e.g.: 8)"
+        help="The maximum number of sequences in scheduling for benchmark (e.g.: 8)"
     )
 
     parser.addoption(
-        "--cache_len",
+        "--max_model_len",
         action="store",
-        default=DEFAULT_CACHE_LEN,
+        default=MAX_MODEL_LEN,
         type=int,
         help="The maximum length of kv cache for benchmark (e.g.: 512)"
     )
@@ -78,12 +84,12 @@ def req_num(request) -> int:
     return request.config.getoption("--req_num")
 
 @pytest.fixture(scope="session")
-def max_seqs(request) -> int:
-    return request.config.getoption("--max_seqs")
+def max_num_seqs(request) -> int:
+    return request.config.getoption("--max_num_seqs")
 
 @pytest.fixture(scope="session")
-def cache_len(request) -> int:
-    return request.config.getoption("--cache_len")
+def max_model_len(request) -> int:
+    return request.config.getoption("--max_model_len")
 
 
 # instances for testing
@@ -132,50 +138,51 @@ def solo_long_encoding(tokenizer):
     return tokenizer(LONG_BATCH, padding=True, return_tensors="pt")     # BatchEncoding
 
 @pytest.fixture(scope="function")
-def solo_long_input_ids_tensor(solo_long_encoding):
+def solo_long_input_ids_tensor(solo_long_encoding) -> torch.Tensor:
     return solo_long_encoding.input_ids     # shape [bsz, seq_len]
 
 @pytest.fixture(scope="function")
-def solo_long_input_ids_list(tokenizer):
-    return tokenizer(LONG_BATCH).input_ids      # type list[list[int]]
+def solo_long_input_ids_list(tokenizer) -> list[list[int]]:
+    return tokenizer(LONG_BATCH).input_ids
 
 @pytest.fixture(scope="function")
-def batch_for_regular_benchmarking(tokenizer):
-    return tokenizer(BATCH_FOR_BENCHMARKING).input_ids      # type list[list[int]]
+def batch_for_regular_benchmarking(tokenizer) -> list[list[int]]:
+    return tokenizer(BATCH_FOR_BENCHMARKING).input_ids
 
 
 # my implementation
 @pytest.fixture(scope="session")
 def target_config():
-    return ModelConfig.from_pretrained(MODEL_DIR)       # load weights
+    config = ModelConfig.from_pretrained(MODEL_DIR)       # load weights
+    config.num_blocks = 512
+    config.cache_verification_interval = 1. 
+    return config
+
+@pytest.fixture(scope="function")
+def tmp_target_config(target_config):
+    tmp = dataclasses.replace(target_config, weights=None)
+    tmp.weights = target_config.weights
+    return tmp
 
 @pytest.fixture(scope="session")
 def target_model(target_config):
     return QwenForCausalLM(target_config)
 
 @pytest.fixture(scope="session")
-def target_scheduler(target_config):
-    return StaticScheduler(target_config)
-
-@pytest.fixture(scope="session")
-def target_driver(target_model, target_scheduler):
-    engine = LLMEngine(target_model, target_scheduler)
-    driver = ServingDriver(engine)
-    driver.start()
-    return driver
+def target_driver(target_config) -> Iterator[ServingDriver]:
+    engine = LLMEngine(target_config)
+    with ServingDriver(engine) as d:
+        yield d
 
 @pytest.fixture(scope="function")
-def target_model_with_function_scope(target_config):
-    return QwenForCausalLM(target_config)
+def tmp_cache(tmp_target_config: ModelConfig):
+    return KVCache(tmp_target_config)
 
 @pytest.fixture(scope="function")
-def target_driver_with_function_scope(target_model_with_function_scope):
-    scheduler = StaticScheduler(target_model_with_function_scope.config)
-    engine = LLMEngine(target_model_with_function_scope, scheduler)
-    driver = ServingDriver(engine)
-    driver.start()
-    return driver
-
+def tmp_target_driver(tmp_target_config) -> Iterator[ServingDriver]:
+    engine = LLMEngine(tmp_target_config)
+    with ServingDriver(engine) as d:
+        yield d
 
 # instance of modeling_qwen2.py from transformers
 @pytest.fixture(scope="session")
@@ -187,26 +194,30 @@ def ref_model():
 
 # benchmark
 @pytest.fixture(scope="function")
-def shareGPT_batch_for_sharegpt_benchmarking(tokenizer, req_num, cache_len) -> list[list[int]]:
-    return sample_sharegpt(SHARE_GPT_FILE_NAME, tokenizer,  num_requests=req_num, max_p_len=cache_len//2, cache_len=cache_len)
+def shareGPT_batch_for_sharegpt_benchmarking(tokenizer, req_num, max_model_len) -> list[list[int]]:
+    return sample_sharegpt(SHARE_GPT_FILE_NAME, tokenizer,  num_requests=req_num, max_p_len=max_model_len//2, max_model_len=max_model_len)
 
 
 @pytest.fixture(scope="function")
-def target_engine_for_regular_benchmarking(target_config) -> LLMEngine:
-    model = QwenForCausalLM(target_config, max_seqs=4, cache_len=128)  # overwrite max_seqs and cache_len for benchmarking
-    model.config.stat_interval = 10.
+def target_engine_for_regular_benchmarking(tmp_target_config: ModelConfig) -> LLMEngine:
+    # overwrite max_num_seqs and max_model_len for benchmarking
+    tmp_target_config.max_num_seqs = 4
+    tmp_target_config.max_model_len = 128
+    tmp_target_config.stat_interval = 10.
+    tmp_target_config.is_benchmarking = True
+    tmp_target_config.max_waiting=100
 
-    scheduler = StaticScheduler(model.config, is_benchmarking=True)
-    scheduler.max_waiting=100
-    return LLMEngine(model, scheduler)
+    return LLMEngine(tmp_target_config)
 
 @pytest.fixture(scope="function")
-def target_engine_for_sharegpt_benchmarking(target_config, req_num:int, max_seqs:int, cache_len:int) -> LLMEngine:
-    model = QwenForCausalLM(target_config, max_seqs=max_seqs, cache_len=cache_len)  # overwrite max_seqs and cache_len for benchmarking
-    model.config.stat_interval = 60.
+def target_engine_for_sharegpt_benchmarking(tmp_target_config, req_num:int, max_num_seqs:int, max_model_len:int) -> LLMEngine:
+    # overwrite max_num_seqs and max_model_len for benchmarking
+    tmp_target_config.max_num_seqs = max_num_seqs
+    tmp_target_config.max_model_len = max_model_len
+    tmp_target_config.stat_interval = 60.
+    tmp_target_config.is_benchmarking = True
+    tmp_target_config.max_waiting=req_num
 
-    scheduler = StaticScheduler(model.config, is_benchmarking=True)
-    scheduler.max_waiting=req_num
-    return LLMEngine(model, scheduler)
+    return LLMEngine(tmp_target_config)
 
 

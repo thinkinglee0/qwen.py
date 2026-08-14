@@ -84,11 +84,11 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 
 #### 1.2 Platform: NVIDIA A10
 
-later
+stay tuned
 
 ### 2 Continuous Batching
 
-later
+stay tuned
 
 ---
 

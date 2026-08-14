@@ -3,6 +3,7 @@
 import logging
 import pytest_asyncio
 import pytest
+import orjson
 
 from httpx import ASGITransport, AsyncClient
 from qwen.api import app, get_driver
@@ -32,8 +33,14 @@ async def test_endpoint_generate_stream(api_client):
         assert resp.status_code == 200
         async for line in resp.aiter_lines():
             if line.startswith("data: "):
-                chunks.append(line.removeprefix("data: ").strip())
+                json_str = line.removeprefix("data: ").strip()
+                if json_str == "[DONE]":
+                    chunks.append(json_str)
+                    break
+
+                raw = orjson.loads(json_str)
+                assert "text" in raw
+                chunks.append(raw["text"])
     
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"fastapi output: |{chunks}|")
+    logger.info(f"fastapi output: |{''.join(chunks)}|")
     assert chunks and chunks[-1] == "[DONE]"

@@ -62,7 +62,7 @@ class RMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-def sample_sharegpt(path, tokenizer, num_requests=256, max_p_len=1024, cache_len=2048, seed=0) -> list[list[int]]:
+def sample_sharegpt(path, tokenizer, num_requests=256, max_p_len=1024, max_model_len=2048, seed=0) -> list[list[int]]:
     with open(path) as f:
         raw = orjson.loads(f.read())
     raw = [d for d in raw if len(d["conversations"]) >= 2]
@@ -77,7 +77,7 @@ def sample_sharegpt(path, tokenizer, num_requests=256, max_p_len=1024, cache_len
         # vLLM-compatible filter — must match exactly for a valid A/B
         if p_len < 4 or o_len < 4:          # degenerate turns skew the tail
             continue
-        if p_len >= max_p_len or p_len + o_len > cache_len:   # keep every request inside one cache slab
+        if p_len >= max_p_len or p_len + o_len > max_model_len:   # keep every request inside one cache slab
             continue
         reqs.append(p_input_ids)
         if len(reqs) == num_requests:
