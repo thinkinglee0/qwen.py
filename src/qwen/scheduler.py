@@ -1,16 +1,18 @@
 from collections import deque
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
 import uuid
+import copy
+import orjson
 
+from qwen.utils import round_floats
 from qwen.sampling import TensorSampling, Sampling
 from qwen.config import ModelConfig
-from qwen.metrics import analyze_stats, Metrics
-from qwen.constants import LOG_DIR
+from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrices, SchedulerStepMetrices
 from qwen.cache import KVCache, cdiv
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,7 @@ class ModelRequest:
         self.not_before_step: int = 0     # earliest scheduler step at which re-admission is allowed
 
         # metrics
-        self.metrics = Metrics(arrival_time=time.perf_counter(), input_token_num=len(self.input_ids))
+        self.metrics = RequestMetrics(arrival_time=time.perf_counter(), num_input_token=len(self.input_ids))
 
         # intermediate states
         self.num_computed_tokens: int = 0   # for kv cache
@@ -74,9 +76,15 @@ class ModelRequest:
     def num_prompt_remaining(self) -> int:  # compatible with requests re-computing from scratch after evicted from decoding
         return max(0, self._num_prefill_tokens - self.num_computed_tokens)
 
-    def add_sampled_token(self, tok: int, eos_token_id_set, now):
-        if tok in eos_token_id_set or len(self.output_ids)+1 >= self.max_new_tokens:
+    # return 1 if this request is finished because the output tokens exceed max_new_tokens, meaning that the request is truncated
+    def add_sampled_token(self, tok: int, eos_token_id_set, now) -> int:
+        num_truncated: int = 0
+        if tok in eos_token_id_set \
+            or len(self.output_ids)+1 >= self.max_new_tokens:
             self.finished = True
+
+            if len(self.output_ids)+1 >= self.max_new_tokens:
+                num_truncated += 1
 
             # self.io_token_ids, do not append when finished
             self.output_ids.append(tok) if tok not in eos_token_id_set else None
@@ -94,6 +102,8 @@ class ModelRequest:
             if self.loop is not None:
                 self.loop.call_soon_threadsafe(self.token_queue.put_nowait, tok)  
 
+        return num_truncated
+
 @dataclass
 class ScheduledInfo:
     want: int
@@ -103,28 +113,51 @@ class ScheduledInfo:
         assert self.want == len(self.slots)
 
 class SchedulerOutput:
-    def __init__(self, reqs: list[ModelRequest], scheduled: dict[str, ScheduledInfo], block_tables: list[list[int]], config):
+    def __init__(self, step: int, reqs: list[ModelRequest], scheduled: dict[str, ScheduledInfo],
+                 block_tables: list[list[int]], config: ModelConfig, scheduler: "Scheduler | None"):
         assert len(reqs) > 0, "SchedulerOutput must have at least one request"
         self.reqs = reqs
         self.scheduled = scheduled
         self.block_tables = block_tables
+        self.config = config
 
         self.batch_size = len(reqs)
         self.prompt_ids = [req.input_ids for req in reqs]
         batch_sampling = [req.sampling for req in reqs]     # list[Sampling | None]
-        self.tensor_sampling = TensorSampling.from_sampling_list(batch_sampling, config, self.batch_size)
-
-        # metrics
-        now=time.perf_counter()
-        for req in self.reqs:
-            req.metrics.schedule_time = now
+        self.tensor_sampling = TensorSampling.from_sampling_list(batch_sampling, self.config, self.batch_size)
 
         # intermediate states for the batch
         self.output_ids: list[list[int]] = [req.output_ids for req in self.reqs]      # for repetition penalty and synchronous generation
         self.finished: list[bool] = [req.finished for req in self.reqs]
 
-    def add_sampled_tokens(self, next_tokens_cpu: list[int], eos_token_id_set) -> None:
+        # metrics
+        num_prefill_tokens, num_decode_tokens = 0, 0
+        for req in self.reqs:
+            if req.metrics.first_schedule_time is None:
+                req.metrics.first_schedule_time = time.perf_counter()
+            if not req.is_decoding:
+                # prefill
+                num_prefill_tokens += scheduled[req.request_id].want
+                req.metrics.num_prefill_chunk += 1
+            else:
+                # decode
+                num_decode_tokens += scheduled[req.request_id].want
+
+        self.step_metrics: SchedulerStepMetrices | None = SchedulerStepMetrices(
+            step=step,
+            bz=self.batch_size,
+            n_p=num_prefill_tokens,
+            n_d=num_decode_tokens,
+            run=len(scheduler.running),
+            wait=len(scheduler.waiting),
+            blk_used=scheduler.cache.pool.used(),
+            blk_total=scheduler.cache.pool.num_blocks,
+        ) if scheduler is not None else None
+
+    # return the number of truncated reqs which are finished just now
+    def add_sampled_tokens(self, next_tokens_cpu: list[int], eos_token_id_set) -> int:
         assert len(next_tokens_cpu) == self.batch_size
+        num_truncated: int = 0
 
         now = time.perf_counter()
         for (tok, req) in zip(next_tokens_cpu, self.reqs):
@@ -141,12 +174,14 @@ class SchedulerOutput:
                 assert req.num_computed_tokens <= req._num_prefill_tokens
                 if req.num_computed_tokens == req._num_prefill_tokens:
                     req.is_decoding = True
-                    req.add_sampled_token(tok, eos_token_id_set, now)
+                    num_truncated += req.add_sampled_token(tok, eos_token_id_set, now)
                 continue
 
             # in decoding
             req.num_computed_tokens += s_info.want
-            req.add_sampled_token(tok, eos_token_id_set, now)
+            num_truncated += req.add_sampled_token(tok, eos_token_id_set, now)
+
+        return num_truncated
 
 class Scheduler:
     def __init__(self, config: ModelConfig):
@@ -162,23 +197,25 @@ class Scheduler:
 
         self.waiting: deque[ModelRequest] = deque()
         self.running: list[ModelRequest] = []
-        self.metrics_list: list[Metrics] = []   # store temporarily
         self.cache = KVCache(config)
 
         # backoff after preempted
-        self.step_id: int = 0
         self.backoff_base = config.backoff_base
         self.backoff_cap = config.backoff_cap
 
-        # for stats
-        self.stat_interval = config.stat_interval
-        self._last_stat_time = time.perf_counter()  # starting time
+        # metrics
+        self.sch_metrics = SchedulerMetrices()
+        self.req_metrics_list: list[RequestMetrics] = []   # store temporarily
+        self.req_metrics_interval = config.req_metrics_interval
+        self._last_req_metrics_time = time.perf_counter()  # starting time
 
         # for benchmark
         self.is_benchmarking = config.is_benchmarking
-        self.completed_req_cnt:int = 0
-        self.total_metrics: list[Metrics] = []
+        self.total_metrics: list[RequestMetrics] = []
         self.log_name_flag = datetime.now().strftime("%Y%m%d_%H%M%S")   # may be changed in test_benchmark_* functions.
+
+    def teardown(self):
+        self.cache.teardown()
 
     def add_request(self, req: ModelRequest) -> bool:
         max_blocks = cdiv(len(req.input_ids) + req.max_new_tokens, self.cache.block_size)
@@ -201,6 +238,7 @@ class Scheduler:
         '''
         assert not victim.finished
 
+        self.sch_metrics.report_on_preemption()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"{victim.request_id} preempted, moved from running to waiting")
 
@@ -211,33 +249,35 @@ class Scheduler:
         victim.reset_on_preemption()  # recompute from scratch
 
         delay = min(self.backoff_base ** (victim.preempt_count - 1), self.backoff_cap)
-        victim.not_before_step = self.step_id + delay
+        victim.not_before_step = self.sch_metrics.step + delay
         self.waiting.appendleft(victim)
 
-    def commit_step(self, sch_out: SchedulerOutput):
+    def commit_step(self, sch_out: SchedulerOutput, num_truncated:int):
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"call commit_step")
+            logger.debug(f"call commit_step, ")
         for req in sch_out.reqs:
             if req.finished:
                 self.cleanup_on_finished(req=req)
 
-        self.log_stats()
+        self.sch_metrics.report_on_truncated(num_truncated)
+        self.log_metrics(sch_out=sch_out)
 
     def cleanup_on_finished(self, req: ModelRequest):
         assert req.finished and req.is_decoding
         assert req in self.running
 
+        self.sch_metrics.report_on_finish()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"{req.request_id} finished, removed")
 
         self.running.remove(req)
         self.cache.free(req)
-        self.completed_req_cnt += 1
-        self.metrics_list.append(req.metrics)
+        self.req_metrics_list.append(req.metrics)
 
     def cleanup_on_error(self, req: ModelRequest, e: Exception):
         assert req in self.running
-        
+
+        self.sch_metrics.report_on_error()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"an error occured in {req.request_id}, removed")
 
@@ -247,8 +287,7 @@ class Scheduler:
 
         self.running.remove(req)
         self.cache.free(req)
-        self.completed_req_cnt += 1
-        self.metrics_list.append(req.metrics)
+        self.req_metrics_list.append(req.metrics)
 
     def _pick_waiting(self, victims: set[str]) -> ModelRequest | None:
         '''
@@ -258,7 +297,7 @@ class Scheduler:
         2) aging boost to avoid long prefills' starvation.
         '''
         for r in self.waiting:
-            if r.request_id not in victims and r.not_before_step <= self.step_id:
+            if r.request_id not in victims and r.not_before_step <= self.sch_metrics.step:
                 return r
 
         # ignore backoff when len(running)==0 and len(waiting)>0 and nothing available due to backoff, avoiding the starvation of scheduler.
@@ -270,7 +309,7 @@ class Scheduler:
         return None
 
     def schedule(self) -> SchedulerOutput | None:            # called by run_loop
-        self.step_id += 1
+        self.sch_metrics.step += 1
         return self.D_first_preemptive_schedule() if self.use_d_first_schedule else self.preemptive_schedule()
 
     # D-first scheduling with no-cross preemption
@@ -286,7 +325,7 @@ class Scheduler:
         self.running: list[ModelRequest] = decoding + prefill
 
         # 1) running first — protect in-flight decodes' TPOT.
-        scheduled_running = []
+        scheduled_running: list[ModelRequest] = []
         for req in list(self.running):
             assert not req.finished     # all finished requests has been removed in add_sampled_tokens
 
@@ -298,13 +337,15 @@ class Scheduler:
             want = 1 if req.is_decoding else min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
             if want <= 0:
                 # only when in prefill (is_decoding=False) and budget <= 0, which means all Ds has been scheduled and budget exhausted, the loop breaks.
-                # then kept in running, but not be scheduled
+                # then kept the rest in running, but not be scheduled
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"no more budget for {req.request_id} to prefill, skip over")
                 break
 
             new_slots = self.cache.allocate_slots(req, want)
             while new_slots is None:       # KV pool exhausted
+                self.sch_metrics.report_on_cache_exhausted()
+
                 victim = self.running.pop()     # traverse reversely, so it may have finished.
                 self._preempt(victim, victims)     # yield no matter whether it's in decoding
 
@@ -334,6 +375,7 @@ class Scheduler:
             want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
             slots = self.cache.allocate_slots(req, want=want, respect_watermark=True)
             if slots is None:
+                self.sch_metrics.report_on_cache_exhausted()
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"failed to allocate slots for {req.request_id}")
                 break                                 # no room, stop admitting
@@ -358,9 +400,10 @@ class Scheduler:
 
         if not scheduled_running:
             return None     # no work to do
-        
-        return SchedulerOutput(scheduled_running, scheduled, block_tables=block_tables,
-                               config=self.config)
+
+        self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
+        return SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
+                               config=self.config, scheduler=self)
 
     def _pick_victim(self, cur_req):
         # pick strategies
@@ -385,7 +428,7 @@ class Scheduler:
         
         # 1) running first — protect in-flight decodes' TPOT.
         #    Note: Ps and Ds may interleave.
-        scheduled_running = []
+        scheduled_running: list[ModelRequest] = []
         for req in list(self.running):  # snapshot
             assert not req.finished     # all finished requests has been removed in add_sampled_tokens
 
@@ -397,13 +440,15 @@ class Scheduler:
             want = 1 if req.is_decoding else min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
             if want <= 0:
                 # only when is_decoding=False and budget <= 0, which means there is no room for current in-flight prefill request.
-                # then kept in running, but not be scheduled
+                # then kept the rest in running, but not be scheduled
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"no more budget for {req.request_id} to prefill, skip over")
                 continue
 
             new_slots = self.cache.allocate_slots(req, want)
             while new_slots is None:                # KV pool exhausted
+                self.sch_metrics.report_on_cache_exhausted()
+
                 victim = self._pick_victim(req)
                 if victim is None:
                     self._preempt(req, victims)     # yield no matter whether it's in decoding
@@ -446,6 +491,7 @@ class Scheduler:
             want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
             slots = self.cache.allocate_slots(req, want, respect_watermark=True)
             if slots is None:
+                self.sch_metrics.report_on_cache_exhausted()
                 break                                 # no room, stop admitting
 
             self.running.append(req)
@@ -465,33 +511,61 @@ class Scheduler:
             bt = self.cache.get_block_table(req)
             assert bt is not None
             block_tables.append(bt)
-        return SchedulerOutput(scheduled_running, scheduled, block_tables=block_tables,
-                               config=self.config)
 
-    def log_stats(self, is_exiting: bool=False):
+        self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
+        return SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
+                               config=self.config, scheduler=self)
+
+    def log_metrics(self, sch_out: SchedulerOutput, is_exiting: bool=False):
+        self.log_step_metrics(sch_out=sch_out)
+        self.log_scheduler_metrics(is_exiting=is_exiting)
+
+    def log_scheduler_metrics(self, is_exiting: bool=False):
         now = time.perf_counter()
-        if now - self._last_stat_time < self.stat_interval and not is_exiting:
+        if now - self._last_req_metrics_time < self.req_metrics_interval and not is_exiting:
             return
-        self._last_stat_time = now
+        self._last_req_metrics_time = now
 
-        if not self.metrics_list:
+        if not self.req_metrics_list:
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("empty metrics_list")
+                logger.debug("empty req_metrics_list")
             return
 
-        self.total_metrics.extend(self.metrics_list) if self.is_benchmarking else None
+        # snapshot
+        tmp_counters: SchedulerMetrices = copy.deepcopy(self.sch_metrics)
+        req_metrics_list = self.req_metrics_list
+        self.req_metrics_list = []      # reset
+        self.total_metrics.extend(req_metrics_list) if self.is_benchmarking else None
 
-        metrics_list = self.metrics_list
-        self.metrics_list = []      # reset
+        if logger.isEnabledFor(logging.DEBUG):
+            for metrics in req_metrics_list:
+                json_bytes = orjson.dumps(round_floats(asdict(metrics), nd=3))
+                logger.debug(f"metrics obj: {json_bytes.decode()}")
 
-        json_bytes = analyze_stats(metrics_list=metrics_list)
-        logger.info(f"completed_req_cnt: {self.completed_req_cnt}, stats: {json_bytes.decode()}")
-        if self.is_benchmarking:
-            log_path = Path(LOG_DIR)
-            log_path.mkdir(parents=True, exist_ok=True)
-            stats_path = log_path / f'stats.{self.log_name_flag}'
-            with open(stats_path, "a+b") as f:
-                f.write(json_bytes)
-                f.write(b"\n")
+        # analyze
+        json_bytes = analyze_metrics(req_metrics_list=req_metrics_list, sch_metrics=tmp_counters,
+                                     is_benchmarking=self.is_benchmarking, config=self.config)
+        logger.info(f"analyzed scheduler metrics: {json_bytes.decode()}")
 
+        # save to file
+        log_path = Path(self.config.log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        stats_path = log_path / f'sch_metrics.{self.log_name_flag}.json'
+        with open(stats_path, "a+b") as f:
+            f.write(json_bytes)
+            f.write(b"\n")
+            f.flush()
+
+    def log_step_metrics(self, sch_out: SchedulerOutput):
+        assert sch_out.step_metrics
+        json_bytes = orjson.dumps(round_floats(asdict(sch_out.step_metrics), nd=3))
+
+        # save to file
+        log_path = Path(self.config.log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        stats_path = log_path / f'step_metrics.{self.log_name_flag}.json'
+        with open(stats_path, "a+b") as f:
+            f.write(json_bytes)
+            f.write(b"\n")
+            f.flush()
 

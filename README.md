@@ -3,7 +3,7 @@
 A from-scratch implementation of the Qwen2.5 forward pass in **pure PyTorch**, built to
 understand LLM inference at the mechanism level. The model code (attention, RoPE, RMSNorm, SwiGLU, weight loading) depends only on `torch` + `safetensors`; `transformers` is a **dev-only** dependency, used solely for the tokenizer and as the reference model during numerical validation.
 
-Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-7B on an NVIDIA A10**.
+Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-7B on an NVIDIA RTX 4090**.
 
 ---
 
@@ -17,7 +17,7 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M4**    | sampling, restructure the project layout                        | ✅ done, add repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial; isolate source code from unit tests; extract attention/mlp/decode_layer/norm from model.py, and bind weights to the `nn.Module` tree through the `load_state_dict` function. |
 | **M5**    | static batching                                                 | ✅done. pack a list of **variable-length** id sequences into a 1-dim id list, opt for SDPA attention in my local macbook for quick functional verifications; add request to `StaticScheduler`, and then scheduler in a fixed batch.                                       |
 | **M6**    | continuous batching                                             | 🔜 next                                                                                                                                                                                                                                                                  |
-| later     | performance of static and continuous batchings on 7B / A10      | planed                                                                                                                                                                                                                                                                   |
+| later     | performance of static and continuous batchings on 7B / RTX 4090      | planed                                                                                                                                                                                                                                                                   |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
 
@@ -37,7 +37,7 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 - **Streaming HTTP service** — `async_generate`throws `_decode_step`into the current `event loop`, and yields CPU after `_decode_step`returns; `/generate_stream`and `/health`endpoints implemented by FastAPI; `@asynccontextmanager`, `@pytest_asyncio.fixture` and `@pytest.fixture` ensure that the model **Weights** only loads **once** in testing scenarios of sync functions, async functions, and FastAPI endpoints.
 - **Sampling** — parse `generation_conf.json`, apply repetition/frequency/presence penalties just after `forward`, then do sampling if `do_sample` swtich is on; sampling includes temperature, top_k, top_p, multinomial.
 - **Restructure the project layout** — rename `qwen.py` to `model.py`, `main.py` to `api.py`, put sync/async generations into `engine.py`, place source code files in the `src/qwen` folder, and unit tests in `tests`.
-- **Static batching** — pack a list of **variable-length** id sequence into an 1-dim id list by `pack_sequences`, `scatter_to_kv_cache` after the projection and rope of K and V; select flash_attn for cloud A10 VPS, falls back to SDPA attention in my locl macbook for quick functional verifications.
+- **Static batching** — pack a list of **variable-length** id sequence into an 1-dim id list by `pack_sequences`, `scatter_to_kv_cache` after the projection and rope of K and V; select flash_attn for cloud RTX 4090 VPS, falls back to SDPA attention in my locl macbook for quick functional verifications.
 - **Benchmarking and statistic** — statisticize `TTFT`, `TPOT`, and `ITL` for each request, and triggered periodically after each step; add a regular benchmark for functionality verification and ShareGPT benchmark for performance profiling.
 
 ---
@@ -82,7 +82,7 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 | 32/96                           | {<br/> "n": 512,<br/> "mean": 1871.921,<br/> "std": 191.012,<br/> "p50": 1918.657,<br/> "p90": 2165.994,<br/> "p99": 2214.558,<br/> "max": 2214.558<br/> } | {<br/> "n": 512,<br/> "mean": 376.967,<br/> "std": 7.716,<br/> "p50": 378.624,<br/> "p90": 384.873,<br/> "p99": 391.298,<br/> "max": 391.729<br/> } | {<br/> "n": 35717,<br/> "mean": 376.976,<br/> "std": 18.841,<br/> "p50": 376.089,<br/> "p90": 391.813,<br/> "p99": 447.585,<br/> "max": 595.678<br/> }  |
 | 64/256                          | {<br/> "n": 512,<br/> "mean": 3860.661,<br/> "std": 375.43,<br/> "p50": 3868.442,<br/> "p90": 4454.093,<br/> "p99": 4454.093,<br/> "max": 4454.093<br/> }  | {<br/> "n": 512,<br/> "mean": 706.547,<br/> "std": 7.933,<br/> "p50": 707.658,<br/> "p90": 718.253,<br/> "p99": 718.253,<br/> "max": 718.253<br/> } | {<br/> "n": 33484,<br/> "mean": 706.657,<br/> "std": 32.015,<br/> "p50": 701.086,<br/> "p90": 739.056,<br/> "p99": 808.442,<br/> "max": 1032.269<br/> } |
 
-#### 1.2 Platform: NVIDIA A10
+#### 1.2 Platform: NVIDIA RTX 4090
 
 stay tuned
 
@@ -159,7 +159,7 @@ Other following verifications see `tests/` folder for details. The main ones `te
 
 ## Roadmap
 
-1. **Performance** — move to GPU, profile against the 7B / A10 target.
+1. **Performance** — move to GPU, profile against the 7B / RTX 4090 target.
 2. **Continuous batching** — evict finished requests and add waiting request in flight.
 
 ## License

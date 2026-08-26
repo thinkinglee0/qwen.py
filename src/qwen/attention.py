@@ -15,7 +15,7 @@ from qwen.rope import BaseRoPE
 
 # attention backend selection — resolved once at import
 try:
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache  # for A10
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache  # for CUDA
     HAS_FLASH_ATTN = True
 except ImportError:
     flash_attn_varlen_func = None
@@ -51,6 +51,8 @@ class AttentionMetadata:
     max_seqlen_q: int
 
     # lens of kv cache
+    cu_seqlens_k: Tensor
+    max_seqlen_k: int
     cache_seqlens: Tensor
     block_table:  Tensor    # [num_seqs, max_blocks]
     # kv for SDPA
@@ -105,6 +107,10 @@ def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, devic
     )
 
     cache_seqlens = torch.tensor(cache_lens, device=device, dtype=torch.int32)
+    max_seqlen_k = max(cache_lens)
+    cu_seqlens_k = torch.tensor(
+        list(itertools.accumulate(cache_lens, initial=0)), device=device, dtype=torch.int32
+    )
 
     position_ids = torch.tensor(position_id_lst, device=device, dtype=torch.int32)
     slot_mapping = torch.tensor(slots, device=device, dtype=torch.int64)
@@ -113,8 +119,8 @@ def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, devic
 
     return packed_ids, AttentionMetadata(cache=cache_data,
                              cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
+                             cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max_seqlen_k,
                              cache_seqlens=cache_seqlens, block_table=block_table,
-                            #  k_lens=cache_lens, block_tables=sch_out.block_tables,
                              position_ids=position_ids, slot_mapping=slot_mapping)
 
 def sdpa_one_seq(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -225,7 +231,8 @@ class Attention(nn.Module):
             q, k_cache, v_cache,
             cu_seqlens_q=meta.cu_seqlens_q,     # [num_reqs+1]  query boundary
             max_seqlen_q=meta.max_seqlen_q,
-            seqused_k=meta.cache_seqlens,        # [num_reqs]
+            cu_seqlens_k=meta.cu_seqlens_k,     # [num_reqs+1]  query boundary
+            max_seqlen_k=meta.max_seqlen_k,
             block_table=meta.block_table,       # [num_reqs, max_num_blocks_per_req]
             causal=True,
         )                                       # [T, Hq, D]

@@ -3,6 +3,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 import dataclasses
+import gc
 
 from constants import *
 from qwen.config import ModelConfig
@@ -13,6 +14,8 @@ from qwen.scheduler import Scheduler
 from qwen.cache import KVCache
 from qwen.utils import sample_sharegpt
 from collections.abc import Iterator
+from qwen.utils import resolve_device, default_dtype
+from qwen.attention import HAS_FLASH_ATTN
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +23,7 @@ logger = logging.getLogger(__name__)
 MODULE_ORDER = ["test_rope", "test_sampling", "test_cache", "test_attention", "test_model", "test_scheduler", "test_engine", "test_api"]
 
 def pytest_collection_modifyitems(session, config, items):
-    excluded_fun_names = ["test_benchmark_sharegpt"]
+    excluded_fun_names = ["test_benchmark_on_pc", "test_benchmark_sharegpt", "test_benchmark_sharegpt_sweep_batch_size", "test_parse_metrics"]
     excluded_module_names = ["test_playground"]
 
     explicitly_called = any(fun_name in arg for fun_name in excluded_fun_names for arg in config.args)
@@ -64,6 +67,14 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
+        "--max_model_len",
+        action="store",
+        default=MAX_MODEL_LEN,
+        type=int,
+        help="The maximum length of kv cache for benchmark (e.g.: 512)"
+    )
+
+    parser.addoption(
         "--max_num_seqs",
         action="store",
         default=SHARE_GPT_MAX_SEQS,
@@ -72,11 +83,19 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--max_model_len",
+        "--num_blocks",
         action="store",
-        default=MAX_MODEL_LEN,
+        default=MAX_NUM_BLOCKS,
         type=int,
-        help="The maximum length of kv cache for benchmark (e.g.: 512)"
+        help="The maximum number of blocks in kv cache pool (e.g.: 1024)"
+    )
+
+    parser.addoption(
+        "--log_dir",
+        action="store",
+        default=LOG_DIR,
+        type=str,
+        help="The log directory for metrics (e.g.: ./log)"
     )
 
 @pytest.fixture(scope="session")
@@ -84,12 +103,20 @@ def req_num(request) -> int:
     return request.config.getoption("--req_num")
 
 @pytest.fixture(scope="session")
+def max_model_len(request) -> int:
+    return request.config.getoption("--max_model_len")
+
+@pytest.fixture(scope="session")
 def max_num_seqs(request) -> int:
     return request.config.getoption("--max_num_seqs")
 
 @pytest.fixture(scope="session")
-def max_model_len(request) -> int:
-    return request.config.getoption("--max_model_len")
+def num_blocks(request) -> int:
+    return request.config.getoption("--num_blocks")
+
+@pytest.fixture(scope="session")
+def log_dir(request) -> str:
+    return request.config.getoption("--log_dir")
 
 
 # instances for testing
@@ -152,10 +179,11 @@ def batch_for_regular_benchmarking(tokenizer) -> list[list[int]]:
 
 # my implementation
 @pytest.fixture(scope="session")
-def target_config():
+def target_config(log_dir):
     config = ModelConfig.from_pretrained(MODEL_DIR)       # load weights
-    config.num_blocks = 512
+    config.num_blocks = 16
     config.cache_verification_interval = 1. 
+    config.log_dir = log_dir
     return config
 
 @pytest.fixture(scope="function")
@@ -186,38 +214,91 @@ def tmp_target_driver(tmp_target_config) -> Iterator[ServingDriver]:
 
 # instance of modeling_qwen2.py from transformers
 @pytest.fixture(scope="session")
-def ref_model():
-    ref_model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float32, attn_implementation="eager")
+def ref_model() -> AutoModelForCausalLM:
+    device = resolve_device()
+    dtype = default_dtype(device)
+
+    # mirror target_model's own kernel fallback (qwen.attention.HAS_FLASH_ATTN), so ref and
+    # target always agree on which attention kernel family they're using — otherwise, on a
+    # CUDA box without flash-attn installed, target would silently fall back to sdpa while
+    # this fixture hard-crashes requesting attn_implementation="flash_attention_2".
+    attn_implementation = "flash_attention_2" if device.type == "cuda" and HAS_FLASH_ATTN else "sdpa"
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_DIR,
+        torch_dtype=dtype,
+        attn_implementation=attn_implementation,
+    ).to(device)
+
     ref_model.eval()
     return ref_model
 
 
 # benchmark
 @pytest.fixture(scope="function")
-def shareGPT_batch_for_sharegpt_benchmarking(tokenizer, req_num, max_model_len) -> list[list[int]]:
-    return sample_sharegpt(SHARE_GPT_FILE_NAME, tokenizer,  num_requests=req_num, max_p_len=max_model_len//2, max_model_len=max_model_len)
+def sharegpt_batch(tokenizer, req_num, max_model_len) -> list[list[int]]:
+    return sample_sharegpt(
+        SHARE_GPT_FILE_NAME, tokenizer,  num_requests=req_num,
+        max_p_len=max_model_len//2, max_model_len=max_model_len)
 
 
 @pytest.fixture(scope="function")
-def target_engine_for_regular_benchmarking(tmp_target_config: ModelConfig) -> LLMEngine:
+def target_engine_for_pc_benchmarking(tmp_target_config: ModelConfig) -> LLMEngine:
     # overwrite max_num_seqs and max_model_len for benchmarking
-    tmp_target_config.max_num_seqs = 4
     tmp_target_config.max_model_len = 128
-    tmp_target_config.stat_interval = 10.
+    tmp_target_config.req_metrics_interval = 10.
     tmp_target_config.is_benchmarking = True
-    tmp_target_config.max_waiting=100
+    tmp_target_config.max_waiting = 100
+    tmp_target_config.max_num_seqs = 4
+    tmp_target_config.max_num_batched_tokens = 24
+    tmp_target_config.long_prefill_token_threshold = 8
 
     return LLMEngine(tmp_target_config)
 
+# @pytest.fixture(scope="function")
+# def target_engine_for_sharegpt_benchmarking(tmp_target_config: ModelConfig, req_num:int, max_num_seqs:int, max_model_len:int, num_blocks: int) -> LLMEngine:
+#     # overwrite max_num_seqs and max_model_len for benchmarking
+#     tmp_target_config.max_num_seqs = max_num_seqs
+#     tmp_target_config.max_model_len = max_model_len
+#     tmp_target_config.req_metrics_interval = 60.
+#     tmp_target_config.is_benchmarking = True
+#     tmp_target_config.max_waiting=req_num
+#     tmp_target_config.num_blocks = num_blocks
+#     tmp_target_config.do_sample = False
+
+#     return LLMEngine(tmp_target_config)
+
 @pytest.fixture(scope="function")
-def target_engine_for_sharegpt_benchmarking(tmp_target_config, req_num:int, max_num_seqs:int, max_model_len:int) -> LLMEngine:
+def target_engine_for_sharegpt_benchmarking(
+    tmp_target_config: ModelConfig, req_num:int, max_num_seqs:int,
+    max_model_len:int, num_blocks: int
+) -> Iterator[LLMEngine]:
     # overwrite max_num_seqs and max_model_len for benchmarking
     tmp_target_config.max_num_seqs = max_num_seqs
     tmp_target_config.max_model_len = max_model_len
-    tmp_target_config.stat_interval = 60.
-    tmp_target_config.is_benchmarking = True
     tmp_target_config.max_waiting=req_num
+    tmp_target_config.num_blocks = num_blocks
+    tmp_target_config.req_metrics_interval = 60.
+    tmp_target_config.is_benchmarking = True
+    tmp_target_config.do_sample = False
 
-    return LLMEngine(tmp_target_config)
+    try:
+        engine = LLMEngine(tmp_target_config)
+        yield engine
+    finally:
+        # explicitly release kv cache
+        engine.teardown()
+        del engine
+
+        gc.collect()
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
+@pytest.fixture(scope="function")
+def tmp_target_config_for_sharegpt_benchmarking(tmp_target_config: ModelConfig) -> ModelConfig:
+    tmp_target_config.req_metrics_interval = 60.
+    tmp_target_config.is_benchmarking = True
+    tmp_target_config.do_sample = False
+
+    return tmp_target_config

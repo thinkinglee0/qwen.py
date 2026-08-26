@@ -22,14 +22,14 @@ class DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # self attention
-        hidden_states = self.self_attn.forward(hidden_states, meta)
+        hidden_states = self.self_attn(hidden_states, meta)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         # fully connected, mlp
-        hidden_states = self.mlp.forward(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states

@@ -1,4 +1,3 @@
-import schedule
 import logging
 import threading
 import time
@@ -21,23 +20,26 @@ logger = logging.getLogger(__name__)
 def _generate(
     model: QwenForCausalLM,
     cache_data: KVCacheData,
-    scheduler_output: SchedulerOutput,
+    sch_out: SchedulerOutput,
     scheduler: Scheduler,
 ):
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"batch size: {len(scheduler_output.reqs)}")
+        logger.debug(f"batch size: {len(sch_out.reqs)}")
 
-    packed_input_ids, md = build_attn_metadata(scheduler_output, cache_data, model.config.device)  # is_prefill=True
+    packed_input_ids, md = build_attn_metadata(sch_out, cache_data, model.config.device)  # is_prefill=True
+    start_time = time.perf_counter()
     hidden = model.forward(packed_input_ids, md)       # [total_tokens, H]
+    assert sch_out.step_metrics is not None
+    sch_out.step_metrics.elapsed_ms = (time.perf_counter() - start_time) * 1000
 
     # gather each seq's LAST token -> logits -> first generated token
     last_idx = md.cu_seqlens_q[1:] - 1          # [B]
     logits = model.compute_logits(hidden[last_idx])   # [B, vocab]
-    next_tokens = model.sampler(logits, scheduler_output)          # [B]
+    next_tokens = model.sampler(logits, sch_out)          # [B]
 
-    scheduler_output.add_sampled_tokens(next_tokens.tolist(), model.config.eos_token_id_set)
+    num_truncated = sch_out.add_sampled_tokens(next_tokens.tolist(), model.config.eos_token_id_set)
 
-    scheduler.commit_step(sch_out=scheduler_output)
+    scheduler.commit_step(sch_out=sch_out, num_truncated=num_truncated)
 
 class LLMEngine:
     def __init__(self, config: ModelConfig):
@@ -58,11 +60,14 @@ class LLMEngine:
                 continue
             try:
                 _generate(model=self.model, cache_data=self.scheduler.cache.data,
-                          scheduler_output=scheduler_output, scheduler=self.scheduler)
+                          sch_out=scheduler_output, scheduler=self.scheduler)
             except Exception as e:
                 logger.exception(f"Error occurred while generating")
                 break
 
+    def teardown(self):
+        self.scheduler.teardown()
+        del self.scheduler
 
 def benchmark(engine: LLMEngine, batch_input_ids: list[list[int]],
               sampling: Sampling | None = None, max_new_tokens: int = 300) -> tuple[list[list[int]], float]:
@@ -83,7 +88,7 @@ def benchmark(engine: LLMEngine, batch_input_ids: list[list[int]],
     engine.run_to_completion()         # drains the whole queue synchronously
     elapsed = time.perf_counter() - t0
 
-    engine.scheduler.log_stats(is_exiting=True)    # for last stats but the logging interval does not elapse.
+    engine.scheduler.log_scheduler_metrics(is_exiting=True)    # for last metrics but the logging interval does not elapse.
 
     output_ids = [req.output_ids for req in reqs]
     return output_ids, elapsed
@@ -111,6 +116,9 @@ class ServingDriver:
     def stop(self, timeout: float=5.):
         time.sleep(timeout)
         self._shutdown = True
+
+        self.engine.teardown()
+        del self.engine
 
     def submit(self, input_ids, sampling, max_new_tokens: int)  -> asyncio.Queue[int | None | Exception] | None:
         with self.cond:
@@ -144,7 +152,7 @@ class ServingDriver:
                     continue
 
                 _generate(model=self.engine.model, cache_data=self.engine.scheduler.cache.data,
-                          scheduler_output=scheduler_output, scheduler=self.engine.scheduler)
+                          sch_out=scheduler_output, scheduler=self.engine.scheduler)
             except Exception as e:
                 logger.exception("Error occurred while generating")
                 try:

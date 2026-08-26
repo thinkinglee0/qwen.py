@@ -1,6 +1,7 @@
 __pycache__
 .vscode
 log/
+log_vast/
 playgrounds/
 *.egg-info/
 *.bak

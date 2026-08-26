@@ -1,4 +1,5 @@
 import torch
+import logging
 
 from qwen.utils import resolve_device, default_dtype
 from qwen.attention import _bottom_right_causal_bias, build_attn_metadata
@@ -6,16 +7,17 @@ from qwen.scheduler import SchedulerOutput, ModelRequest, ScheduledInfo
 from qwen.cache import KVCacheData, cdiv
 from qwen.sampling import Sampling, TensorSampling
 
+logger = logging.getLogger(__name__)
 
 # map[platform:xx]
-CUR_HOST_PLATFORM = "mac"
 EXPECTED_DEVICE_DTYPE_MAP = {
-    "mac": {"device": torch.device("cpu"), "dtype": torch.float32},
-    "a10": {"device": torch.device("cuda"), "dtype": torch.bfloat16},
+    "cpu": {"device": torch.device("cpu"), "dtype": torch.float32},
+    "cuda": {"device": torch.device("cuda:0"), "dtype": torch.bfloat16},
 }
 
 def get_expected_value(key: str):
-    return EXPECTED_DEVICE_DTYPE_MAP[CUR_HOST_PLATFORM][key]
+    platform = "cuda" if torch.cuda.is_available() else "cpu"
+    return EXPECTED_DEVICE_DTYPE_MAP[platform][key]
 
 
 def test_device_dtype():
@@ -26,8 +28,8 @@ def test_device_dtype():
 
 
 def test_causal_mask():
-    device=get_expected_value("device")
-    dtype=get_expected_value("dtype")
+    device = resolve_device()
+    dtype = default_dtype(device)
 
     m = torch.finfo(dtype).min   # masked
     z = 0.0             # zero
@@ -35,7 +37,7 @@ def test_causal_mask():
     mask = _bottom_right_causal_bias(2, 2, device=device, dtype=dtype)
     expected = torch.tensor([[[
         [z, m],
-        [z, z]]]])
+        [z, z]]]], device=device, dtype=dtype)
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
@@ -43,21 +45,21 @@ def test_causal_mask():
     expected = torch.tensor([[[
         [z, m, m],
         [z, z, m],
-        [z, z, z]]]])
+        [z, z, z]]]], device=device, dtype=dtype)
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
     mask = _bottom_right_causal_bias(1, 2, device=device, dtype=dtype)
     # expected = torch.zeros(1, 1, 1, 2)
     expected = torch.tensor([[[
-        [z, z]]]])
+        [z, z]]]], device=device, dtype=dtype)
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
     mask = _bottom_right_causal_bias(2, 3, device=device, dtype=dtype)
     expected = torch.tensor([[[
         [z, z, m],
-        [z, z, z]]]])
+        [z, z, z]]]], device=device, dtype=dtype)
     assert mask.shape == expected.shape
     torch.testing.assert_close(mask, expected)
 
@@ -91,7 +93,8 @@ def test_build_attn_metadata(tmp_target_config):
 
     block_tables: list[list[int]] = [[100], [200, 400], [300]]
 
-    sch_out = SchedulerOutput(reqs=[req1, req2, req3], scheduled=scheduled, block_tables=block_tables, config=tmp_target_config)
+    sch_out = SchedulerOutput(step=0, reqs=[req1, req2, req3], scheduled=scheduled,
+                              block_tables=block_tables, config=tmp_target_config, scheduler=None)
     assert sch_out.tensor_sampling.temperature is not None and sch_out.tensor_sampling.temperature.tolist() == [1.0]*3
     assert sch_out.tensor_sampling.top_k is not None and sch_out.tensor_sampling.top_k.tolist() == [3]*3
 

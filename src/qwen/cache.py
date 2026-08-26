@@ -22,6 +22,9 @@ class BlockPool:
     def available(self) -> int:
         return len(self.free)
 
+    def used(self) -> int:
+        return self.num_blocks - self.available()
+
     def alloc(self) -> int:
         assert len(self.free) > 0
         block_id = self.free.popleft()
@@ -67,13 +70,19 @@ class KVCacheData:
         ]
 
         self.k_caches, self.v_caches = [], []
-        for kv_cache in kv_caches:
-            kv = kv_cache.unbind(0)
-            self.k_caches.append(kv[0])
-            self.v_caches.append(kv[1])
+        for kv_cache_of_layer in kv_caches:
+            kv_of_layer = kv_cache_of_layer.unbind(0)
+            self.k_caches.append(kv_of_layer[0])
+            self.v_caches.append(kv_of_layer[1])
 
         logger.info(f"creating kv cache done")
         
+    def teardown(self):
+        self.k_caches.clear()
+        self.v_caches.clear()
+
+        del self.k_caches
+        del self.v_caches
 
 class KVCache:
     def __init__(self, config: ModelConfig):
@@ -86,7 +95,17 @@ class KVCache:
 
         # verification
         self.cache_verification_interval = config.cache_verification_interval
-        self._last_stat_time = time.perf_counter()  # starting time
+        self._last_req_metrics_time = time.perf_counter()  # starting time
+
+        # exhausted report
+        self.exhausted_report_interval = 60
+        self.exhausted_report_cnt = 0
+        self._last_report_exhausted_time = time.perf_counter()  # starting time
+
+    def teardown(self):
+        self.data.teardown()
+        del self.data
+        del self.pool
 
     def new_blocks_needed(self, request, num_new_tokens: int):
         total = cdiv(request.num_computed_tokens + num_new_tokens, self.block_size)
@@ -107,9 +126,16 @@ class KVCache:
             logger.debug(f"cache invariant vierifciation succeeded, interval: {self.cache_verification_interval}")
 
     def verify_invariant_periodical(self, now: float=time.perf_counter()):
-        if now - self._last_stat_time > self.cache_verification_interval:
+        if now - self._last_req_metrics_time > self.cache_verification_interval:
             self.verify_invariant()
-        self._last_stat_time = now
+        self._last_req_metrics_time = now
+
+    def report_pool_exhausted(self, now: float=time.perf_counter()):
+        self.exhausted_report_cnt += 1
+        if now - self._last_report_exhausted_time > self.exhausted_report_interval:
+            logger.warning(f"no new block {self.exhausted_report_cnt} times")
+            self.exhausted_report_cnt = 0
+        self._last_report_exhausted_time = now
 
     def allocate_slots(self, request, want: int, respect_watermark: bool = False) -> list[int] | None:
         assert want > 0
@@ -118,8 +144,7 @@ class KVCache:
 
         reserve = self.watermark_blocks if respect_watermark else 0
         if need > self.pool.available() - reserve:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"no new block for {request.request_id}")
+            self.report_pool_exhausted()
             return None
 
         table = self.block_tables.setdefault(request.request_id, [])

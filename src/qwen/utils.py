@@ -9,14 +9,14 @@ logger = logging.getLogger(__name__)
 def resolve_device(prefer: str | None = None) -> torch.device:
     if prefer:                       # override explictly for reproducing or debuging
         return torch.device(prefer)
-    if torch.cuda.is_available():    # A10
-        return torch.device("cuda")
+    if torch.cuda.is_available():    # CUDA
+        return torch.device("cuda:0")
 
     return torch.device("cpu")       # Intel Mac
 
 def default_dtype(device: torch.device) -> torch.dtype:
     if device.type == "cuda":
-        return torch.bfloat16        # A10
+        return torch.bfloat16        # CUDA
     return torch.float32             # CPU
 
 def compare(target, ref, name="", rtol=0, atol=1e-3):
@@ -63,6 +63,7 @@ class RMSNorm(nn.Module):
 
 
 def sample_sharegpt(path, tokenizer, num_requests=256, max_p_len=1024, max_model_len=2048, seed=0) -> list[list[int]]:
+    logger.info("start to load sharegpt sample")
     with open(path) as f:
         raw = orjson.loads(f.read())
     raw = [d for d in raw if len(d["conversations"]) >= 2]
@@ -82,6 +83,8 @@ def sample_sharegpt(path, tokenizer, num_requests=256, max_p_len=1024, max_model
         reqs.append(p_input_ids)
         if len(reqs) == num_requests:
             break
+
+    logger.info(f"finished to load sharegpt sample, {len(reqs)}")
     return reqs
 
 

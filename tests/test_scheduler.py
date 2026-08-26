@@ -2,11 +2,13 @@ import torch
 import logging
 import copy
 import pytest
+import time
 
 from qwen.config import ModelConfig
 from qwen.scheduler import SchedulerOutput, ModelRequest, ScheduledInfo, Scheduler
 from qwen.sampling import Sampling, TensorSampling
 from qwen.cache import cdiv
+from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrices
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +19,7 @@ def test_schedule(tmp_target_config: ModelConfig):
     '''mock a real workflow to verify the correctness of schedule1 and schedule2'''
     tmp_target_config.max_num_batched_tokens = 201
     tmp_target_config.max_num_seqs = 3
-    tmp_target_config.num_blocks = 1024
+    tmp_target_config.num_blocks = 8
     tmp_target_config.max_waiting = 2
     tmp_target_config.cache_verification_interval = 0.  # always trigger cache invariant verification
 
@@ -63,7 +65,7 @@ def test_schedule(tmp_target_config: ModelConfig):
     req5 = copy.deepcopy(req4)
     req5.request_id = "req5"
 
-    # sch1
+    # sch
     sch.running.append(req1)
     sch.running.append(req2)
     assert sch.add_request(req3)
@@ -73,7 +75,7 @@ def test_schedule(tmp_target_config: ModelConfig):
     assert sch.running == [req1, req2]
     assert list(sch.waiting) == [req3, req4]
 
-    # step 1: verify schedule strategy v1, excepted want [1, 100, 100]
+    # step 1: verify D_first_preemptive_schedule, excepted want [1, 100, 100]
     # req1: D, i_len=100, o_len=1, num_computed_tokens=100
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
     # req3: P, i_len=300, o_len=0, num_computed_tokens=0, waiting -> running
@@ -86,6 +88,14 @@ def test_schedule(tmp_target_config: ModelConfig):
     assert sch_out.scheduled[req2.request_id].want == len(req2.input_ids)-req2.num_computed_tokens and len(sch_out.scheduled[req2.request_id].slots) == len(req2.input_ids)-req2.num_computed_tokens
     assert sch_out.scheduled[req3.request_id].want == 100 and len(sch_out.scheduled[req3.request_id].slots) == 100  # 201-1-100
 
+    # counters
+    assert sch.sch_metrics.num_scheduled == 3
+    assert sch.sch_metrics.num_rescheduled == 0
+    assert sch.sch_metrics.num_preempted == 0
+    assert sch.sch_metrics.num_finished == 0
+    assert sch.sch_metrics.num_error == 0
+    assert sch.sch_metrics.num_cache_exhausted == 0
+
     assert sch_out.output_ids == [[99], [], []]
     assert sch_out.finished == [False]*len(sch_out.reqs)
 
@@ -93,10 +103,13 @@ def test_schedule(tmp_target_config: ModelConfig):
     assert sch_out.tensor_sampling.temperature is not None and sch_out.tensor_sampling.temperature.tolist() == [temperature]*3
     assert sch_out.tensor_sampling.top_k is not None and sch_out.tensor_sampling.top_k.tolist() == [top_k]*3
 
-    # step 2: verify schedule strategy v2 against v1
+    # step 2: verify preemptive_schedule against D_first_preemptive_schedule
     # req1: D, i_len=100, o_len=1, num_computed_tokens=100
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
     # req3: P, i_len=300, o_len=0, num_computed_tokens=0
+    for req in sch.running:
+        req.metrics.first_schedule_time = None  # for counters
+    sch.sch_metrics = SchedulerMetrices()   # reset counters
     sch_out2 = sch.preemptive_schedule()
     assert sch_out2 is not None
     assert sch_out.reqs == sch_out2.reqs
@@ -104,13 +117,21 @@ def test_schedule(tmp_target_config: ModelConfig):
     torch.testing.assert_close(sch_out.tensor_sampling.temperature, sch_out2.tensor_sampling.temperature)
     torch.testing.assert_close(sch_out.tensor_sampling.top_k, sch_out2.tensor_sampling.top_k)
 
+    # counters
+    assert sch.sch_metrics.num_scheduled == 3
+    assert sch.sch_metrics.num_rescheduled == 0
+    assert sch.sch_metrics.num_preempted == 0
+    assert sch.sch_metrics.num_finished == 0
+    assert sch.sch_metrics.num_error == 0
+    assert sch.sch_metrics.num_cache_exhausted == 0
+
     # step 3: add sampled tokens to the current batch after the mocked sampler, and verify intermediate states of all reqs
     # req1: D, i_len=100, o_len=1, num_computed_tokens=100
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
     # req3: P, i_len=300, o_len=0, num_computed_tokens=0
     # want [1, 100, 100]
-    sch_out.add_sampled_tokens([100, 100, 100], tmp_target_config.eos_token_id_set)
-    sch.commit_step(sch_out=sch_out)
+    num_truncated = sch_out.add_sampled_tokens([100, 100, 100], tmp_target_config.eos_token_id_set)
+    sch.commit_step(sch_out=sch_out, num_truncated=num_truncated)
     # req1: D, i_len=100, o_len=2, num_computed_tokens=101
     # req2: D, i_len=200, o_len=1, num_computed_tokens=200
     # req3: P, i_len=300, o_len=0, num_computed_tokens=100
@@ -149,8 +170,8 @@ def test_schedule(tmp_target_config: ModelConfig):
     # req1: D, i_len=100, o_len=2, num_computed_tokens=101
     # req2: D, i_len=200, o_len=1, num_computed_tokens=200
     # req3: P, i_len=300, o_len=0, num_computed_tokens=100
-    sch_out.add_sampled_tokens([TOK_EOS, 101, 101], tmp_target_config.eos_token_id_set)
-    sch.commit_step(sch_out=sch_out)
+    num_truncated = sch_out.add_sampled_tokens([TOK_EOS, 101, 101], tmp_target_config.eos_token_id_set)
+    sch.commit_step(sch_out=sch_out, num_truncated=num_truncated)
     # req1: D, i_len=100, o_len=2, num_computed_tokens=102, finished, removed from running
     # req2: D, i_len=200, o_len=2, num_computed_tokens=201
     # req3: P, i_len=300, o_len=0, num_computed_tokens=299
@@ -162,8 +183,8 @@ def test_schedule(tmp_target_config: ModelConfig):
 
     logger.info([r.request_id for r in sch.running])
     assert req1 not in sch.running
-    assert sch.completed_req_cnt == 1
-    assert len(sch.metrics_list) == 1
+    assert sch.sch_metrics.num_finished == 1
+    assert len(sch.req_metrics_list) == 1
     assert sch.cache.get_block_table(req1) is None
 
     assert req1.output_ids == [99, 100] and req2.output_ids == [100, 101] and req3.output_ids == []
@@ -214,8 +235,10 @@ def test_schedule(tmp_target_config: ModelConfig):
     # req3: P, i_len=300, o_len=0, num_computed_tokens=299
     # req4: P, i_len=200, o_len=0, num_computed_tokens=0
     sch.running = [req3, req4, req2]
-    sch.metrics_list = []
-    sch.completed_req_cnt = 0
+    sch.req_metrics_list = []
+    for req in sch.running:
+        req.metrics.first_schedule_time = None  # for counters
+    sch.sch_metrics = SchedulerMetrices()
 
     sch_out = sch.preemptive_schedule()    # expected want [1, 200, 1]
     assert sch_out is not None
@@ -224,6 +247,14 @@ def test_schedule(tmp_target_config: ModelConfig):
     assert sch_out.scheduled[req4.request_id].want == 200 and len(sch_out.scheduled[req4.request_id].slots) == 200  # min(201-1, 200)
     assert sch_out.scheduled[req2.request_id].want == 1 and len(sch_out.scheduled[req2.request_id].slots) == 1
     assert sum([si.want for si in sch_out.scheduled.values()]) > tmp_target_config.max_num_batched_tokens
+    
+    # counters
+    assert sch.sch_metrics.num_scheduled == 3
+    assert sch.sch_metrics.num_rescheduled == 0
+    assert sch.sch_metrics.num_preempted == 0
+    assert sch.sch_metrics.num_finished == 0
+    assert sch.sch_metrics.num_error == 0
+    assert sch.sch_metrics.num_cache_exhausted == 0
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
@@ -243,11 +274,15 @@ def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     req1.output_ids = [TOK]
     req1.is_decoding = True             # change to True because of num_computed_tokens==len(input_ids)
 
+    # mock schedule
+    req1.metrics.first_schedule_time = time.perf_counter()
+
     # preempted manually
     req1.reset_on_preemption()
     # req1: P, i_len=100, o_len=1, num_computed_tokens=0
     assert req1.is_decoding == False    # default
     assert req1.num_computed_tokens == 0
+    assert req1.metrics.first_schedule_time is not None     # do not reset first_schedule_time on preemption
 
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 200))[0].tolist()
@@ -268,10 +303,16 @@ def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     assert sch_out.reqs == [req2, req1]
     assert sch_out.scheduled[req2.request_id].want == 100   # 200-100
     assert sch_out.scheduled[req1.request_id].want == 101   # i_len+o_len=100+1=101
+    assert req1.metrics.first_schedule_time is not None and req2.metrics.first_schedule_time is not None
+    assert req1.metrics.first_schedule_time < req2.metrics.first_schedule_time
+
+    # counters
+    assert sch.sch_metrics.num_scheduled == 2
+    assert sch.sch_metrics.num_rescheduled == 1
 
     # after sampling
-    sch_out.add_sampled_tokens([TOK, TOK], tmp_target_config.eos_token_id_set)
-    sch.commit_step(sch_out=sch_out)
+    num_truncated = sch_out.add_sampled_tokens([TOK, TOK], tmp_target_config.eos_token_id_set)
+    sch.commit_step(sch_out=sch_out, num_truncated=num_truncated)
     # req2: P, i_len=200, o_len=1, num_computed_tokens=200
     # req1: P, i_len=100, o_len=2, num_computed_tokens=101
     assert req2.is_decoding and req1.is_decoding
@@ -296,7 +337,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
-    sch.cache.allocate_slots(req1, 16)      # construct its block table, one block
+    sch.cache.allocate_slots(req1, 16)      # construct its block table, and consume one block
     req1.num_computed_tokens = 16
     assert req1.is_decoding == False
 
@@ -305,7 +346,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0
-    sch.cache.allocate_slots(req2, 16)      # construct its block table, one block
+    sch.cache.allocate_slots(req2, 16)      # construct its block table, and consume one block
     req2.num_computed_tokens = 16
     assert req2.is_decoding == False
 
@@ -314,7 +355,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     # now there is only one free block in kv cache pool
     assert len(sch.cache.pool.free) == 1
 
-    # req1 requires a new block in this turn and is met, then there is no free block;
+    # req1 requires a new block in this turn and is met, but there is no free block;
     # so req2's request is rejected due to the insufficiency of free blocks.
     sch_out = sch.schedule()
     assert sch_out is not None
@@ -333,6 +374,9 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     assert not req2.is_decoding
     assert req2.num_computed_tokens == 0
     assert sch.cache.get_block_table(req2) is None
+    assert sch.sch_metrics.num_preempted == 1
+    assert sch.sch_metrics.num_scheduled == 1
+    assert sch.sch_metrics.num_cache_exhausted == 1
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
@@ -390,6 +434,11 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     assert not req2.is_decoding
     assert req2.num_computed_tokens == 0
     assert sch.cache.get_block_table(req2) is None
+
+    # counters
+    assert sch.sch_metrics.num_preempted == 1
+    assert sch.sch_metrics.num_scheduled == 1
+    assert sch.sch_metrics.num_cache_exhausted == 1
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 @pytest.mark.parametrize("p_before_d", [True, False])
@@ -449,6 +498,11 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     assert not req1.is_decoding
     assert req1.num_computed_tokens == 0
     assert sch.cache.get_block_table(req1) is None
+
+    # counters
+    assert sch.sch_metrics.num_scheduled == 1
+    assert sch.sch_metrics.num_preempted == 1
+    assert sch.sch_metrics.num_cache_exhausted == 1
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_pick_waiting(tmp_target_config: ModelConfig, use_d_first_schedule: bool):

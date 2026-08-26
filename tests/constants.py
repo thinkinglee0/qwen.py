@@ -6,9 +6,10 @@ MAX_NEW_TOKEN_NUM = 40
 MAX_MODEL_LEN = 512
 
 # benchmark
-SHARE_GPT_FILE_NAME = "./data/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHARE_GPT_FILE_NAME = "../models/sharegpt_data/ShareGPT_V3_unfiltered_cleaned_split.json"
 SHARE_GPT_REQ_NUM = 128
 SHARE_GPT_MAX_SEQS = 8
+MAX_NUM_BLOCKS = 2048
 
 DATA_DIR = "./data"
 LOG_DIR = "./log"
@@ -40,26 +41,31 @@ LONG_BATCH_2 = [LONG_PROMPT_1, LONG_PROMPT_2]
 BATCH_FOR_BENCHMARKING = [
     PROMPT_CLASSICAL,
     "Hi",
-    "Hello",
+    "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...",
     "How are you?",
-    "What is your name?",
+    "How to tell if a customer segment is well segmented? In 3 bullet points.",
     "Where are you from?",
-    "What do you do?",
-    "What is your favorite color?",
-    "What is your favorite food?",
-    "What is your favorite movie?",
-    "What do you know about me?",
-    "What is the meaning of life?",
-    "What is the purpose of existence?",
+    "Do you know the book Traction by Gino Wickman",
+    "create new version. we will call it: \"second draft\". You need to reformat Filters part to be more ease to read",
+    "test: [noun] a means of testing: such as. something (such as a series of questions or exercises) for measuring the skill, knowledge, intelligence, capacities, or aptitudes of an individual or group. a procedure, reaction, or reagent used to identify or characterize a substance or constituent. a positive result in such a test.",
+    "what is a good maven pom.xml template for compiling a java project?",
+    "What is the most quoted biblical verse?",
+    "how to use case-sensative sorting in js?",
+    "explain the process of a product designer",
     "What is the nature of reality?",
-    "What is the nature of consciousness?",
+    "generate apache airflow configuration code for supporting azure active directory sso tokens",
     "What is the nature of the universe?",
-    "What is the nature of time?",
+    "i need a copy paste tool for zellij. its relaly hard to grab scrollback output cleanly, idk how to output it easily for use outside the terminal. can you help? either a tool or just commands that allow me to extract that data cleanly wtihout jumping through hoops",
     "What is the nature of space?",
+    '''Need you act as a senior developer. 
+we use AWS, angular with EC2. We have a coaching tool that places images on screen of particpants and uses webRTC for communications, we will aso be adding lines from twilio for VOIP.
+
+we currently have API for google and have trasncription working. and use GPT to analyze call. 
+
+I have a few questions''',
     "What is the nature of matter?",
-    "What is the nature of energy?",
+    "I have a food delivery business, I want ideas for menu items, like snacks, for 2 or more poeple to eat together, one I have in mind are mexican nachos",
     "What is the nature of light?",
-    "What is the nature of sound?",
     "What is the nature of gravity?",
     "1+1=?",
     "123*456=?",

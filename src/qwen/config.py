@@ -1,6 +1,6 @@
 # src/config.py
 
-import json, torch
+import orjson, torch
 from typing import Any
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +10,7 @@ import logging
 from collections.abc import Iterable
 
 from qwen.utils import resolve_device, default_dtype
+from qwen.constants import LOG_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +83,8 @@ class ModelConfig():
     max_waiting: int = 64                   # idem
 
     # paged cache
-    num_blocks: int = 1024*32   # 2 * 24 * 1024*32 * 16 * 2 * 64 * 2 B = 6442450944 B ≈ 6.4 GB
-    block_size: int = 16
+    num_blocks: int = 1024*2   # 2 * 24 * 1024*2 * 256 * 2 * 64 * 2 B = 6442450944 B ≈ 6.4 GB
+    block_size: int = 256
 
     # backoff after preempted
     backoff_base: int = 2
@@ -91,10 +92,15 @@ class ModelConfig():
 
     # timing tasks
     is_benchmarking: bool=False
-    stat_interval: float = 60               # sec
+    req_metrics_interval: float = 60               # sec
     cache_verification_interval: float = 60 # sec
 
+    # log
+    log_dir: str = LOG_DIR
+
     def __post_init__(self):
+        assert self.block_size % 256 == 0, f"flash-attn paged KV requires block_size % 256 == 0, got {self.block_size}"
+
         if self.head_dim == 0:
             self.head_dim = self.hidden_size // self.num_attention_heads
 
@@ -116,10 +122,10 @@ class ModelConfig():
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":
         with open(Path(model_dir) / "config.json") as f:
-            raw: dict = json.load(f)
+            raw = orjson.loads(f.read())
 
         with open(Path(model_dir) / "generation_config.json") as f:
-            raw2: dict = json.load(f)
+            raw2 = orjson.loads(f.read())
 
         raw.update(raw2)    # merge generation config into model config
         raw["model_dir"] = model_dir    # inject

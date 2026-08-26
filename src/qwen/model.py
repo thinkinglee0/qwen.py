@@ -31,7 +31,7 @@ class QwenModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
 
         for layer in self.layers:
-            hidden_states = layer.forward(hidden_states, meta)
+            hidden_states = layer(hidden_states, meta)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states

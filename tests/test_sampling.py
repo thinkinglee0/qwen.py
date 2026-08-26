@@ -5,11 +5,12 @@ import logging
 from qwen.sampling import apply_top_p, apply_top_k, apply_penalties, sample
 from qwen.utils import pad_token_ids
 from constants import *
+from qwen.utils import resolve_device, default_dtype
 
 logger = logging.getLogger(__name__)
 
 def test_apply_penalties():
-    device = "cpu"
+    device = resolve_device()
     vocab_size = 151936          # Actual value for Qwen2.5
     bsz = 3
     logits = torch.randn(bsz, vocab_size, device=device, dtype=torch.float32)
