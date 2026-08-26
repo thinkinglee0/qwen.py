@@ -84,7 +84,7 @@ def sample_sharegpt(path, tokenizer, num_requests=256, max_p_len=1024, max_model
         if len(reqs) == num_requests:
             break
 
-    logger.info(f"finished to load sharegpt sample, {len(reqs)}")
+    logger.info(f"finished to load sharegpt sample, request count: {len(reqs)}")
     return reqs
 
 

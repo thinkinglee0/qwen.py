@@ -14,10 +14,11 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M1**    | Forward pass — embed → 24 × decoder block → final norm → logits | ✅ done, logits validated against the `transformers` reference layer-by-layer                                                                                                                                                                                             |
 | **M2**    | KV cache (incremental decode, `past_len` plumbing)              | ✅ done, logits validated against the non-kv-cache mode by pytest                                                                                                                                                                                                         |
 | **M3**    | Generation loop, Streaming HTTP service                         | ✅ done, introduce FastAPI, async                                                                                                                                                                                                                                         |
-| **M4**    | sampling, restructure the project layout                        | ✅ done, add repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial; isolate source code from unit tests; extract attention/mlp/decode_layer/norm from model.py, and bind weights to the `nn.Module` tree through the `load_state_dict` function. |
-| **M5**    | static batching                                                 | ✅done. pack a list of **variable-length** id sequences into a 1-dim id list, opt for SDPA attention in my local macbook for quick functional verifications; add request to `StaticScheduler`, and then scheduler in a fixed batch.                                       |
-| **M6**    | continuous batching                                             | 🔜 next                                                                                                                                                                                                                                                                  |
-| later     | performance of static and continuous batchings on 7B / RTX 4090      | planed                                                                                                                                                                                                                                                                   |
+| **M4**    | sampling, restructure the project layout                        | ✅ done, add repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial; isolate source code from unit tests; extract attention/mlp/decode_layer/norm from model.py, and bind weights to the `nn.Module` tree through the `load_state_dict` function. |
+| **M5**    | static batching                                                 | ✅done. pack a list of **variable-length** id sequences into a 1-dim id list, opt for SDPA attention in my local macbook for quick functional verifications; add request to `StaticScheduler`, and then scheduler in a fixed batch.                                       |
+| **M6**    | continuous batching                                             | ✅done. continuous batching with paged kv cache; two interchangable scheduling strategies (preemptive_schedule and D_first_preemptive_schedule); watermark block reservation; expential backoff; KVCache.verify_invariant periodically checks; metrics (schedule metrics, step metrics, and request metrics).|
+| **M7**    | performance profiling     | 🔜 next. performance profiling of continuous batching on NVIDIA 4090    |
+| later     | Fused kernels in Trition | planed  |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
 
@@ -25,20 +26,36 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 
 ## What's implemented
 
-- **GQA attention** — 14 query heads / 2 KV heads, `head_dim=64`; `repeat_kv` expands KV to query-head count *after* RoPE, matching HuggingFace's ordering.
-- **RoPE** (`rope.py`) — `default`, `linear`, and `dynamic-NTK` scaling variants behind a common base class, selected from `config.rope_scaling`. Half-dim cos/sin cache; rotation convention is bit-equivalent to HF's `rotate_half`.
+**Continuous batching & scheduling**
+- **Continuous batching** — scheduling runs per forward step instead of per fixed batch: a request is admitted as soon as there's room and evicted the moment it finishes, instead of waiting on the slowest member of a static batch.
+- **Two interchangeable scheduling strategies** — `preemptive_schedule` lets Prefill (Ps) and Decode (Ds) requests interleave within a step; `D_first_preemptive_schedule` always schedules Ds before Ps to protect in-flight decode latency, which changes its `_pick_victim` logic accordingly. See `scheduler.py`.
+- **Chunked prefill** — long prompts are split across steps (`long_prefill_token_threshold`) so they can't stall decode-phase requests and blow up ITL P99.
+- **Exponential backoff on preemption** — a preempted request is barred from re-admission for `backoff_base ** preempt_count` steps (capped at `backoff_cap`), avoiding thrash under sustained cache pressure.
+- **Watermark block reservation** — a reserved slice of the KV pool (`respect_watermark`) so already-running requests can't be starved by new admissions.
+- **Recompute on preemption** — a preempted request drops its KV cache and returns to the waiting queue, keeping its already-generated output tokens; those tokens are replayed as input when it's rescheduled.
+- **Truncation tracking** — requests that hit `max_new_tokens` before EOS are counted separately (`num_truncated`) from normal completions.
+
+**Paged KV cache**
+- **Block-based, ref-counted paged cache** (`cache.py`) — fixed-size blocks (`block_size=256`, required to be a multiple of 256 by flash-attn's paged-KV kernel) allocated from a `BlockPool`; `verify_invariant` runs periodically to catch block-table/ref-count drift (cache leaks) early.
+- **Explicit teardown** — `KVCacheData`, `KVCache`, `Scheduler`, and `LLMEngine` each expose `teardown()` to drop KV-cache/model references deterministically instead of waiting on GC; `ServingDriver.stop()` tears its engine down automatically.
+
+**Attention & model**
+- **Flash and SDPA attention** — `flash_attn_varlen_func` with a paged `block_table` on CUDA; falls back to a reference SDPA-over-gathered-cache path (`sdpa_from_cache`) for functional verification on machines without flash-attn (e.g. a local MacBook).
+- **RoPE** — `default`, `linear`, and `dynamic-NTK` scaling variants behind a common base class, selected from `config.rope_scaling`. Half-dim cos/sin cache; rotation convention is bit-equivalent to HF's `rotate_half`.
 - **RMSNorm** — variance computed in fp32 then cast back, identical to the reference.
 - **SwiGLU MLP** — `silu(gate_proj(x)) * up_proj(x) → down_proj`.
-- **Causal masking** — additive `-inf` mask built once per forward; written so it generalizes to `k_len > q_len` (the KV-cache case in M2).
-- **Tied embeddings** — `lm_head` falls back to `embed_tokens.weight` when
-  `tie_word_embeddings=True` (0.5B); a separate `lm_head.weight` is used when present (7B).
-- **Weight loading** — `safetensors` → flat dict, dtype cast, config parsed from `config.json` into a typed dataclass.
-- **KV cache** — `prefill` and `decode` share the same `forward`; `init_kv_cache`while `cache`is None in `forward`function; return `cache` on the end of `forward` for the next iteration.
-- **Streaming HTTP service** — `async_generate`throws `_decode_step`into the current `event loop`, and yields CPU after `_decode_step`returns; `/generate_stream`and `/health`endpoints implemented by FastAPI; `@asynccontextmanager`, `@pytest_asyncio.fixture` and `@pytest.fixture` ensure that the model **Weights** only loads **once** in testing scenarios of sync functions, async functions, and FastAPI endpoints.
-- **Sampling** — parse `generation_conf.json`, apply repetition/frequency/presence penalties just after `forward`, then do sampling if `do_sample` swtich is on; sampling includes temperature, top_k, top_p, multinomial.
-- **Restructure the project layout** — rename `qwen.py` to `model.py`, `main.py` to `api.py`, put sync/async generations into `engine.py`, place source code files in the `src/qwen` folder, and unit tests in `tests`.
-- **Static batching** — pack a list of **variable-length** id sequence into an 1-dim id list by `pack_sequences`, `scatter_to_kv_cache` after the projection and rope of K and V; select flash_attn for cloud RTX 4090 VPS, falls back to SDPA attention in my locl macbook for quick functional verifications.
-- **Benchmarking and statistic** — statisticize `TTFT`, `TPOT`, and `ITL` for each request, and triggered periodically after each step; add a regular benchmark for functionality verification and ShareGPT benchmark for performance profiling.
+- **Causal masking** — additive `-inf` mask built once per forward; generalizes to `k_len > q_len` for the KV-cache case.
+- **Tied embeddings** — `lm_head` falls back to `embed_tokens.weight` when `tie_word_embeddings=True` (0.5B); a separate `lm_head.weight` is used when present (7B).
+- **Weight loading** — `safetensors` → flat dict, dtype cast, config parsed from `config.json`/`generation_config.json` (via `orjson`) into a typed dataclass.
+- **Static batching** — packs a list of variable-length id sequences into a 1-D id list (`pack_sequences`, `scatter_to_kv_cache`) and schedules them as a fixed batch via `StaticScheduler`; kept alongside continuous batching for comparison/benchmarking.
+
+**Sampling**
+- **Sampling** — parses `generation_config.json`; applies repetition/frequency/presence penalties right after `forward`, then samples (temperature, top_k, top_p, multinomial) when `do_sample` is on.
+
+**Serving & observability**
+- **Streaming HTTP service** — FastAPI `/generate_stream` and `/health`; `async_generate` interleaves `_decode_step` into the running event loop so one worker serves multiple concurrent streams; `@asynccontextmanager`/`@pytest_asyncio.fixture`/`@pytest.fixture` ensure model weights load only once across sync, async, and endpoint tests.
+- **Three-tier metrics** — logged as JSON per run: **request metrics** (TTFT/TPOT/ITL per request), **scheduler metrics** (cumulative preemption/cache-exhaustion/truncation/reschedule counters), and **per-step metrics** (batch size, prefill/decode token counts, KV-block utilization, step latency).
+- **Benchmarking** — a functional benchmark plus a ShareGPT-based benchmark for performance profiling (see [Performance profiling](#performance-profiling)).
 
 ---
 
@@ -72,15 +89,7 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 
 3. **Anomaly analisis**: decode throughput ratio is 1.12 from batch_isze 1 to 2, greater than 1. It was caused by CPU existing from Turbo mode due to my operations (1. `caffeinate -i -m`; 2. run benchmark; 3. press power button of my MacBook).
 
-| Batch size /<br/>Request number | Prefill<br/>=TTFT - Queue_delay                                                                                                                            | TPOT                                                                                                                                                | ITL                                                                                                                                                     |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1/16                            | {<br/> "n": 512,<br/> "mean": 132.789,<br/> "std": 20.351,<br/> "p50": 123.835,<br/> "p90": 158.678,<br/> "p99": 200.014,<br/> "max": 238.765<br/> }       | {<br/> "n": 512,<br/> "mean": 123.055,<br/> "std": 6.967,<br/> "p50": 125.854,<br/> "p90": 127.2,<br/> "p99": 128.289,<br/> "max": 136.474<br/> }   | {<br/> "n": 53223,<br/> "mean": 123.057,<br/> "std": 10.703,<br/> "p50": 126.926,<br/> "p90": 130.222,<br/> "p99": 132.54,<br/> "max": 718.706<br/> }   |
-| 2/32                            | {<br/> "n": 512,<br/> "mean": 154.021,<br/> "std": 32.566,<br/> "p50": 142.686,<br/> "p90": 198.823,<br/> "p99": 268.931,<br/> "max": 304.286<br/> }       | {<br/> "n": 512,<br/> "mean": 116.047,<br/> "std": 1.061,<br/> "p50": 115.814,<br/> "p90": 117.372,<br/> "p99": 120.021,<br/> "max": 121.719<br/> } | {<br/> "n": 50226,<br/> "mean": 116.033,<br/> "std": 5.726,<br/> "p50": 115.211,<br/> "p90": 119.312,<br/> "p99": 133.598,<br/> "max": 293.065<br/> }   |
-| 4/64                            | {<br/> "n": 512,<br/> "mean": 248.721,<br/> "std": 72.967,<br/> "p50": 236.974,<br/> "p90": 351.284,<br/> "p99": 461.978,<br/> "max": 493.999<br/> }       | {<br/> "n": 512,<br/> "mean": 128.17,<br/> "std": 2.515,<br/> "p50": 128.205,<br/> "p90": 130.687,<br/> "p99": 133.46,<br/> "max": 138.427<br/> }   | {<br/> "n": 46170,<br/> "mean": 128.044,<br/> "std": 11.133,<br/> "p50": 127.213,<br/> "p90": 132.165,<br/> "p99": 149.898,<br/> "max": 1086.059<br/> } |
-| 8/64                            | {<br/> "n": 512,<br/> "mean": 522.491,<br/> "std": 114.651,<br/> "p50": 504.209,<br/> "p90": 657.909,<br/> "p99": 809.124,<br/> "max": 809.124<br/> }      | {<br/> "n": 512,<br/> "mean": 151.551,<br/> "std": 3.149,<br/> "p50": 151.117,<br/> "p90": 156.75,<br/> "p99": 160.548,<br/> "max": 160.548<br/> }  | {<br/> "n": 41722,<br/> "mean": 151.636,<br/> "std": 9.636,<br/> "p50": 149.803,<br/> "p90": 159.913,<br/> "p99": 185.699,<br/> "max": 317.199<br/> }   |
-| 16/64                           | {<br/> "n": 512,<br/> "mean": 993.516,<br/> "std": 148.212,<br/> "p50": 1009.939,<br/> "p90": 1172.503,<br/> "p99": 1313.25,<br/> "max": 1313.25<br/> }    | {<br/> "n": 512,<br/> "mean": 228.547,<br/> "std": 6.539,<br/> "p50": 227.93,<br/> "p90": 237.638,<br/> "p99": 243.826,<br/> "max": 243.826<br/> }  | {<br/> "n": 38854,<br/> "mean": 228.307,<br/> "std": 12.012,<br/> "p50": 226.788,<br/> "p90": 239.941,<br/> "p99": 276.275,<br/> "max": 351.846<br/> }  |
-| 32/96                           | {<br/> "n": 512,<br/> "mean": 1871.921,<br/> "std": 191.012,<br/> "p50": 1918.657,<br/> "p90": 2165.994,<br/> "p99": 2214.558,<br/> "max": 2214.558<br/> } | {<br/> "n": 512,<br/> "mean": 376.967,<br/> "std": 7.716,<br/> "p50": 378.624,<br/> "p90": 384.873,<br/> "p99": 391.298,<br/> "max": 391.729<br/> } | {<br/> "n": 35717,<br/> "mean": 376.976,<br/> "std": 18.841,<br/> "p50": 376.089,<br/> "p90": 391.813,<br/> "p99": 447.585,<br/> "max": 595.678<br/> }  |
-| 64/256                          | {<br/> "n": 512,<br/> "mean": 3860.661,<br/> "std": 375.43,<br/> "p50": 3868.442,<br/> "p90": 4454.093,<br/> "p99": 4454.093,<br/> "max": 4454.093<br/> }  | {<br/> "n": 512,<br/> "mean": 706.547,<br/> "std": 7.933,<br/> "p50": 707.658,<br/> "p90": 718.253,<br/> "p99": 718.253,<br/> "max": 718.253<br/> } | {<br/> "n": 33484,<br/> "mean": 706.657,<br/> "std": 32.015,<br/> "p50": 701.086,<br/> "p90": 739.056,<br/> "p99": 808.442,<br/> "max": 1032.269<br/> } |
+Full per-batch-size latency table: [`docs/static_batching_cpu_benchmark.md`](./docs/static_batching_cpu_benchmark.md).
 
 #### 1.2 Platform: NVIDIA RTX 4090
 
@@ -94,12 +103,9 @@ stay tuned
 
 ## Quickstart
 
+build the development platform, see [vast-evn-build.md](./env/vastai/vast-evn-build.md) for details.
+
 ```bash
-pip install torch safetensors transformers fastapi uvicorn pytest_asyncio pytest
-
-# fetch the dev model (≈1 GB)
-huggingface-cli download Qwen/Qwen2.5-0.5B --local-dir ../qwen2.5-0.5b
-
 # verify
 pytest
 

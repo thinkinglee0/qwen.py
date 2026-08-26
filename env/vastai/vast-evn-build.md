@@ -134,7 +134,7 @@ uptime      # snapshot neighbour load alongside the number
 
 ```bash
 cd /workspace
-git clone <your qwen.py repo> && cd qwen.py
+git clone https://github.com/thinkinglee0/qwen.py.git && cd qwen.py
 ```
 
 ### 2a. torch 版本对齐
@@ -167,7 +167,7 @@ pip install --no-cache-dir torch==2.9.* --index-url https://download.pytorch.org
 ### 2b. 一键装完
 
 ```bash
-bash setup.sh
+bash env/vastai/setup.sh
 ```
 
 `setup.sh` 会:读出当前 torch/ABI/cp → 生成 constraints → 精确匹配 wheel → 安装 → 实跑 `flash_attn_varlen_func` 验证。**匹配不到就报错退出,绝不静默回退到源码编译。**
@@ -220,6 +220,9 @@ print('varlen OK      ', tuple(flash_attn_varlen_func(q, q, q, cu, cu, 8, 8, cau
 ## 3. 环境变量
 
 写进 `~/.bashrc`,别每次手敲。宿主报 128 threads,放任 torch 开满会自己制造 CPU 瓶颈,而且这个开销**只打在 qwen.py 身上**(vLLM 自己会设)。
+顺便写 `~/.gitconfig`。
+
+完成后，**重新登录**cloud instance。
 
 ```bash
 cat >> ~/.gitconfig <<'EOF'
@@ -236,12 +239,19 @@ export MKL_NUM_THREADS=8
 export QWEN_MODEL_DIR=/workspace/models
 export HF_HOME=/workspace/hf
 EOF
-source ~/.bashrc
 ```
 
 ---
 
 ## 4. 下权重(5–10 分钟)
+
+执行以下命令：
+
+```bash
+bash download_models_and_dataset.sh
+```
+
+其中脚本`download_models_and_dataset.sh`内容如下（无需独立执行）：
 
 ```bash
 mkdir -p "$QWEN_MODEL_DIR"
@@ -255,7 +265,7 @@ mkdir -p "$QWEN_MODEL_DIR"
 # otherwise double the transfer.
 python - <<'PY'
 import os
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, hf_hub_download
 
 root = os.environ["QWEN_MODEL_DIR"]
 KEEP = ["*.json", "*.safetensors", "*.txt", "*.model", "*.py"]
@@ -265,10 +275,18 @@ for repo, sub in [
     # run, and 7B makes that unbearable.
     ("Qwen/Qwen2.5-0.5B-Instruct", "qwen2.5-0.5b-instruct"),
     # 7B only when benchmarking -- comment out otherwise.
-    ("Qwen/Qwen2.5-7B-Instruct",   "qwen2.5-7b-instruct"),
+    # ("Qwen/Qwen2.5-7B-Instruct",   "qwen2.5-7b-instruct"),
 ]:
     p = snapshot_download(repo, local_dir=f"{root}/{sub}", allow_patterns=KEEP)
     print("->", p)
+
+# Dataset repo, and only one file out of ~4.2 GB of JSON.
+p = hf_hub_download(
+    "anon8231489123/ShareGPT_Vicuna_unfiltered",
+    repo_type="dataset",                              # <-- the actual fix
+    filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+    local_dir=f"{root}/sharegpt_data",
+)
 PY
 ```
 

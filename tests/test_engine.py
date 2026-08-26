@@ -209,7 +209,7 @@ def _get_batch_sizes() -> list[int]:
         return _DEFAULT_BATCH_SIZES
     return [int(b) for b in env.split(",")]
 
-# SWEEP_BATCH_SIZES=64,128 pytest -x tests/test_engine.py::test_benchmark_sharegpt
+# SWEEP_BATCH_SIZES=64,128 pytest -x tests/test_engine.py::test_benchmark_sharegpt_sweep_batch_size
 @pytest.mark.parametrize("B", _get_batch_sizes())
 def test_benchmark_sharegpt_sweep_batch_size(tmp_target_config_for_sharegpt_benchmarking, tokenizer, B:int, log_dir):
     cfg = tmp_target_config_for_sharegpt_benchmarking
