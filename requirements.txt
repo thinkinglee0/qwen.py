@@ -1,0 +1,42 @@
+# Pin ONLY what is load-bearing. Everything else is left to the
+# constraints file, which reflects what the running image already has --
+# adding a second opinion here just manufactures conflicts.
+
+# Golden-reference oracle. The differential harness compares qwen.py
+# against modeling_qwen2.py from THIS version, and the dtype tolerances
+# were calibrated against it. Treat as load-bearing, not a dependency.
+transformers==4.46.3
+
+# Forced by the line above: transformers 4.46.3 predates huggingface-hub
+# 1.0 and declares huggingface-hub<1.0. Images shipping hf-hub 1.x must
+# have it EXCLUDED from the constraints file, or the resolve is impossible:
+#   grep -viE '^huggingface[-_]hub==' /opt/torch-baseline.txt > /opt/constraints.txt
+huggingface-hub<1.0
+
+# serving layer
+fastapi
+uvicorn[standard]
+httpx
+
+# test infra
+pytest
+pytest-asyncio
+
+# Benchmark result analysis only. NOT on the logits path.
+pandas
+
+# NOTE: `datasets` is deliberately absent. Recent versions require
+# huggingface-hub>=1.0, which collides head-on with the oracle pin above.
+# The ShareGPT benchmark reads the raw JSON dump directly, so the
+# dependency buys nothing:
+#   ShareGPT_V3_unfiltered_cleaned_split.json -> json.load()
+
+# NOTE: no numpy pin. The numpy<2.0 ceiling belongs to the Intel Mac dev
+# box (torch 2.2.2 era) and does not apply on a modern CUDA torch.
+
+# domestic weight download path (huggingface.co unreachable from mainland
+# China). Harmless everywhere; keeps one image for both.
+modelscope
+
+orjson
+pytest-forked
