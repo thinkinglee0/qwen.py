@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 import logging
 import orjson
 from collections.abc import Callable
+import uuid
 
 from qwen.model import QwenForCausalLM
 from qwen.config import ModelConfig
@@ -61,19 +62,20 @@ def _generate_stream_imp(http_req: HTTPRequest, req: GenRequest, driver: Serving
                          payload_generate: Callable[[str], bytes] = lambda text: orjson.dumps({"text": text}),
                          prefix: bytes=b"data: ", suffix: bytes=b"\n\n"):
     input_ids = tokenizer(req.prompt).input_ids     # convert prompt to token ids
+    request_id = str(uuid.uuid4())
 
     async def sse():
         try:
-            async for token in async_generate(driver, input_ids, req.sampling):
+            async for token in async_generate(driver, input_ids=input_ids, request_id=request_id, sampling=req.sampling):
                 if await http_req.is_disconnected():      # client closed connection
                     break
                 text = tokenizer.decode(token)
                 payload = payload_generate(text)
                 yield prefix + payload + suffix
             yield prefix+b"[DONE]\n\n"        # normal completion only
-        finally:
-            # todo: release KV cache slots for client-disconnect scenario.
-            pass
+        except Exception as e:
+            # release KV cache slots for client-disconnect scenario.
+            driver.abort(request_id)
 
     return StreamingResponse(sse(), media_type="text/event-stream")
 

@@ -149,9 +149,37 @@ def test_free(tmp_target_config: ModelConfig, seed=0):
     assert cache.pool.available() == cache.pool.num_blocks
 
 def test_watermark(tmp_target_config: ModelConfig):
-    '''
-    todo
-    
-    '''
-    pass
+    tmp_target_config.num_blocks = 100
+    tmp_target_config.block_size = 10
+    tmp_target_config.cache_verification_interval = 0.  # always trigger cache invariant verification
+
+    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 2000))[0].tolist()    # rectangular tensor
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None, max_new_tokens=1000)
+    req1.request_id = "req1"
+
+    cache = KVCache(tmp_target_config)
+    assert cache.watermark_blocks == 1
+
+    assert cache.allocate_slots(req1, 990) is not None
+    cache.free(req1)
+
+    assert cache.allocate_slots(req1, 991) is not None
+    cache.free(req1)
+
+    assert cache.allocate_slots(req1, 990, respect_watermark=True) is not None
+    cache.free(req1)
+
+    assert cache.allocate_slots(req1, 991, respect_watermark=True) is None
+    cache.free(req1)
+
+    assert cache.allocate_slots(req1, 1000) is not None
+    cache.free(req1)
+
+    assert cache.allocate_slots(req1, 1001) is None
+    cache.free(req1)
+
+    assert cache.allocate_slots(req1, 1001, respect_watermark=True) is None
+    cache.free(req1)
+
+
 

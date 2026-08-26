@@ -5,9 +5,9 @@ import asyncio
 import time
 from datetime import datetime
 from pathlib import Path
-import uuid
 import copy
 import orjson
+import uuid
 
 from qwen.utils import round_floats
 from qwen.sampling import TensorSampling, Sampling
@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class ModelRequest:
-    def __init__(self, config: ModelConfig, loop, input_ids: list[int], sampling: Sampling | None = None, max_new_tokens: int=1024):
-        self.request_id = str(uuid.uuid4())
+    def __init__(self, config: ModelConfig, loop, input_ids: list[int], request_id: str | None=None, sampling: Sampling | None = None, max_new_tokens: int=1024):
+        self.request_id = request_id if request_id is not None else str(uuid.uuid4())
         self.input_ids = input_ids
         self.sampling = sampling
         self.max_new_tokens = max(1, min(config.max_model_len-len(input_ids), max_new_tokens))
@@ -49,6 +49,8 @@ class ModelRequest:
         self.preempt_count += 1
 
     def get_existing_ids(self, want: int) -> list[int]:
+        assert 0 < want <= len(self.input_ids) + len(self.output_ids)
+
         start = self.num_computed_tokens
         end = start + want
 
@@ -234,7 +236,7 @@ class Scheduler:
     def _preempt(self, victim: ModelRequest, victims: set[str]):
         '''
         todo: swap out to host memory
-        new issue: how to choose swap out and recompute
+        new issue: how to choose between swap out and recompute
         '''
         assert not victim.finished
 
@@ -246,9 +248,9 @@ class Scheduler:
         self.running.remove(victim) if victim in self.running else None   # compatible for D_first_preemptive_schedule
         self.cache.free(victim)     # must execute before reset_on_preemption because the original num_computed_tokens is needed for freeing cache
 
-        victim.reset_on_preemption()  # recompute from scratch
+        victim.reset_on_preemption()  # recompute from scratch, preempt_count += 1
 
-        delay = min(self.backoff_base ** (victim.preempt_count - 1), self.backoff_cap)
+        delay = min(self.backoff_base ** (victim.preempt_count - 1), self.backoff_cap)  # mininum of delay is 1
         victim.not_before_step = self.sch_metrics.step + delay
         self.waiting.appendleft(victim)
 
@@ -274,20 +276,59 @@ class Scheduler:
         self.cache.free(req)
         self.req_metrics_list.append(req.metrics)
 
-    def cleanup_on_error(self, req: ModelRequest, e: Exception):
-        assert req in self.running
-
-        self.sch_metrics.report_on_error()
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"an error occured in {req.request_id}, removed")
-
+    def _do_cleanup_on_error(self, req: ModelRequest, e: Exception):
         req.finished = True
         if req.loop is not None:
             req.loop.call_soon_threadsafe(req.token_queue.put_nowait, e)
 
-        self.running.remove(req)
         self.cache.free(req)
         self.req_metrics_list.append(req.metrics)
+        self.sch_metrics.report_on_error()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"an error occured in {req.request_id}, removed")
+
+    def cleanup_running_on_error(self, e: Exception):
+        while self.running:
+            req = self.running.pop()
+            self._do_cleanup_on_error(req, e)
+
+        # maybe cuased by the front of waiting
+        req = self.waiting.popleft()
+        self._do_cleanup_on_error(req, e)
+
+    def cleanup_on_error(self, req: ModelRequest, e: Exception):
+        assert req in self.running
+        self.running.remove(req)
+
+        self._do_cleanup_on_error(req, e)
+
+    def cleanup_on_abort(self, request_id: str):
+        '''called from api.py maybe due to the connection lost, but the request may have finished now'''
+        req = None
+        for i in range(len(self.running)):
+            if self.running[i].request_id == request_id:
+                req = self.running.pop(i)
+
+        if req is None:
+            for i in range(len(self.waiting)):
+                if self.waiting[i].request_id == request_id:
+                    # delete at index from deque
+                    self.waiting.rotate(-i)
+                    req = self.waiting.popleft()
+                    self.waiting.rotate(i)
+
+        if req is None:
+            '''do not exist in both running and waiting, may have finished, so do nothing'''
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"the aborted request may have finished, do nothing.")
+            return
+
+        self.cache.free(req)
+        self.req_metrics_list.append(req.metrics)
+        self.sch_metrics.report_on_error()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"{request_id} aborted, removed")
 
     def _pick_waiting(self, victims: set[str]) -> ModelRequest | None:
         '''
@@ -296,6 +337,9 @@ class Scheduler:
               in which expected_output_len is evaluated by 50p of historical output lengths
         2) aging boost to avoid long prefills' starvation.
         '''
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"len, victims: {len(victims)}, waiting: {len(self.waiting)}")
+
         for r in self.waiting:
             if r.request_id not in victims and r.not_before_step <= self.sch_metrics.step:
                 return r
@@ -324,10 +368,13 @@ class Scheduler:
             (decoding if req.is_decoding else prefill).append(req)
         self.running: list[ModelRequest] = decoding + prefill
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
+
         # 1) running first — protect in-flight decodes' TPOT.
         scheduled_running: list[ModelRequest] = []
         for req in list(self.running):
-            assert not req.finished     # all finished requests has been removed in add_sampled_tokens
+            assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
 
             if req.request_id in victims:
                 if logger.isEnabledFor(logging.DEBUG):
@@ -425,12 +472,15 @@ class Scheduler:
         budget = self.max_num_batched_tokens
         scheduled: dict[str, ScheduledInfo] = {}
         victims: set[str] = set()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
         
         # 1) running first — protect in-flight decodes' TPOT.
         #    Note: Ps and Ds may interleave.
         scheduled_running: list[ModelRequest] = []
         for req in list(self.running):  # snapshot
-            assert not req.finished     # all finished requests has been removed in add_sampled_tokens
+            assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
 
             if req.request_id in victims:    # evicted
                 if logger.isEnabledFor(logging.DEBUG):

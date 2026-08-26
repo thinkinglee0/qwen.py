@@ -639,7 +639,7 @@ def test_flash_attn_varlen_paged_vs_flat_multi_request(target_model):
 
 
 # this checking method is only for static batching.
-# todo: do not update for continuous batching.
+# warning: do not update for continuous batching.
 def compare_cache_against_kv_after_rope(B: int, meta: AttentionMetadata, cfg: ModelConfig):
     # only for B=1
     if B != 1:
@@ -933,14 +933,4 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
         logger.info(f"logits, target vs ref = {(target_logits - ref_logits).abs().max().item()}")
         assert (target_logits - ref_logits).abs().max() < atol
 
-
-def test_recompute():
-    '''
-    todo
-    scenario: 
-    expect:
-    targeting bug: build_attn_metadata gets wrong input ids for preempt-then-recompute requests.
-    fix: use get_existing_ids compatible for recompute scenario.
-    '''
-    pass
 

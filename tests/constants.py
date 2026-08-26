@@ -18,6 +18,9 @@ LOG_DIR = "./log"
 REP_PEN_OFF = 1.
 TEMP_GREEDY = 0.
 
+TOK = 100
+TOK_EOS = 151643
+
 # prompt
 PROMPT_CLASSICAL = "The capital of France is"
 PROMPT_BATCH_1 = [PROMPT_CLASSICAL]

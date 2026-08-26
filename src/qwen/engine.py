@@ -78,7 +78,7 @@ def benchmark(engine: LLMEngine, batch_input_ids: list[list[int]],
     reqs: list[ModelRequest] = []
     for input_ids in batch_input_ids:
         loop = None
-        req = ModelRequest(engine.model.config, loop, input_ids, sampling, max_new_tokens)
+        req = ModelRequest(engine.model.config, loop, input_ids=input_ids, sampling=sampling, max_new_tokens=max_new_tokens)
         if engine.scheduler.add_request(req):       # very unlikely to reject in this test scenario
             reqs.append(req)
         else:
@@ -120,17 +120,22 @@ class ServingDriver:
         self.engine.teardown()
         del self.engine
 
-    def submit(self, input_ids, sampling, max_new_tokens: int)  -> asyncio.Queue[int | None | Exception] | None:
+    def submit(self, input_ids, request_id: str | None, sampling, max_new_tokens: int)  -> asyncio.Queue[int | None | Exception] | None:
         with self.cond:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"submit: input_ids: {input_ids}, sampling: {sampling}")
             loop = asyncio.get_running_loop()
-            req = ModelRequest(self.engine.model.config, loop, input_ids, sampling, max_new_tokens)
+            req = ModelRequest(self.engine.model.config, loop, input_ids=input_ids,
+                               request_id=request_id, sampling=sampling, max_new_tokens=max_new_tokens)
             if self.engine.scheduler.add_request(req):
                 self.cond.notify()
                 return req.token_queue
             else:
                 return None
+
+    def abort(self, request_id: str):
+        with self.cond:
+            self.engine.scheduler.cleanup_on_abort(request_id)
 
     def run_loop(self):
         while not self._shutdown:
@@ -154,23 +159,28 @@ class ServingDriver:
                 _generate(model=self.engine.model, cache_data=self.engine.scheduler.cache.data,
                           sch_out=scheduler_output, scheduler=self.engine.scheduler)
             except Exception as e:
-                logger.exception("Error occurred while generating")
+                logger.exception("Error occurred in schedule or _generate")
                 try:
                     if scheduler_output is not None:
                         for req in scheduler_output.reqs:
                             self.engine.scheduler.cleanup_on_error(req=req, e=e)
+                    else:
+                        # error occured in schedule, clean up the running queue
+                        self.engine.scheduler.cleanup_running_on_error(e=e)
+
                 except RuntimeError as e:
                     logger.exception(f"runtime error when clean up {req.request_id}")
 
 async def async_generate(
     driver: ServingDriver,
     input_ids: list[int],    # one variable-length id sequence
+    request_id: str | None = None,
     sampling: Sampling | None = None,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN,
 ) -> AsyncIterator[int]:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"async_generate: input_ids: {input_ids}, sampling: {sampling}")
-    queue = driver.submit(input_ids, sampling, max_new_tokens)
+    queue = driver.submit(input_ids, request_id, sampling, max_new_tokens)
 
     if queue is None:
         raise RuntimeError("Request rejected: too many waiting requests")

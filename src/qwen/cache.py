@@ -107,11 +107,6 @@ class KVCache:
         del self.data
         del self.pool
 
-    def new_blocks_needed(self, request, num_new_tokens: int):
-        total = cdiv(request.num_computed_tokens + num_new_tokens, self.block_size)
-        cur = len(self.block_tables.get(request.request_id, []))
-        return total-cur
-
     def verify_invariant(self):
         live = sum(1 for c in self.pool.ref_cnt if c > 0)
         assert len(self.pool.free) + live == self.pool.num_blocks
@@ -137,6 +132,11 @@ class KVCache:
             self.exhausted_report_cnt = 0
         self._last_report_exhausted_time = now
 
+    def new_blocks_needed(self, request, num_new_tokens: int):
+        total = cdiv(request.num_computed_tokens + num_new_tokens, self.block_size)
+        cur = len(self.block_tables.get(request.request_id, []))
+        return total-cur
+
     def allocate_slots(self, request, want: int, respect_watermark: bool = False) -> list[int] | None:
         assert want > 0
         need = self.new_blocks_needed(request, want)
@@ -144,6 +144,8 @@ class KVCache:
 
         reserve = self.watermark_blocks if respect_watermark else 0
         if need > self.pool.available() - reserve:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"cache pool exhausted, request: {request.request_id}, want: {want}")
             self.report_pool_exhausted()
             return None
 

@@ -3,17 +3,16 @@ import logging
 import copy
 import pytest
 import time
+import random
 
 from qwen.config import ModelConfig
 from qwen.scheduler import SchedulerOutput, ModelRequest, ScheduledInfo, Scheduler
 from qwen.sampling import Sampling, TensorSampling
 from qwen.cache import cdiv
 from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrices
+from constants import TOK, TOK_EOS
 
 logger = logging.getLogger(__name__)
-
-TOK = 100
-TOK_EOS = 151643
 
 def test_schedule(tmp_target_config: ModelConfig):
     '''mock a real workflow to verify the correctness of schedule1 and schedule2'''
@@ -31,7 +30,7 @@ def test_schedule(tmp_target_config: ModelConfig):
 
     # Case 1: add requests in decoding, chunked prefill, and fully new, and reject one due to max_waiting
     # req1: D, i_len=100, o_len=1, num_computed_tokens=100
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(100)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req1.request_id = "req1"
     req1.num_computed_tokens = 100      # want=1
@@ -41,21 +40,21 @@ def test_schedule(tmp_target_config: ModelConfig):
 
     # chunked prefill
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 200))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(200)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req2.request_id = "req2"
     req2.num_computed_tokens = 100      # want=100
     assert req2.is_decoding == False
 
     # req3: P, i_len=300, o_len=0, num_computed_tokens=0
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 300))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(300)]
     req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req3.request_id = "req3"
     req3.num_computed_tokens = 0        # want = tmp_target_config.max_num_batched_tokens - req1.want - req2.want
     assert req3.is_decoding == False
 
     # req4: P, i_len=200, o_len=0, num_computed_tokens=0
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 200))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(200)]
     req4 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req4.request_id = "req4"
     req4.num_computed_tokens = 0
@@ -265,7 +264,7 @@ def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     sch = Scheduler(tmp_target_config)
 
     # req1: D, i_len=100, o_len=1, num_computed_tokens=100
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(100)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
@@ -283,9 +282,27 @@ def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     assert req1.is_decoding == False    # default
     assert req1.num_computed_tokens == 0
     assert req1.metrics.first_schedule_time is not None     # do not reset first_schedule_time on preemption
+    assert req1.output_ids == [TOK]
+
+    '''
+    targeting bug: build_attn_metadata gets wrong input ids for preempt-then-recompute requests.
+    fix: use get_existing_ids compatible for recompute scenario.
+    '''
+    req1.num_computed_tokens = 0
+    mixed_prompt_len = len(req1.input_ids+req1.output_ids)
+    len1 = mixed_prompt_len // 2
+    assert req1.get_existing_ids(len1) == (req1.input_ids+req1.output_ids)[:len1]
+    len1 = mixed_prompt_len-1
+    assert req1.get_existing_ids(len1) == (req1.input_ids+req1.output_ids)[:len1]
+    len1 = mixed_prompt_len
+    assert req1.get_existing_ids(len1) == (req1.input_ids+req1.output_ids)[:len1]
+    with pytest.raises(AssertionError):
+        req1.get_existing_ids(mixed_prompt_len+1)
+    with pytest.raises(AssertionError):
+        req1.get_existing_ids(0)
 
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 200))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(200)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0
@@ -320,9 +337,74 @@ def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     assert req2.output_ids == [TOK] and req1.output_ids == [TOK, TOK]
 
 
+def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, survival_req: ModelRequest, preempted_req: ModelRequest, tmp_target_config):
+    '''
+    1. check running/waiting queue, metrics, and cache after preempted
+    2. sruvial req generated EOS token, then finished, check its states, running/waiting queue, metrics, and cache
+    3. submit a new request, put it to the tail of waiting; decrease num_max_seqs to 1 ensuring only one request in waiting can be scheduled.
+    4. the leftest request in waiting just preempted is re-scheduled.
+    Coverage: preempt, _pick_waiting, backoff
+    '''
+    # only survival_req succeeds
+    assert sch.running == [survival_req]
+    assert sch_out.reqs == [survival_req]
+
+    # # preempted_req fails, and is preempted, which means that its kv block table is freed, 
+    # # it is moved to waiting queue, and its intermediate states about forward are reset.
+    assert sch_out.scheduled.get(preempted_req.request_id) is None
+    assert preempted_req in list(sch.waiting)
+    assert not preempted_req.is_decoding
+    assert preempted_req.num_computed_tokens == 0
+    assert preempted_req.metrics.first_schedule_time is not None     # do not reset first_schedule_time on preemption
+    assert preempted_req.preempt_count == 1 and preempted_req.not_before_step == sch.sch_metrics.step + 1     # not be delayed the first time it's preempted
+    assert sch.cache.get_block_table(preempted_req) is None
+    assert sch.sch_metrics.num_preempted == 1
+    assert sch.sch_metrics.num_scheduled == 1
+    assert sch.sch_metrics.num_cache_exhausted == 1
+
+    with pytest.raises(AssertionError):
+        sch_out.add_sampled_tokens([TOK, TOK], tmp_target_config.eos_token_id_set)
+
+    # survival_req finished
+    num_truncated = sch_out.add_sampled_tokens([TOK_EOS], tmp_target_config.eos_token_id_set)
+    assert survival_req.is_decoding and survival_req.finished
+    assert survival_req in sch.running
+    sch.commit_step(sch_out=sch_out, num_truncated=num_truncated)
+    assert survival_req not in sch.running and survival_req not in list(sch.waiting) and sch.running == []
+    assert sch.sch_metrics.num_finished == 1
+    assert sch.cache.get_block_table(request=survival_req) is None      # kv cache released
+    assert len(sch.cache.pool.free) == sch.cache.pool.num_blocks    # empty pool
+
+    # req3: P, i_len=30, o_len=0, num_computed_tokens=0
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(30)]
+    req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
+    req3.request_id = "req3"
+    req3.num_computed_tokens = 0        # want = tmp_target_config.max_num_batched_tokens - req1.want - req2.want
+    assert req3.is_decoding == False
+
+    # submit req3 to waiting
+    sch.waiting.append(req3)
+    assert list(sch.waiting) == [preempted_req, req3]
+
+    # WARNING: decrease max_num_seqs to 1, then only one rquest can be scheduled.
+    sch.max_num_seqs = 1
+
+    # req2, preempted before, will be scheduled because it sits on the leftest front of waiting deque.
+    # test target: _pick_waiting
+    sch_out2 = sch.schedule()
+    assert sch_out2 is not None
+    assert sch_out2.batch_size == 1 and sch_out2.reqs == [preempted_req]
+    assert list(sch.waiting) == [req3]
+    assert sch.sch_metrics.num_rescheduled == 1
+
+
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
-    '''two requests are both in prefill phase, and the newer one would be preempted while KV pool is exhausted.'''
+    '''
+    1. two requests are both in prefill phase, and the newer one would be preempted while KV pool is exhausted.
+    2. decrease num_max_seqs to 1 ensuring only one request in waiting can be scheduled.
+    3. the leftest request in waiting just preempted is re-scheduled.
+    '''
     tmp_target_config.max_num_batched_tokens = 201
     tmp_target_config.num_blocks = 3
     tmp_target_config.block_size = 16
@@ -333,21 +415,23 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
 
     # req1: P, i_len=23, o_len=0, num_computed_tokens=16
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 23))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
     sch.cache.allocate_slots(req1, 16)      # construct its block table, and consume one block
     req1.num_computed_tokens = 16
+    req1.metrics.first_schedule_time = 1.
     assert req1.is_decoding == False
 
-    # req2: P, i_len=100, o_len=0, num_computed_tokens=16
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()
+    # req2: P, i_len=20, o_len=0, num_computed_tokens=16
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(20)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0
     sch.cache.allocate_slots(req2, 16)      # construct its block table, and consume one block
     req2.num_computed_tokens = 16
+    req2.metrics.first_schedule_time = 1.
     assert req2.is_decoding == False
 
     sch.running = [req1, req2]
@@ -359,28 +443,24 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     # so req2's request is rejected due to the insufficiency of free blocks.
     sch_out = sch.schedule()
     assert sch_out is not None
+    assert sch_out.batch_size == 1
 
     # only req1 succeeds
-    assert sch.running == [req1]
-    assert sch_out.reqs == [req1]
     assert sch_out.scheduled[req1.request_id].want == 7
     table1 = sch.cache.get_block_table(req1)
     assert table1 is not None and len(table1) == 2
     assert len(sch.cache.pool.free) == 1
 
-    # req2 fails, and is preempted
-    assert sch_out.scheduled.get(req2.request_id) is None
-    assert req2 in list(sch.waiting)
-    assert not req2.is_decoding
-    assert req2.num_computed_tokens == 0
-    assert sch.cache.get_block_table(req2) is None
-    assert sch.sch_metrics.num_preempted == 1
-    assert sch.sch_metrics.num_scheduled == 1
-    assert sch.sch_metrics.num_cache_exhausted == 1
+    _test_preemption_and_reschedule(sch=sch, sch_out=sch_out, survival_req=req1, preempted_req=req2, tmp_target_config=tmp_target_config)
+
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
-    '''two requests are in decoding phase, and the newer one would be preempted while KV pool is exhausted.'''
+    '''
+    1. two requests are in decoding phase, and the newer one would be preempted while KV pool is exhausted.
+    2. decrease num_max_seqs to 1 ensuring only one request in waiting can be scheduled.
+    3. the leftest request in waiting just preempted is re-scheduled.
+    '''
     tmp_target_config.num_blocks = 3
     tmp_target_config.block_size = 16
     tmp_target_config.use_d_first_schedule = use_d_first_schedule
@@ -390,7 +470,7 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
 
     # req1: D, i_len=23, o_len=1, num_computed_tokens=23
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 23))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
@@ -398,9 +478,10 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     req1.num_computed_tokens = 23
     req1.output_ids = [TOK]
     req1.is_decoding = True
+    req1.metrics.first_schedule_time = 1.
 
     # req2: D, i_len=16, o_len=1, num_computed_tokens=16
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 16))[0].tolist()
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(16)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0
@@ -408,6 +489,7 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     req2.num_computed_tokens = 16
     req2.output_ids = [TOK]
     req2.is_decoding = True
+    req2.metrics.first_schedule_time = 1.
 
     sch.running = [req1, req2]
 
@@ -420,25 +502,12 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     assert sch_out is not None
 
     # only req1 succeeds
-    assert sch.running == [req1]
-    assert sch_out.reqs == [req1]
     assert sch_out.scheduled[req1.request_id].want == 1
     table1 = sch.cache.get_block_table(req1)
     assert table1 is not None and len(table1) == 2
     assert len(sch.cache.pool.free) == 1    # freed by req2 due to preemption.
 
-    # req2 fails, and is preempted, which means that its kv block table is freed, 
-    # it is moved to waiting queue, and its intermediate states about forward are reset.
-    assert sch_out.scheduled.get(req2.request_id) is None
-    assert req2 in list(sch.waiting)
-    assert not req2.is_decoding
-    assert req2.num_computed_tokens == 0
-    assert sch.cache.get_block_table(req2) is None
-
-    # counters
-    assert sch.sch_metrics.num_preempted == 1
-    assert sch.sch_metrics.num_scheduled == 1
-    assert sch.sch_metrics.num_cache_exhausted == 1
+    _test_preemption_and_reschedule(sch=sch, sch_out=sch_out, survival_req=req1, preempted_req=req2, tmp_target_config=tmp_target_config)
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 @pytest.mark.parametrize("p_before_d", [True, False])
@@ -455,26 +524,28 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     assert sch.cache.pool.num_blocks == tmp_target_config.num_blocks
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
 
-    # req1: P, i_len=23, o_len=0, num_computed_tokens=16
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 23))[0].tolist()
+    # req1: D, i_len=16, o_len=1, num_computed_tokens=16
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(16)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
-    req1.request_id = "req1"
+    req1.request_id = "req2"
     req1.num_computed_tokens = 0
     sch.cache.allocate_slots(req1, 16)      # construct its block table, 1 block
     req1.num_computed_tokens = 16
-    assert req1.is_decoding == False
+    req1.output_ids = [TOK]
+    req1.is_decoding = True
+    req1.metrics.first_schedule_time = 1.
 
-    # req2: D, i_len=16, o_len=1, num_computed_tokens=16
-    input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 16))[0].tolist()
+    # req2: P, i_len=23, o_len=0, num_computed_tokens=16
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
-    req2.request_id = "req2"
+    req2.request_id = "req1"
     req2.num_computed_tokens = 0
     sch.cache.allocate_slots(req2, 16)      # construct its block table, 1 block
     req2.num_computed_tokens = 16
-    req2.output_ids = [TOK]
-    req2.is_decoding = True
+    assert req2.is_decoding == False
+    req2.metrics.first_schedule_time = 1.
 
-    sch.running = [req1, req2] if p_before_d else [req2, req1]
+    sch.running = [req2, req1] if p_before_d else [req1, req2]
 
     # now there is no free blocks in kv cache pool
     assert len(sch.cache.pool.free) == 0
@@ -483,45 +554,74 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     sch_out = sch.schedule()
     assert sch_out is not None
 
-    # only req2 succeeds
-    assert sch.running == [req2]
-    assert sch_out.reqs == [req2]
-    assert sch_out.scheduled[req2.request_id].want == 1
-    table2 = sch.cache.get_block_table(req2)
+    # only req1 succeeds
+    assert sch_out.scheduled[req1.request_id].want == 1
+    table2 = sch.cache.get_block_table(req1)
     assert table2 is not None and len(table2) == 2
     assert len(sch.cache.pool.free) == 0
 
-    # req1 fails, and is preempted, which means that its kv block table is freed, 
-    # it is moved to waiting queue, and its intermediate states about forward are reset.
-    assert sch_out.scheduled.get(req1.request_id) is None
-    assert req1 in list(sch.waiting)
-    assert not req1.is_decoding
-    assert req1.num_computed_tokens == 0
-    assert sch.cache.get_block_table(req1) is None
-
-    # counters
-    assert sch.sch_metrics.num_scheduled == 1
-    assert sch.sch_metrics.num_preempted == 1
-    assert sch.sch_metrics.num_cache_exhausted == 1
-
-@pytest.mark.parametrize("use_d_first_schedule", [True, False])
-def test_pick_waiting(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
-    '''
-    todo
-    scenario: multiple requests in waiting, including some new requests, a preempted victim in the front.
-    expect: the preempted request not admitted in the following step.
-    targeting bug: waiting.popleft will remove the leftest request when _pick_waiting picks non-leftest requests.
-    '''
-    pass
+    _test_preemption_and_reschedule(sch=sch, sch_out=sch_out, survival_req=req1, preempted_req=req2, tmp_target_config=tmp_target_config)
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_backoff(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     '''
-    todo
     scenario: multiple requests in waiting, including some new requests, a preempted one with backoff in the front.
     expect: the preempted request not admitted in the following step.
     '''
-    pass
+    tmp_target_config.max_num_batched_tokens = 201
+    tmp_target_config.num_blocks = 3
+    tmp_target_config.block_size = 16
+    tmp_target_config.use_d_first_schedule = use_d_first_schedule
+
+    sch = Scheduler(tmp_target_config)
+    assert sch.cache.pool.num_blocks == tmp_target_config.num_blocks
+    assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
+
+    # req1: P, i_len=23, o_len=0, num_computed_tokens=16
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
+    req1.request_id = "req1"
+    req1.num_computed_tokens = 0
+    sch.cache.allocate_slots(req1, 16)      # construct its block table, and consume one block
+    req1.num_computed_tokens = 16
+    req1.metrics.first_schedule_time = 1.
+    assert req1.is_decoding == False
+
+    # frist time to preempt manually
+    sch.running = [req1]
+    victims: set[str] = set()
+    sch._preempt(req1, victims=victims)
+    assert sch.sch_metrics.num_preempted == 1
+    assert req1.request_id in victims
+    assert req1.not_before_step == sch.sch_metrics.step+1
+    assert req1 not in sch.running and req1 in list(sch.waiting)
+
+    # second time to preempt manually
+    sch.waiting.popleft()
+    sch.running = [req1]
+    sch._preempt(req1, victims=victims)
+    assert sch.sch_metrics.num_preempted == 2
+    assert req1.request_id in victims
+    assert req1.not_before_step == sch.sch_metrics.step+2
+    assert req1 not in sch.running and req1 in list(sch.waiting)
+
+    # req3: P, i_len=30, o_len=0, num_computed_tokens=0
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(30)]
+    req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
+    req3.request_id = "req3"
+    req3.num_computed_tokens = 0        # want = tmp_target_config.max_num_batched_tokens - req1.want - req2.want
+    assert req3.is_decoding == False
+
+    # submit req3 to waiting
+    sch.waiting.append(req3)
+    assert list(sch.waiting) == [req1, req3]
+
+    # req1 not scheduled due to backoff
+    sch_out = sch.schedule()
+    assert sch_out is not None
+    assert sch_out.reqs == [req3]
+    assert req1 in list(sch.waiting)
+
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_aging_boost(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
@@ -532,5 +632,41 @@ def test_aging_boost(tmp_target_config: ModelConfig, use_d_first_schedule: bool)
     '''
     pass
 
+def test_abort_and_error(tmp_target_config: ModelConfig):
+    '''expect: error or aborted request removed from the running and waiting immediately'''
+    tmp_target_config.num_blocks = 2
+    tmp_target_config.block_size = 16
+
+    sch = Scheduler(tmp_target_config)
+
+    # req1: P, i_len=23, o_len=0, num_computed_tokens=16
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
+    req1.request_id = "req1"
+    req1.num_computed_tokens = 0
+    sch.cache.allocate_slots(req1, 16)      # construct its block table, 1 block
+    req1.num_computed_tokens = 16
+    assert req1.is_decoding == False
+
+    # req2: D, i_len=16, o_len=1, num_computed_tokens=16
+    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(16)]
+    req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
+    req2.request_id = "req2"
+    req2.num_computed_tokens = 0
+    sch.cache.allocate_slots(req2, 16)      # construct its block table, 1 block
+    req2.num_computed_tokens = 16
+    req2.output_ids = [TOK]
+    req2.is_decoding = True
+
+    sch.running = [req2, req1]
+
+    sch.cleanup_on_abort(req1.request_id)
+    assert req1 not in sch.running and req1 not in list(sch.waiting)
+    assert req2 in sch.running
+    assert sch.sch_metrics.num_error == 1
+
+    sch.cleanup_on_error(req2, e=Exception())
+    assert req2 not in sch.running and req2 not in list(sch.waiting)
+    assert sch.sch_metrics.num_error == 2
 
 
