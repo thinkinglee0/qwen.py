@@ -12,7 +12,7 @@ import uuid
 from qwen.model import QwenForCausalLM
 from qwen.config import ModelConfig
 from qwen.engine import async_generate, ServingDriver, LLMEngine
-from qwen.constants import MODEL_DIR
+from qwen.constants import MODEL_DIR, DEFAULT_MAX_NEW_TOKEN
 from qwen.sampling import Sampling
 from qwen.scheduler import Scheduler
 
@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
 
 class GenRequest(BaseModel):
     prompt: str
-    max_new_tokens: int = 100
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN
     sampling: Sampling = Sampling()
 
 app = FastAPI(lifespan=lifespan)

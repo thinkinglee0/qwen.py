@@ -66,16 +66,16 @@ def test_causal_mask():
 def test_build_attn_metadata(tmp_target_config):
     sampling = Sampling(temperature=1.0, top_k=3)
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()    # rectangular tensor
-    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling, max_new_tokens=1000)
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req1.num_computed_tokens = 10
     assert req1.is_decoding == False
 
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 200))[0].tolist()    # rectangular tensor
-    req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling, max_new_tokens=1000)
+    req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req2.num_computed_tokens = 20
 
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 300))[0].tolist()    # rectangular tensor
-    req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling, max_new_tokens=1000)
+    req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req3.num_computed_tokens = 30
 
     # uuid

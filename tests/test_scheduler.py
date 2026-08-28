@@ -30,7 +30,7 @@ def test_schedule(tmp_target_config: ModelConfig):
 
     # Case 1: add requests in decoding, chunked prefill, and fully new, and reject one due to max_waiting
     # req1: D, i_len=100, o_len=1, num_computed_tokens=100
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(100)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(100)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req1.request_id = "req1"
     req1.num_computed_tokens = 100      # want=1
@@ -40,21 +40,21 @@ def test_schedule(tmp_target_config: ModelConfig):
 
     # chunked prefill
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(200)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(200)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req2.request_id = "req2"
     req2.num_computed_tokens = 100      # want=100
     assert req2.is_decoding == False
 
     # req3: P, i_len=300, o_len=0, num_computed_tokens=0
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(300)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(300)]
     req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req3.request_id = "req3"
     req3.num_computed_tokens = 0        # want = tmp_target_config.max_num_batched_tokens - req1.want - req2.want
     assert req3.is_decoding == False
 
     # req4: P, i_len=200, o_len=0, num_computed_tokens=0
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(200)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(200)]
     req4 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req4.request_id = "req4"
     req4.num_computed_tokens = 0
@@ -264,7 +264,7 @@ def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     sch = Scheduler(tmp_target_config)
 
     # req1: D, i_len=100, o_len=1, num_computed_tokens=100
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(100)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(100)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
@@ -302,7 +302,7 @@ def test_recompute(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
         req1.get_existing_ids(0)
 
     # req2: P, i_len=200, o_len=0, num_computed_tokens=100
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(200)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(200)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0
@@ -376,7 +376,7 @@ def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, su
     assert len(sch.cache.pool.free) == sch.cache.pool.num_blocks    # empty pool
 
     # req3: P, i_len=30, o_len=0, num_computed_tokens=0
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(30)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(30)]
     req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req3.request_id = "req3"
     req3.num_computed_tokens = 0        # want = tmp_target_config.max_num_batched_tokens - req1.want - req2.want
@@ -415,7 +415,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
 
     # req1: P, i_len=23, o_len=0, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(23)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
@@ -425,7 +425,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     assert req1.is_decoding == False
 
     # req2: P, i_len=20, o_len=0, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(20)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(20)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0
@@ -470,7 +470,7 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
 
     # req1: D, i_len=23, o_len=1, num_computed_tokens=23
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(23)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
@@ -481,7 +481,7 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     req1.metrics.first_schedule_time = 1.
 
     # req2: D, i_len=16, o_len=1, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(16)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(16)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0
@@ -525,7 +525,7 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
 
     # req1: D, i_len=16, o_len=1, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(16)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(16)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req2"
     req1.num_computed_tokens = 0
@@ -536,7 +536,7 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     req1.metrics.first_schedule_time = 1.
 
     # req2: P, i_len=23, o_len=0, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(23)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req1"
     req2.num_computed_tokens = 0
@@ -578,7 +578,7 @@ def test_backoff(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
 
     # req1: P, i_len=23, o_len=0, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(23)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
@@ -606,7 +606,7 @@ def test_backoff(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     assert req1 not in sch.running and req1 in list(sch.waiting)
 
     # req3: P, i_len=30, o_len=0, num_computed_tokens=0
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(30)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(30)]
     req3 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req3.request_id = "req3"
     req3.num_computed_tokens = 0        # want = tmp_target_config.max_num_batched_tokens - req1.want - req2.want
@@ -640,7 +640,7 @@ def test_abort_and_error(tmp_target_config: ModelConfig):
     sch = Scheduler(tmp_target_config)
 
     # req1: P, i_len=23, o_len=0, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(23)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(23)]
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req1.request_id = "req1"
     req1.num_computed_tokens = 0
@@ -649,7 +649,7 @@ def test_abort_and_error(tmp_target_config: ModelConfig):
     assert req1.is_decoding == False
 
     # req2: D, i_len=16, o_len=1, num_computed_tokens=16
-    input_ids = [random.randint(0, tmp_target_config.vocab_size) for _ in range(16)]
+    input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(16)]
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids)
     req2.request_id = "req2"
     req2.num_computed_tokens = 0

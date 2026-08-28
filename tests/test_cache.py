@@ -35,7 +35,7 @@ def test_cache(tmp_target_config: ModelConfig, seed=0):
     tmp_target_config.cache_verification_interval = 0.  # always trigger cache invariant verification
 
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()    # rectangular tensor
-    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None, max_new_tokens=1000)
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None)
     req1.request_id = "req1"
 
     cache = KVCache(tmp_target_config)
@@ -109,7 +109,7 @@ def test_pool_exhausted(tmp_target_config: ModelConfig):
     tmp_target_config.cache_verification_interval = 0.  # always trigger cache invariant verification
 
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()    # rectangular tensor
-    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None, max_new_tokens=1000)
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None)
     req1.request_id = "req1"
 
     cache = KVCache(tmp_target_config)
@@ -124,7 +124,7 @@ def test_free(tmp_target_config: ModelConfig, seed=0):
     tmp_target_config.cache_verification_interval = 0.  # always trigger cache invariant verification
 
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()    # rectangular tensor
-    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None, max_new_tokens=1000)
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None)
     req1.request_id = "req1"
 
     cache = KVCache(tmp_target_config)
@@ -154,7 +154,7 @@ def test_watermark(tmp_target_config: ModelConfig):
     tmp_target_config.cache_verification_interval = 0.  # always trigger cache invariant verification
 
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 2000))[0].tolist()    # rectangular tensor
-    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None, max_new_tokens=1000)
+    req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=None)
     req1.request_id = "req1"
 
     cache = KVCache(tmp_target_config)

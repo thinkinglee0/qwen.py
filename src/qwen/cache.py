@@ -75,7 +75,7 @@ class KVCacheData:
             self.k_caches.append(kv_of_layer[0])
             self.v_caches.append(kv_of_layer[1])
 
-        logger.info(f"creating kv cache done")
+        logger.info(f"creating kv cache finished")
         
     def teardown(self):
         self.k_caches.clear()

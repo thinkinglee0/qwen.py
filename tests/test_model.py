@@ -51,7 +51,7 @@ def build_scheduler_output_on_prefill(model, cache, input_ids_lst) -> SchedulerO
     scheduled: dict[str, ScheduledInfo] = {}
     block_tables: list[list[int]] = []
     for input_ids in input_ids_lst:
-        req = ModelRequest(model.config, loop=None, input_ids=input_ids, sampling=None, max_new_tokens=1000)
+        req = ModelRequest(model.config, loop=None, input_ids=input_ids, sampling=None)
         reqs.append(req)
         want = len(input_ids)
         slots = cache.allocate_slots(req, want)

@@ -2,7 +2,7 @@
 
 # constant variables
 NINF = float("-inf")
-MAX_NEW_TOKEN_NUM = 40
+MAX_NEW_TOKENS_FOR_TEST = 40
 MAX_MODEL_LEN = 512
 
 # benchmark

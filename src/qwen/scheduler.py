@@ -14,12 +14,13 @@ from qwen.sampling import TensorSampling, Sampling
 from qwen.config import ModelConfig
 from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrices, SchedulerStepMetrices
 from qwen.cache import KVCache, cdiv
+from qwen.constants import DEFAULT_MAX_NEW_TOKEN
 
 logger = logging.getLogger(__name__)
 
 
 class ModelRequest:
-    def __init__(self, config: ModelConfig, loop, input_ids: list[int], request_id: str | None=None, sampling: Sampling | None = None, max_new_tokens: int=1024):
+    def __init__(self, config: ModelConfig, loop, input_ids: list[int], request_id: str | None=None, sampling: Sampling | None = None, max_new_tokens: int=DEFAULT_MAX_NEW_TOKEN):
         self.request_id = request_id if request_id is not None else str(uuid.uuid4())
         self.input_ids = input_ids
         self.sampling = sampling
@@ -617,5 +618,5 @@ class Scheduler:
         with open(stats_path, "a+b") as f:
             f.write(json_bytes)
             f.write(b"\n")
-            f.flush()
+            # f.flush()
 

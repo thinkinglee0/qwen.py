@@ -23,7 +23,12 @@ logger = logging.getLogger(__name__)
 MODULE_ORDER = ["test_rope", "test_sampling", "test_cache", "test_attention", "test_model", "test_scheduler", "test_engine", "test_api"]
 
 def pytest_collection_modifyitems(session, config, items):
-    excluded_fun_names = ["test_benchmark_on_pc", "test_benchmark_sharegpt", "test_benchmark_sharegpt_sweep_batch_size", "test_parse_metrics"]
+    excluded_fun_names = ["test_benchmark_on_pc", "test_benchmark_sharegpt",
+                          "test_benchmark_sweep_batch_size",
+                          "test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold",
+                          "test_parse_metrics_sweep_batch_size",
+                          "test_profile_decode_idle_fraction",
+                          ]
     excluded_module_names = ["test_playground"]
 
     explicitly_called = any(fun_name in arg for fun_name in excluded_fun_names for arg in config.args)
