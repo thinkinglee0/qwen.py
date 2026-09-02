@@ -40,3 +40,4 @@ modelscope
 
 orjson
 pytest-forked
+py-spy

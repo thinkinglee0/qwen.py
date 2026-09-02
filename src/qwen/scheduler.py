@@ -154,7 +154,6 @@ class SchedulerOutput:
             run=len(scheduler.running),
             wait=len(scheduler.waiting),
             blk_used=scheduler.cache.pool.used(),
-            blk_total=scheduler.cache.pool.num_blocks,
         ) if scheduler is not None else None
 
     # return the number of truncated reqs which are finished just now
@@ -255,7 +254,7 @@ class Scheduler:
         victim.not_before_step = self.sch_metrics.step + delay
         self.waiting.appendleft(victim)
 
-    def commit_step(self, sch_out: SchedulerOutput, num_truncated:int):
+    def commit_step(self, sch_out: SchedulerOutput, num_truncated:int, start_time: float | None = None):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"call commit_step, ")
         for req in sch_out.reqs:
@@ -263,6 +262,11 @@ class Scheduler:
                 self.cleanup_on_finished(req=req)
 
         self.sch_metrics.report_on_truncated(num_truncated)
+
+        if start_time is not None:
+            finish_time = time.perf_counter()
+            assert sch_out.step_metrics
+            sch_out.step_metrics.ci_ms = (finish_time - start_time) * 1000
         self.log_metrics(sch_out=sch_out)
 
     def cleanup_on_finished(self, req: ModelRequest):
@@ -359,6 +363,8 @@ class Scheduler:
 
     # D-first scheduling with no-cross preemption
     def D_first_preemptive_schedule(self) -> SchedulerOutput | None:            # called by run_loop when idle
+        step_metrics = SchedulerStepMetrices()
+        start_time = time.perf_counter()
         budget = self.max_num_batched_tokens
         scheduled: dict[str, ScheduledInfo] = {}
         victims: set[str] = set()
@@ -371,6 +377,9 @@ class Scheduler:
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
+        finish_time = time.perf_counter()
+        step_metrics.sched_pre_ms = (finish_time-start_time)*1000
+        start_time = finish_time
 
         # 1) running first — protect in-flight decodes' TPOT.
         scheduled_running: list[ModelRequest] = []
@@ -411,6 +420,10 @@ class Scheduler:
             s_info = ScheduledInfo(want=want, slots=new_slots)
             scheduled[req.request_id] = s_info
             budget -= want
+
+        finish_time = time.perf_counter()
+        step_metrics.sched_run_ms = (finish_time-start_time)*1000
+        start_time = finish_time
     
         # 2) waiting next — fill remaining budget with (chunked) prefills
         while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
@@ -437,6 +450,10 @@ class Scheduler:
             scheduled[req.request_id] = s_info
             budget -= want
 
+        finish_time = time.perf_counter()
+        step_metrics.sched_wait_ms = (finish_time-start_time)*1000
+        start_time = finish_time
+
         block_tables = []
         for req in scheduled_running:
             bt = self.cache.get_block_table(req)
@@ -450,9 +467,18 @@ class Scheduler:
             return None     # no work to do
 
         self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
-        return SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
+        s_out = SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
                                config=self.config, scheduler=self)
+        finish_time = time.perf_counter()
+        step_metrics.sched_ret_ms = (finish_time-start_time)*1000
 
+        assert s_out.step_metrics is not None
+        s_out.step_metrics.sched_pre_ms = step_metrics.sched_pre_ms
+        s_out.step_metrics.sched_run_ms = step_metrics.sched_run_ms
+        s_out.step_metrics.sched_wait_ms = step_metrics.sched_wait_ms
+        s_out.step_metrics.sched_ret_ms = step_metrics.sched_ret_ms
+        return s_out
+    
     def _pick_victim(self, cur_req):
         # pick strategies
         # 1) if cur_req is D, any P can be preempted. pick the newest D when there is no P.
@@ -470,12 +496,17 @@ class Scheduler:
 
     # Preemptive scheduling with victim eviction
     def preemptive_schedule(self) -> SchedulerOutput | None:            # called by run_loop when idle
+        step_metrics = SchedulerStepMetrices()
+        start_time = time.perf_counter()
         budget = self.max_num_batched_tokens
         scheduled: dict[str, ScheduledInfo] = {}
         victims: set[str] = set()
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
+        finish_time = time.perf_counter()
+        step_metrics.sched_pre_ms = (finish_time-start_time)*1000
+        start_time = finish_time
         
         # 1) running first — protect in-flight decodes' TPOT.
         #    Note: Ps and Ds may interleave.
@@ -530,6 +561,10 @@ class Scheduler:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"add {req.request_id} to scheduled_running")
             budget -= want
+
+        finish_time = time.perf_counter()
+        step_metrics.sched_run_ms = (finish_time-start_time)*1000
+        start_time = finish_time
     
         # 2) waiting next — fill remaining budget with (chunked) prefills
         while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
@@ -554,6 +589,10 @@ class Scheduler:
                 logger.debug(f"add {req.request_id} to scheduled_running")
             budget -= want
 
+        finish_time = time.perf_counter()
+        step_metrics.sched_wait_ms = (finish_time-start_time)*1000
+        start_time = finish_time
+
         if not scheduled_running:
             return None     # no work to do
 
@@ -564,8 +603,17 @@ class Scheduler:
             block_tables.append(bt)
 
         self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
-        return SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
+        s_out = SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
                                config=self.config, scheduler=self)
+        finish_time = time.perf_counter()
+        step_metrics.sched_ret_ms = (finish_time-start_time)*1000
+
+        assert s_out.step_metrics is not None
+        s_out.step_metrics.sched_pre_ms = step_metrics.sched_pre_ms
+        s_out.step_metrics.sched_run_ms = step_metrics.sched_run_ms
+        s_out.step_metrics.sched_wait_ms = step_metrics.sched_wait_ms
+        s_out.step_metrics.sched_ret_ms = step_metrics.sched_ret_ms
+        return s_out
 
     def log_metrics(self, sch_out: SchedulerOutput, is_exiting: bool=False):
         self.log_step_metrics(sch_out=sch_out)

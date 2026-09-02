@@ -6,12 +6,12 @@ import asyncio
 from typing import AsyncIterator
 
 from qwen.model import QwenForCausalLM
-from qwen.cache import KVCache, KVCacheData
 from qwen.attention import build_attn_metadata
 from qwen.sampling import Sampling
 from qwen.scheduler import Scheduler, SchedulerOutput, ModelRequest
 from qwen.constants import DEFAULT_MAX_NEW_TOKEN
 from qwen.config import ModelConfig
+from qwen.metrics import StepEvents
 
 logger = logging.getLogger(__name__)
 
@@ -28,34 +28,73 @@ class LLMEngine:
         self.scheduler = Scheduler(config=self.model.config)
 
     def step(self) -> bool:
-        scheduler_output = self.scheduler.schedule()
-        if scheduler_output is None:
+        start_time = time.perf_counter()
+        sch_out = self.scheduler.schedule()
+        if sch_out is None:
             logger.info("Scheduler: no work, next loop iteration")
             return False
-        self.forward(sch_out=scheduler_output)
+        finish_time = time.perf_counter()
+        assert sch_out.step_metrics is not None
+        sch_out.step_metrics.sched_ms = (finish_time-start_time)*1000
+
+        self.forward(sch_out=sch_out)
         return True
 
 
     @torch.inference_mode()
     def forward(self, sch_out: SchedulerOutput):
+        assert sch_out.step_metrics is not None
+
+        ev = StepEvents()
+
+        start_time = time.perf_counter()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"batch size: {len(sch_out.reqs)}")
 
         packed_input_ids, md = build_attn_metadata(
-            sch_out, self.scheduler.cache.data, self.model.config.device)  # is_prefill=True
-        start_time = time.perf_counter()
-        hidden = self.model.forward(packed_input_ids, md)       # [total_tokens, H]
-        assert sch_out.step_metrics is not None
-        sch_out.step_metrics.elapsed_ms = (time.perf_counter() - start_time) * 1000
+            sch_out, self.scheduler.cache.data, device=self.model.config.device)
+        finish_time = time.perf_counter()
+        sch_out.step_metrics.bld_meta_ms = (finish_time - start_time) * 1000
 
+        start_time = finish_time
+        ev.start("fwd")
+        # torch.cuda.set_sync_debug_mode("error")
+        hidden = self.model.forward(packed_input_ids, md)       # [total_tokens, H]
+        # torch.cuda.set_sync_debug_mode("default")
+        ev.stop("fwd")
+        finish_time = time.perf_counter()
+        assert sch_out.step_metrics is not None
+        sch_out.step_metrics.fwd_ms = (finish_time - start_time) * 1000
+
+        start_time = finish_time
+        ev.start("logits")
         # gather each seq's LAST token -> logits -> first generated token
         last_idx = md.cu_seqlens_q[1:] - 1          # [B]
         logits = self.model.compute_logits(hidden[last_idx])   # [B, vocab]
+        ev.stop("logits")
+        finish_time = time.perf_counter()
+        sch_out.step_metrics.logits_ms = (finish_time - start_time) * 1000
+
+        start_time = finish_time
+        ev.start("sample")
         next_tokens = self.model.sampler(logits, sch_out)          # [B]
+        ev.stop("sample")
+        finish_time = time.perf_counter()
+        sch_out.step_metrics.sample_ms = (finish_time - start_time) * 1000
 
-        num_truncated = sch_out.add_sampled_tokens(next_tokens.tolist(), self.model.config.eos_token_id_set)
+        start_time = finish_time
+        next_tokens_cpu = next_tokens.tolist()
+        finish_time = time.perf_counter()
+        sch_out.step_metrics.dth_ms = (finish_time - start_time) * 1000
+        sch_out.step_metrics.n_sample = len(next_tokens_cpu)
 
-        self.scheduler.commit_step(sch_out=sch_out, num_truncated=num_truncated)
+        for k, v in ev.read().items():
+            setattr(sch_out.step_metrics, k, v)
+
+        start_time = finish_time
+        num_truncated = sch_out.add_sampled_tokens(next_tokens_cpu, self.model.config.eos_token_id_set)
+
+        self.scheduler.commit_step(sch_out=sch_out, num_truncated=num_truncated, start_time=start_time)
 
 
     def run_to_completion(self):

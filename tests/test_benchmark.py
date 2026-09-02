@@ -17,7 +17,7 @@ from qwen.metrics import analyze_metrics
 from qwen.utils import sample_sharegpt
 from qwen.config import ModelConfig
 from qwen.constants import DEFAULT_MAX_NEW_TOKEN
-from utils import _get_evn_list_value
+from utils import parse_env_list_value
 
 logger = logging.getLogger(__name__)
 
@@ -69,19 +69,19 @@ def _test_benchmark(engine: LLMEngine, input_ids:list[list[int]], tok, max_new_t
 def test_benchmark_on_pc(target_engine_for_pc_benchmarking, batch_for_regular_benchmarking, tokenizer):
     _test_benchmark(target_engine_for_pc_benchmarking, batch_for_regular_benchmarking, tok=tokenizer)
 
-# pytest -x --log-file-level=DEBUG tests/test_engine.py::test_benchmark_sharegpt --max_model_len=512 --req_num=512 --max_num_seqs=16
+# pytest -x --log-file-level=DEBUG tests/test_benchmark.py::test_benchmark_sharegpt --max_model_len=512 --req_num=512 --max_num_seqs=16
 # excluded from execution from file, only allowed from specified execution.
 def test_benchmark_sharegpt(target_engine_for_sharegpt_benchmarking, sharegpt_batch, tokenizer):
     _test_benchmark(target_engine_for_sharegpt_benchmarking, sharegpt_batch, tok=tokenizer)
 
 _DEFAULT_BATCH_SIZES = [
     512,      # warm up
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 _DEFAULT_BLOCKS = [1024*6]  # 18G
 # excluded from execution from file, only allowed from specified execution.
-# SWEEP_BATCH_SIZES=64,128 pytest -x tests/test_engine.py::test_benchmark_sweep_batch_size
-@pytest.mark.parametrize("batch_size", _get_evn_list_value(env_name="SWEEP_BATCH_SIZES", default_value=_DEFAULT_BATCH_SIZES))
-@pytest.mark.parametrize("num_blocks", _get_evn_list_value(env_name="SWEEP_BLOCKS", default_value=_DEFAULT_BLOCKS))
+# SWEEP_BATCH_SIZES=64,128 pytest -x tests/test_benchmark.py::test_benchmark_sweep_batch_size
+@pytest.mark.parametrize("batch_size", parse_env_list_value(env_name="SWEEP_BATCH_SIZES", default_value=_DEFAULT_BATCH_SIZES))
+@pytest.mark.parametrize("num_blocks", parse_env_list_value(env_name="SWEEP_BLOCKS", default_value=_DEFAULT_BLOCKS))
 def test_benchmark_sweep_batch_size(tmp_target_config_for_sharegpt_benchmarking: ModelConfig, tokenizer, batch_size:int, num_blocks:int, log_dir):
     '''
     1. fixed input len 512, fixed output len 128
@@ -118,14 +118,14 @@ def test_benchmark_sweep_batch_size(tmp_target_config_for_sharegpt_benchmarking:
 
 
 # excluded from execution from file, only allowed from specified execution.
-# SWEEP_BATCHED_TOKENS=64,128 pytest -x tests/test_engine.py::test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold
+# SWEEP_BATCHED_TOKENS=64,128 pytest -x tests/test_benchmark.py::test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold
 _DEFAULT_BATCHED_TOKENS = [1024, 2048, 4096, 8192]
 _DEFAULT_PREFILL_SEQS = [1, 2, 4, 8]
 @pytest.mark.parametrize("batch_size", [320])
 @pytest.mark.parametrize("max_num_batched_tokens",
-                         _get_evn_list_value(env_name="SWEEP_BATCHED_TOKENS", default_value=_DEFAULT_BATCHED_TOKENS))
+                         parse_env_list_value(env_name="SWEEP_BATCHED_TOKENS", default_value=_DEFAULT_BATCHED_TOKENS))
 @pytest.mark.parametrize("num_prefill_seqs", 
-                         _get_evn_list_value(env_name="SWEEP_PREFILL_SEQS", default_value=_DEFAULT_PREFILL_SEQS))
+                         parse_env_list_value(env_name="SWEEP_PREFILL_SEQS", default_value=_DEFAULT_PREFILL_SEQS))
 def test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold(tmp_target_config_for_sharegpt_benchmarking, tokenizer, batch_size:int, log_dir,
                           max_num_batched_tokens:int, 
                           num_prefill_seqs:int,):
@@ -158,19 +158,19 @@ def test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold(tmp_tar
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-# pytest tests/test_engine.py::test_parse_metrics_sweep_batch_size --log_dir=log_vast/log3
+# pytest tests/test_benchmark.py::test_parse_metrics_sweep_batch_size --log_dir=log_vast/log3
 def test_parse_metrics_sweep_batch_size(log_dir: str):
     dir_path = Path(log_dir)
     assert dir_path.exists()
 
-    # benchmark_files = [file for file in dir_path.glob("benchmark_metrics.*") if file.is_file()]
-    benchmark_files = [
-        dir_path / "benchmark_metrics.cuda.256.2560.8192.8192.6144.20260827_094209.json",
-        dir_path / "benchmark_metrics.cuda.320.3200.8192.8192.6144.20260827_094348.json",
-        dir_path / "benchmark_metrics.cuda.384.3840.8192.8192.6144.20260827_094531.json",
-        dir_path / "benchmark_metrics.cuda.448.4480.8192.8192.6144.20260827_094728.json",
-        dir_path / "benchmark_metrics.cuda.512.5120.8192.8192.6144.20260827_094938.json",
-    ]
+    benchmark_files = [file for file in dir_path.glob("benchmark_metrics.*") if file.is_file()]
+    # benchmark_files = [
+    #     dir_path / "benchmark_metrics.cuda.256.2560.8192.8192.6144.20260901_063347.json",
+    #     dir_path / "benchmark_metrics.cuda.320.3200.8192.8192.6144.20260901_063512.json",
+    #     dir_path / "benchmark_metrics.cuda.384.3840.8192.8192.6144.20260901_063651.json",
+    #     dir_path / "benchmark_metrics.cuda.448.4480.8192.8192.6144.20260901_063841.json",
+    #     dir_path / "benchmark_metrics.cuda.512.5120.8192.8192.6144.20260901_064045.json",
+    # ]
     '''
     fileds of a file name
     1   device type
@@ -221,3 +221,8 @@ def test_parse_metrics_sweep_batch_size(log_dir: str):
     logger.info(f"itl_ratio: {itl_ratio}")
     logger.info(f"throughput: {throughput}")
     logger.info(f"throughput_ratio: {throughput_ratio}")
+
+    for idx, (gain, cost) in enumerate(zip(throughput_ratio, tpot_ratio)):
+        if cost > gain:
+            logger.info(f"last profitable doubling ends at batch: {sorted_batchs[idx]} -> {sorted_batchs[idx+1]} (gain/cost > 1)")
+            break

@@ -20,7 +20,7 @@ from qwen.attention import HAS_FLASH_ATTN
 logger = logging.getLogger(__name__)
 
 # Enforce custom module execution order, independent of filename sorting.
-MODULE_ORDER = ["test_rope", "test_sampling", "test_cache", "test_attention", "test_model", "test_scheduler", "test_engine", "test_api"]
+MODULE_ORDER = ["test_utils", "test_rope", "test_sampling", "test_cache", "test_attention", "test_model", "test_scheduler", "test_engine", "test_api"]
 
 def pytest_collection_modifyitems(session, config, items):
     excluded_fun_names = ["test_benchmark_on_pc", "test_benchmark_sharegpt",
@@ -28,6 +28,7 @@ def pytest_collection_modifyitems(session, config, items):
                           "test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold",
                           "test_parse_metrics_sweep_batch_size",
                           "test_profile_decode_idle_fraction",
+                          "test_parse_chrome_trace",
                           ]
     excluded_module_names = ["test_playground"]
 

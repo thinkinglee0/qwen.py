@@ -4,12 +4,47 @@ import logging
 import time
 import math
 import orjson
+import torch
 
 from qwen.utils import round_floats
 from qwen.config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
+class StepEvents:
+    """CUDA events for one step. record() is async; read() must run after a sync."""
+
+    SEGMENTS = ("fwd", "logits", "sample")
+
+    def __init__(self):
+        if not torch.cuda.is_available():
+            return
+
+        # enable_timing=True is required for elapsed_time(); it costs nothing extra.
+        self._ev = {s: (torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True))
+                    for s in self.SEGMENTS}
+
+    def start(self, seg: str):
+        if not torch.cuda.is_available():
+            return
+
+        assert seg in self.SEGMENTS, f"invalid segment: {seg}"
+        self._ev[seg][0].record()  # type: ignore[call-arg]
+
+    def stop(self, seg: str):
+        if not torch.cuda.is_available():
+            return
+
+        assert seg in self.SEGMENTS, f"invalid segment: {seg}"
+        self._ev[seg][1].record()  # type: ignore[call-arg]
+
+    def read(self) -> dict[str, float]:
+        if not torch.cuda.is_available():
+            return {}
+
+        """Call ONLY after the stream has been drained -- otherwise this syncs."""
+        return {f"{s}_gpu_ms": a.elapsed_time(b) for s, (a, b) in self._ev.items()}
 
 @dataclass
 class SchedulerStepMetrices:
@@ -20,8 +55,24 @@ class SchedulerStepMetrices:
     run: int = 0        # num_running
     wait: int = 0       # num_waiting
     blk_used: int = 0   # kv_blocks_used
-    blk_total: int = 0    # kv_blocks_total
-    elapsed_ms: float = 0.
+    sched_ms: float = 0.
+    sched_pre_ms: float = 0.
+    sched_run_ms: float = 0.
+    sched_wait_ms: float = 0.
+    sched_ret_ms: float = 0.
+    bld_meta_ms: float = 0.
+    fwd_ms: float = 0.
+    fwd_gpu_ms: float = 0.
+    # fwd_embed_ms: float = 0.
+    # fwd_layers_ms: list[float] = []
+    # fwd_post_norm_ms: float = 0.
+    logits_ms: float = 0.
+    logits_gpu_ms: float = 0.
+    sample_ms: float = 0.
+    sample_gpu_ms: float = 0.
+    n_sample: int = 0
+    dth_ms: float = 0.
+    ci_ms: float = 0.
 
 @dataclass
 class SchedulerMetrices:
