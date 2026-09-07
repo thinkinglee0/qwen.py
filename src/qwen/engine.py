@@ -1,3 +1,4 @@
+import gc
 import logging
 import threading
 import time
@@ -11,7 +12,6 @@ from qwen.sampling import Sampling
 from qwen.scheduler import Scheduler, SchedulerOutput, ModelRequest
 from qwen.constants import DEFAULT_MAX_NEW_TOKEN
 from qwen.config import ModelConfig
-from qwen.metrics import StepEvents
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +28,10 @@ class LLMEngine:
         self.scheduler = Scheduler(config=self.model.config)
 
     def step(self) -> bool:
-        start_time = time.perf_counter()
         sch_out = self.scheduler.schedule()
         if sch_out is None:
             logger.info("Scheduler: no work, next loop iteration")
             return False
-        finish_time = time.perf_counter()
-        assert sch_out.step_metrics is not None
-        sch_out.step_metrics.sched_ms = (finish_time-start_time)*1000
 
         self.forward(sch_out=sch_out)
         return True
@@ -45,56 +41,39 @@ class LLMEngine:
     def forward(self, sch_out: SchedulerOutput):
         assert sch_out.step_metrics is not None
 
-        ev = StepEvents()
-
-        start_time = time.perf_counter()
+        sch_out.step_metrics.start("bld_meta")
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"batch size: {len(sch_out.reqs)}")
 
         packed_input_ids, md = build_attn_metadata(
-            sch_out, self.scheduler.cache.data, device=self.model.config.device)
-        finish_time = time.perf_counter()
-        sch_out.step_metrics.bld_meta_ms = (finish_time - start_time) * 1000
+            sch_out, self.scheduler.cache.data, config=self.model.config)
+        sch_out.step_metrics.stop("bld_meta")
 
-        start_time = finish_time
-        ev.start("fwd")
+        sch_out.step_metrics.start("fwd")
         # torch.cuda.set_sync_debug_mode("error")
         hidden = self.model.forward(packed_input_ids, md)       # [total_tokens, H]
         # torch.cuda.set_sync_debug_mode("default")
-        ev.stop("fwd")
-        finish_time = time.perf_counter()
-        assert sch_out.step_metrics is not None
-        sch_out.step_metrics.fwd_ms = (finish_time - start_time) * 1000
+        sch_out.step_metrics.stop("fwd")
 
-        start_time = finish_time
-        ev.start("logits")
+        sch_out.step_metrics.start("logits")
         # gather each seq's LAST token -> logits -> first generated token
         last_idx = md.cu_seqlens_q[1:] - 1          # [B]
         logits = self.model.compute_logits(hidden[last_idx])   # [B, vocab]
-        ev.stop("logits")
-        finish_time = time.perf_counter()
-        sch_out.step_metrics.logits_ms = (finish_time - start_time) * 1000
+        sch_out.step_metrics.stop("logits")
 
-        start_time = finish_time
-        ev.start("sample")
+        sch_out.step_metrics.start("sample")
         next_tokens = self.model.sampler(logits, sch_out)          # [B]
-        ev.stop("sample")
-        finish_time = time.perf_counter()
-        sch_out.step_metrics.sample_ms = (finish_time - start_time) * 1000
+        sch_out.step_metrics.stop("sample")
 
-        start_time = finish_time
+        sch_out.step_metrics.start("dth")
         next_tokens_cpu = next_tokens.tolist()
-        finish_time = time.perf_counter()
-        sch_out.step_metrics.dth_ms = (finish_time - start_time) * 1000
+        sch_out.step_metrics.stop("dth")
         sch_out.step_metrics.n_sample = len(next_tokens_cpu)
 
-        for k, v in ev.read().items():
-            setattr(sch_out.step_metrics, k, v)
-
-        start_time = finish_time
+        sch_out.step_metrics.start("ci")
         num_truncated = sch_out.add_sampled_tokens(next_tokens_cpu, self.model.config.eos_token_id_set)
 
-        self.scheduler.commit_step(sch_out=sch_out, num_truncated=num_truncated, start_time=start_time)
+        self.scheduler.commit_step(sch_out=sch_out, num_truncated=num_truncated)
 
 
     def run_to_completion(self):
@@ -160,6 +139,12 @@ class ServingDriver:
 
         self.engine.teardown()
         del self.engine
+
+        if torch.cuda.is_available():
+            gc.collect()
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     def submit(self, input_ids, request_id: str | None, sampling, max_new_tokens: int)  -> asyncio.Queue[int | None | Exception] | None:
         with self.cond:

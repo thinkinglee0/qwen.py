@@ -1,10 +1,11 @@
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 import numpy as np
 import logging
 import time
 import math
 import orjson
 import torch
+from collections import deque
 
 from qwen.utils import round_floats
 from qwen.config import ModelConfig
@@ -14,29 +15,32 @@ logger = logging.getLogger(__name__)
 class StepEvents:
     """CUDA events for one step. record() is async; read() must run after a sync."""
 
-    SEGMENTS = ("fwd", "logits", "sample")
+    SEGMENTS = ("fwd", "logits", "sample", "rope")
 
     def __init__(self):
         if not torch.cuda.is_available():
             return
 
         # enable_timing=True is required for elapsed_time(); it costs nothing extra.
-        self._ev = {s: (torch.cuda.Event(enable_timing=True),
-                        torch.cuda.Event(enable_timing=True))
-                    for s in self.SEGMENTS}
+        self._ev = {}
 
     def start(self, seg: str):
         if not torch.cuda.is_available():
             return
 
-        assert seg in self.SEGMENTS, f"invalid segment: {seg}"
+        if seg not in self.SEGMENTS:
+            return
+
+        self._ev[seg] = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         self._ev[seg][0].record()  # type: ignore[call-arg]
 
     def stop(self, seg: str):
         if not torch.cuda.is_available():
             return
 
-        assert seg in self.SEGMENTS, f"invalid segment: {seg}"
+        if seg not in self.SEGMENTS:
+            return
+        
         self._ev[seg][1].record()  # type: ignore[call-arg]
 
     def read(self) -> dict[str, float]:
@@ -44,10 +48,14 @@ class StepEvents:
             return {}
 
         """Call ONLY after the stream has been drained -- otherwise this syncs."""
-        return {f"{s}_gpu_ms": a.elapsed_time(b) for s, (a, b) in self._ev.items()}
+        return {f"{s}_gpu": a.elapsed_time(b) for s, (a, b) in self._ev.items()}
 
 @dataclass
 class SchedulerStepMetrices:
+    EXCLUDE = frozenset({"EXCLUDE", "events", "pending_evs"})
+    events = StepEvents()
+    pending_evs: deque[tuple[str, float]] = field(default_factory=deque, repr=False)
+
     step: int = 0       # step_id
     bz: int = 0         # batch_size
     n_p: int = 0        # number_prefill_tokens
@@ -55,24 +63,49 @@ class SchedulerStepMetrices:
     run: int = 0        # num_running
     wait: int = 0       # num_waiting
     blk_used: int = 0   # kv_blocks_used
-    sched_ms: float = 0.
-    sched_pre_ms: float = 0.
-    sched_run_ms: float = 0.
-    sched_wait_ms: float = 0.
-    sched_ret_ms: float = 0.
-    bld_meta_ms: float = 0.
-    fwd_ms: float = 0.
-    fwd_gpu_ms: float = 0.
-    # fwd_embed_ms: float = 0.
-    # fwd_layers_ms: list[float] = []
-    # fwd_post_norm_ms: float = 0.
-    logits_ms: float = 0.
-    logits_gpu_ms: float = 0.
-    sample_ms: float = 0.
-    sample_gpu_ms: float = 0.
+    sched: float = 0.
+    sched_pre: float = 0.
+    sched_run: float = 0.
+    sched_wait: float = 0.
+    sched_ret: float = 0.
+    bld_meta: float = 0.
+    fwd: float = 0.
+    fwd_gpu: float = 0.
+    rope: float = 0.
+    rope_gpu: float = 0.
+    logits: float = 0.
+    logits_gpu: float = 0.
+    sample: float = 0.
+    sample_gpu: float = 0.
     n_sample: int = 0
-    dth_ms: float = 0.
-    ci_ms: float = 0.
+    dth: float = 0.
+    ci: float = 0.
+
+    def start(self, ev: str):
+        self.pending_evs.append((ev, time.perf_counter()))
+        self.events.start(ev)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"step_metrics.start({ev}), len: {len(self.pending_evs)}")
+
+    def stop(self, ev: str):
+        cur_ev, start_time = self.pending_evs.pop()
+        assert cur_ev == ev, f"stop event {ev} does not match start event {cur_ev}"
+        self.events.stop(cur_ev)
+        finish_time = time.perf_counter()
+        setattr(self, cur_ev, (finish_time - start_time) * 1000)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"step_metrics.stop({ev}), len: {len(self.pending_evs)}, elapsed: {getattr(self, cur_ev)} ms")
+
+    def is_stopped(self) -> bool:
+        return len(self.pending_evs) == 0
+
+    def output_dict(self):
+        for k, v in self.events.read().items():
+            setattr(self, k, v)
+        
+        return {f.name: getattr(self, f.name)
+                    for f in fields(self)
+                    if f.name not in self.EXCLUDE}
 
 @dataclass
 class SchedulerMetrices:

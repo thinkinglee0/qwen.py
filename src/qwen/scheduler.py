@@ -1,6 +1,7 @@
 from collections import deque
 import logging
-from dataclasses import dataclass, asdict
+import dataclasses
+from dataclasses import dataclass
 import asyncio
 import time
 from datetime import datetime
@@ -117,7 +118,8 @@ class ScheduledInfo:
 
 class SchedulerOutput:
     def __init__(self, step: int, reqs: list[ModelRequest], scheduled: dict[str, ScheduledInfo],
-                 block_tables: list[list[int]], config: ModelConfig, scheduler: "Scheduler | None"):
+                 block_tables: list[list[int]], config: ModelConfig, scheduler: "Scheduler | None" = None,
+                 step_metrics: SchedulerStepMetrices | None = None):
         assert len(reqs) > 0, "SchedulerOutput must have at least one request"
         self.reqs = reqs
         self.scheduled = scheduled
@@ -146,15 +148,26 @@ class SchedulerOutput:
                 # decode
                 num_decode_tokens += scheduled[req.request_id].want
 
-        self.step_metrics: SchedulerStepMetrices | None = SchedulerStepMetrices(
-            step=step,
-            bz=self.batch_size,
-            n_p=num_prefill_tokens,
-            n_d=num_decode_tokens,
-            run=len(scheduler.running),
-            wait=len(scheduler.waiting),
-            blk_used=scheduler.cache.pool.used(),
-        ) if scheduler is not None else None
+        self.step_metrics: SchedulerStepMetrices | None = None
+        if scheduler is not None:
+            # Build common metrics dict
+            # use values from the arugment step_metrics if provided, otherwise create a new SchedulerStepMetrices instance
+            pending_evs = step_metrics.pending_evs if step_metrics is not None else deque()
+            metrics_dict = {
+                "step": step,
+                "bz": self.batch_size,
+                "n_p": num_prefill_tokens,
+                "n_d": num_decode_tokens,
+                "run": len(scheduler.running),
+                "wait": len(scheduler.waiting),
+                "blk_used": scheduler.cache.pool.used(),
+                "pending_evs": pending_evs,
+            }
+
+            if step_metrics is not None:
+                self.step_metrics = dataclasses.replace(step_metrics, **metrics_dict)
+            else:
+                self.step_metrics = SchedulerStepMetrices(**metrics_dict)
 
     # return the number of truncated reqs which are finished just now
     def add_sampled_tokens(self, next_tokens_cpu: list[int], eos_token_id_set) -> int:
@@ -254,7 +267,7 @@ class Scheduler:
         victim.not_before_step = self.sch_metrics.step + delay
         self.waiting.appendleft(victim)
 
-    def commit_step(self, sch_out: SchedulerOutput, num_truncated:int, start_time: float | None = None):
+    def commit_step(self, sch_out: SchedulerOutput, num_truncated:int):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"call commit_step, ")
         for req in sch_out.reqs:
@@ -263,10 +276,9 @@ class Scheduler:
 
         self.sch_metrics.report_on_truncated(num_truncated)
 
-        if start_time is not None:
-            finish_time = time.perf_counter()
-            assert sch_out.step_metrics
-            sch_out.step_metrics.ci_ms = (finish_time - start_time) * 1000
+        if sch_out.step_metrics is not None and not sch_out.step_metrics.is_stopped():
+            assert len(sch_out.step_metrics.pending_evs) == 1   # there should be only one pending event, which is "ci"
+            sch_out.step_metrics.stop("ci") # "ci" set in engine.forward usually
         self.log_metrics(sch_out=sch_out)
 
     def cleanup_on_finished(self, req: ModelRequest):
@@ -364,7 +376,8 @@ class Scheduler:
     # D-first scheduling with no-cross preemption
     def D_first_preemptive_schedule(self) -> SchedulerOutput | None:            # called by run_loop when idle
         step_metrics = SchedulerStepMetrices()
-        start_time = time.perf_counter()
+        step_metrics.start("sched")
+        step_metrics.start("sched_pre")
         budget = self.max_num_batched_tokens
         scheduled: dict[str, ScheduledInfo] = {}
         victims: set[str] = set()
@@ -377,11 +390,10 @@ class Scheduler:
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
-        finish_time = time.perf_counter()
-        step_metrics.sched_pre_ms = (finish_time-start_time)*1000
-        start_time = finish_time
+        step_metrics.stop("sched_pre")
 
         # 1) running first — protect in-flight decodes' TPOT.
+        step_metrics.start("sched_run")
         scheduled_running: list[ModelRequest] = []
         for req in list(self.running):
             assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
@@ -421,11 +433,10 @@ class Scheduler:
             scheduled[req.request_id] = s_info
             budget -= want
 
-        finish_time = time.perf_counter()
-        step_metrics.sched_run_ms = (finish_time-start_time)*1000
-        start_time = finish_time
+        step_metrics.stop("sched_run")
     
         # 2) waiting next — fill remaining budget with (chunked) prefills
+        step_metrics.start("sched_wait")
         while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
             req = self._pick_waiting(victims=victims)
             if req is None:
@@ -450,15 +461,7 @@ class Scheduler:
             scheduled[req.request_id] = s_info
             budget -= want
 
-        finish_time = time.perf_counter()
-        step_metrics.sched_wait_ms = (finish_time-start_time)*1000
-        start_time = finish_time
-
-        block_tables = []
-        for req in scheduled_running:
-            bt = self.cache.get_block_table(req)
-            assert bt is not None
-            block_tables.append(bt)
+        step_metrics.stop("sched_wait")
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"schedule1, scheduled: {len(scheduled_running)}, running: {len(self.running)}, waiting: {len(self.waiting)}")
@@ -466,17 +469,19 @@ class Scheduler:
         if not scheduled_running:
             return None     # no work to do
 
+        step_metrics.start("sched_ret")
+        block_tables = []
+        for req in scheduled_running:
+            bt = self.cache.get_block_table(req)
+            assert bt is not None
+            block_tables.append(bt)
+
         self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
         s_out = SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
-                               config=self.config, scheduler=self)
-        finish_time = time.perf_counter()
-        step_metrics.sched_ret_ms = (finish_time-start_time)*1000
-
+                               config=self.config, scheduler=self, step_metrics=step_metrics)
         assert s_out.step_metrics is not None
-        s_out.step_metrics.sched_pre_ms = step_metrics.sched_pre_ms
-        s_out.step_metrics.sched_run_ms = step_metrics.sched_run_ms
-        s_out.step_metrics.sched_wait_ms = step_metrics.sched_wait_ms
-        s_out.step_metrics.sched_ret_ms = step_metrics.sched_ret_ms
+        s_out.step_metrics.stop("sched_ret")
+        s_out.step_metrics.stop("sched")  # stop the whole scheduling step
         return s_out
     
     def _pick_victim(self, cur_req):
@@ -497,7 +502,8 @@ class Scheduler:
     # Preemptive scheduling with victim eviction
     def preemptive_schedule(self) -> SchedulerOutput | None:            # called by run_loop when idle
         step_metrics = SchedulerStepMetrices()
-        start_time = time.perf_counter()
+        step_metrics.start("sched")
+        step_metrics.start("sched_pre")
         budget = self.max_num_batched_tokens
         scheduled: dict[str, ScheduledInfo] = {}
         victims: set[str] = set()
@@ -505,11 +511,11 @@ class Scheduler:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
         finish_time = time.perf_counter()
-        step_metrics.sched_pre_ms = (finish_time-start_time)*1000
-        start_time = finish_time
+        step_metrics.stop("sched_pre")
         
         # 1) running first — protect in-flight decodes' TPOT.
         #    Note: Ps and Ds may interleave.
+        step_metrics.start("sched_run")
         scheduled_running: list[ModelRequest] = []
         for req in list(self.running):  # snapshot
             assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
@@ -562,11 +568,10 @@ class Scheduler:
                 logger.debug(f"add {req.request_id} to scheduled_running")
             budget -= want
 
-        finish_time = time.perf_counter()
-        step_metrics.sched_run_ms = (finish_time-start_time)*1000
-        start_time = finish_time
+        step_metrics.stop("sched_run")
     
         # 2) waiting next — fill remaining budget with (chunked) prefills
+        step_metrics.start("sched_wait")
         while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
             req = self._pick_waiting(victims=victims)
             if req is None:
@@ -589,13 +594,15 @@ class Scheduler:
                 logger.debug(f"add {req.request_id} to scheduled_running")
             budget -= want
 
-        finish_time = time.perf_counter()
-        step_metrics.sched_wait_ms = (finish_time-start_time)*1000
-        start_time = finish_time
+        step_metrics.stop("sched_wait")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"schedule1, scheduled: {len(scheduled_running)}, running: {len(self.running)}, waiting: {len(self.waiting)}")
 
         if not scheduled_running:
             return None     # no work to do
 
+        step_metrics.start("sched_ret")
         block_tables = []
         for req in scheduled_running:
             bt = self.cache.get_block_table(req)
@@ -604,15 +611,10 @@ class Scheduler:
 
         self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
         s_out = SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
-                               config=self.config, scheduler=self)
-        finish_time = time.perf_counter()
-        step_metrics.sched_ret_ms = (finish_time-start_time)*1000
-
+                               config=self.config, scheduler=self, step_metrics=step_metrics)
         assert s_out.step_metrics is not None
-        s_out.step_metrics.sched_pre_ms = step_metrics.sched_pre_ms
-        s_out.step_metrics.sched_run_ms = step_metrics.sched_run_ms
-        s_out.step_metrics.sched_wait_ms = step_metrics.sched_wait_ms
-        s_out.step_metrics.sched_ret_ms = step_metrics.sched_ret_ms
+        s_out.step_metrics.stop("sched_ret")
+        s_out.step_metrics.stop("sched")  # stop the whole scheduling step
         return s_out
 
     def log_metrics(self, sch_out: SchedulerOutput, is_exiting: bool=False):
@@ -638,7 +640,7 @@ class Scheduler:
 
         if logger.isEnabledFor(logging.DEBUG):
             for metrics in req_metrics_list:
-                json_bytes = orjson.dumps(round_floats(asdict(metrics), nd=3))
+                json_bytes = orjson.dumps(round_floats(dataclasses.asdict(metrics), nd=3))
                 logger.debug(f"metrics obj: {json_bytes.decode()}")
 
         # analyze
@@ -656,8 +658,9 @@ class Scheduler:
             f.flush()
 
     def log_step_metrics(self, sch_out: SchedulerOutput):
-        assert sch_out.step_metrics
-        json_bytes = orjson.dumps(round_floats(asdict(sch_out.step_metrics), nd=3))
+        assert sch_out.step_metrics and sch_out.step_metrics.is_stopped(), "step_metrics must be stopped before logging"
+
+        json_bytes = orjson.dumps(round_floats(sch_out.step_metrics.output_dict(), nd=3))
 
         # save to file
         log_path = Path(self.config.log_dir)

@@ -98,7 +98,7 @@ def test_build_attn_metadata(tmp_target_config):
     assert sch_out.tensor_sampling.temperature is not None and sch_out.tensor_sampling.temperature.tolist() == [1.0]*3
     assert sch_out.tensor_sampling.top_k is not None and sch_out.tensor_sampling.top_k.tolist() == [3]*3
 
-    packed_ids, md = build_attn_metadata(sch_out, cache_data=None, device=tmp_target_config.device)
+    packed_ids, md = build_attn_metadata(sch_out, cache_data=None, config=tmp_target_config)
 
     assert len(packed_ids) == 6
     assert packed_ids.tolist() == req1.input_ids[req1.num_computed_tokens:req1.num_computed_tokens+s_info_1.want] \

@@ -60,7 +60,7 @@ def build_scheduler_output_on_prefill(model, cache, input_ids_lst) -> SchedulerO
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config, scheduler=None)
+    return SchedulerOutput(step=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
 
 def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
     scheduled: dict[str, ScheduledInfo] = {}
@@ -73,7 +73,7 @@ def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config, scheduler=None)
+    return SchedulerOutput(step=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
 
 class HookManager:
     hooks: dict[str, Any]   # save_i/save_o store a Tensor directly; patch_rope's hooks store list[Tensor]
@@ -349,7 +349,7 @@ def test_forward_matches_reference_on_math(target_model, tmp_cache, ref_model, B
             # target model
             lst = input_ids.tolist()
             sch_out = build_scheduler_output_on_prefill(target_model, tmp_cache, lst)
-            packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, device=target_model.config.device)
+            packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, config=target_model.config)
             
             hidden = target_model.forward(packed_ids, md)       # [total_tokens, H]
 
@@ -403,7 +403,7 @@ def test_forward_matches_reference_on_long_prompt(L, target_model, ref_model, tm
 
         # target model
         sch_out = build_scheduler_output_on_prefill(target_model, tmp_cache, slice_list)
-        packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, device=target_model.config.device)
+        packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, config=target_model.config)
         hidden = target_model.forward(packed_ids, md)       # [total_tokens, H]
 
         # gather each seq's LAST token -> logits -> first generated token
@@ -683,7 +683,7 @@ def test_kv_cache_correctness(target_model, tmp_cache, B:int):
     cache1 = copy.deepcopy(tmp_cache)
     sch_out = build_scheduler_output_on_prefill(target_model, cache1, ids.tolist())
     req_ids1 = [r.request_id for r in sch_out.reqs]
-    packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache1.data, device=target_model.config.device)
+    packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache1.data, config=target_model.config)
     hidden = target_model.forward(packed_ids, meta_prefill)       # [total_tokens, H]
     last_idx = meta_prefill.cu_seqlens_q[1:] - 1          # [B]
     logits_only_prefill = target_model.compute_logits(hidden[last_idx])   # [B, vocab]
@@ -693,7 +693,7 @@ def test_kv_cache_correctness(target_model, tmp_cache, B:int):
         # sample 2: prefill + decode
         prefill_ids = ids[:, :P]
         sch_out = build_scheduler_output_on_prefill(target_model, cache2, prefill_ids.tolist())
-        packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache2.data, device=target_model.config.device)
+        packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache2.data, config=target_model.config)
         req_ids2 = [r.request_id for r in sch_out.reqs]
 
         ###########################################################################
@@ -719,7 +719,7 @@ def test_kv_cache_correctness(target_model, tmp_cache, B:int):
                 assert req.is_decoding
 
             sch_out = build_scheduler_output_on_decoding(target_model, cache2, sch_out.reqs)
-            packed_ids, meta_decode = build_attn_metadata(sch_out, cache_data=cache2.data, device=target_model.config.device)
+            packed_ids, meta_decode = build_attn_metadata(sch_out, cache_data=cache2.data, config=target_model.config)
             assert packed_ids.tolist() == decode_ids
 
             meta_decode.debug_k_list, meta_decode.debug_v_list = debug_k_list, debug_v_list   # turn on debug
@@ -824,7 +824,7 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
         ######### prefill #########
         # target model's prefill
         sch_out = build_scheduler_output_on_prefill(target_model, cache, input_list)
-        packed_ids, md_prefill = build_attn_metadata(sch_out, cache_data=cache.data, device=target_model.config.device)
+        packed_ids, md_prefill = build_attn_metadata(sch_out, cache_data=cache.data, config=target_model.config)
         hidden = target_model.forward(packed_ids, md_prefill)       # [total_tokens, H]
         last_idx = md_prefill.cu_seqlens_q[1:] - 1          # [B]
         target_logits = target_model.compute_logits(hidden[last_idx])   # [B, vocab], last one
@@ -849,7 +849,7 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
         ######### decode #########
         # target model
         sch_out = build_scheduler_output_on_decoding(target_model, cache, sch_out.reqs)
-        packed_ids, md_decode = build_attn_metadata(sch_out, cache_data=cache.data, device=target_model.config.device)
+        packed_ids, md_decode = build_attn_metadata(sch_out, cache_data=cache.data, config=target_model.config)
 
         # capture layer 1's REAL q (post-RoPE) + cache tensors during this actual forward call,
         # to redo the flash_attn paged-vs-flat probe with real activations instead of random data

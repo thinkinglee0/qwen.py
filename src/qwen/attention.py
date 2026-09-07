@@ -11,6 +11,7 @@ from qwen.config import ModelConfig
 from qwen.cache import KVCacheData
 from qwen.scheduler import SchedulerOutput
 from qwen.rope import BaseRoPE
+from qwen.metrics import SchedulerStepMetrices
 
 
 # attention backend selection — resolved once at import
@@ -62,6 +63,9 @@ class AttentionMetadata:
     position_ids: Tensor    # rope
     slot_mapping: Tensor    # scatter q/v projections to kv cache
 
+    # metrics
+    step_metrics: SchedulerStepMetrices | None = None
+
     # debug cache issue
     debug_k_list: list[Tensor] | None = None
     debug_v_list: list[Tensor] | None = None
@@ -80,7 +84,7 @@ def build_block_table(tables, device):
 
     return bt   # [num_seqs, max_blocks];  padding entries never read, truncated by seqused_k
 
-def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, device) -> tuple[Tensor, AttentionMetadata]:
+def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, config: ModelConfig) -> tuple[Tensor, AttentionMetadata]:
     # packing
     packed_id_list: list[int] = []
     lens: list[int] = []
@@ -98,7 +102,11 @@ def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, devic
         cache_lens.append(end)
         position_id_lst.extend(range(start, end))
 
+    max_position = max(position_id_lst)
+    assert max_position < config.max_model_len, f"seq overflow: {max_position} >= {config.max_model_len}"
+
     # preparation
+    device = config.device
     packed_ids = torch.tensor(packed_id_list, device=device, dtype=torch.int32)      # [T]
 
     max_seqlen_q = max(lens)
@@ -121,7 +129,9 @@ def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, devic
                              cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
                              cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max_seqlen_k,
                              cache_seqlens=cache_seqlens, block_table=block_table,
-                             position_ids=position_ids, slot_mapping=slot_mapping)
+                             position_ids=position_ids, slot_mapping=slot_mapping,
+                             step_metrics=sch_out.step_metrics,
+                             )
 
 def sdpa_one_seq(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     # LAYOUT: padded batch only
@@ -247,7 +257,12 @@ class Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(T, self.num_key_value_heads, self.head_dim)
 
         # rope
-        query_states, key_states = self.rope.forward(query_states, key_states, meta.position_ids)
+        if meta.step_metrics is None:
+            query_states, key_states = self.rope.forward(query_states, key_states, meta.position_ids)
+        else:
+            meta.step_metrics.start("rope")
+            query_states, key_states = self.rope.forward(query_states, key_states, meta.position_ids)
+            meta.step_metrics.stop("rope")
 
         # debug
         if meta.debug_k_list is not None and meta.debug_v_list is not None:
