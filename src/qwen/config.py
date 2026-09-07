@@ -95,6 +95,9 @@ class ModelConfig():
     req_metrics_interval: float = 60               # sec
     cache_verification_interval: float = 60 # sec
 
+    # rope compilation
+    compile_rope: bool | None = None   # None = 自动：CUDA 上开，CPU/mac 上关
+
     # log
     log_dir: str = LOG_DIR
 
@@ -118,6 +121,13 @@ class ModelConfig():
         assert self.max_model_len <= self.max_position_embeddings
 
         self.eos_token_id_set = _normalize_eos(self.eos_token_id)
+
+        if self.compile_rope is None:
+            self.set_default_compile_rope()
+
+    def set_default_compile_rope(self):
+        assert self.device is not None, "device is not set"
+        self.compile_rope = self.device.type == "cuda"  # enable rope compilation for CUDA
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":

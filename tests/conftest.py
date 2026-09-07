@@ -190,6 +190,7 @@ def target_config(log_dir):
     config.num_blocks = 16
     config.cache_verification_interval = 1. 
     config.log_dir = log_dir
+    config.compile_rope = False     # disable rope compilation for testing
     return config
 
 @pytest.fixture(scope="function")
@@ -204,7 +205,11 @@ def target_model(target_config):
 
 @pytest.fixture(scope="session")
 def target_driver(target_config) -> Iterator[ServingDriver]:
-    engine = LLMEngine(target_config)
+    tmp2 = dataclasses.replace(target_config, weights=None)
+    tmp2.weights = target_config.weights
+    tmp2.set_default_compile_rope()  # enable rope compilation for cuda
+    logger.info(f"target_driver: compile_rope = {tmp2.compile_rope}")
+    engine = LLMEngine(tmp2)
     with ServingDriver(engine) as d:
         yield d
 
@@ -213,7 +218,8 @@ def tmp_cache(tmp_target_config: ModelConfig):
     return KVCache(tmp_target_config)
 
 @pytest.fixture(scope="function")
-def tmp_target_driver(tmp_target_config) -> Iterator[ServingDriver]:
+def tmp_target_driver(tmp_target_config: ModelConfig) -> Iterator[ServingDriver]:
+    tmp_target_config.set_default_compile_rope()  # enable rope compilation for cuda
     engine = LLMEngine(tmp_target_config)
     with ServingDriver(engine) as d:
         yield d
@@ -260,18 +266,6 @@ def target_engine_for_pc_benchmarking(tmp_target_config: ModelConfig) -> LLMEngi
 
     return LLMEngine(tmp_target_config)
 
-# @pytest.fixture(scope="function")
-# def target_engine_for_sharegpt_benchmarking(tmp_target_config: ModelConfig, req_num:int, max_num_seqs:int, max_model_len:int, num_blocks: int) -> LLMEngine:
-#     # overwrite max_num_seqs and max_model_len for benchmarking
-#     tmp_target_config.max_num_seqs = max_num_seqs
-#     tmp_target_config.max_model_len = max_model_len
-#     tmp_target_config.req_metrics_interval = 60.
-#     tmp_target_config.is_benchmarking = True
-#     tmp_target_config.max_waiting=req_num
-#     tmp_target_config.num_blocks = num_blocks
-#     tmp_target_config.do_sample = False
-
-#     return LLMEngine(tmp_target_config)
 
 @pytest.fixture(scope="function")
 def target_engine_for_sharegpt_benchmarking(
@@ -286,6 +280,7 @@ def target_engine_for_sharegpt_benchmarking(
     tmp_target_config.req_metrics_interval = 60.
     tmp_target_config.is_benchmarking = True
     tmp_target_config.do_sample = False
+    tmp_target_config.compile_rope = True   # enable rope compilation for benchmarking
 
     try:
         engine = LLMEngine(tmp_target_config)
@@ -306,5 +301,6 @@ def tmp_target_config_for_sharegpt_benchmarking(tmp_target_config: ModelConfig) 
     tmp_target_config.req_metrics_interval = 60.
     tmp_target_config.is_benchmarking = True
     tmp_target_config.do_sample = False
+    tmp_target_config.compile_rope = True   # enable rope compilation for benchmarking
 
     return tmp_target_config

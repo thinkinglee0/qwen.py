@@ -101,6 +101,7 @@ async def test_generation_under_kv_pressure(tmp_target_config, batch_for_regular
     tmp_target_config.do_sample = False
     tmp_target_config.do_penalities = False
     tmp_target_config.is_benchmarking = True
+    tmp_target_config.set_default_compile_rope()  # enable rope compilation for cuda
 
     engine = LLMEngine(config=tmp_target_config)
     sch = engine.scheduler
