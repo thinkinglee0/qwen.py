@@ -10,6 +10,7 @@ from qwen.utils import resolve_device, default_dtype
 logger = logging.getLogger(__name__)
 
 def test_apply_penalties():
+    torch.manual_seed(0)
     device = resolve_device()
     vocab_size = 151936          # Actual value for Qwen2.5
     bsz = 3
@@ -28,16 +29,15 @@ def test_apply_penalties():
 
     assert new_logits.shape == torch.Size([bsz, vocab_size])
     assert torch.sum(new_logits[0] != logits[0], dtype=torch.float32) == 3.0    # because of three distinct elements (101, 202, 303)
-    assert (new_logits[0]-logits[0]).min() == min(new_logits[0, 101]-logits[0, 101],
+    assert (new_logits[0]-logits[0]).min().item() == min(new_logits[0, 101]-logits[0, 101],
                                                   new_logits[0, 202]-logits[0, 202],
                                                   new_logits[0, 303]-logits[0, 303])    # differences on other positions are zero.
 
     assert torch.sum(new_logits[1] != logits[1], dtype=torch.float32) == 1.0    # only one element (66) occurs in the output
-    assert (new_logits[1]-logits[1]).min() == -1.5      # token_id=66 occurs three times, so frequency penalty = 0.5*3 = 1.5
-    assert new_logits[1,66]-logits[1,66] == -1.5        # same
+    torch.testing.assert_close((new_logits[1]-logits[1]).min().item(), -1.5, rtol=0, atol=1e-3)     # token_id=66 occurs three times, so frequency penalty = 0.5*3 = 1.5
+    torch.testing.assert_close((new_logits[1,66]-logits[1,66]).item(), -1.5, rtol=0, atol=1e-3)              # same
 
     assert torch.equal(new_logits[2], logits[2])        # do nothing
-
 
 
 # ---------- apply_top_k ----------

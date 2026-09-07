@@ -73,18 +73,43 @@ class TensorSampling:
                 dtype=config.dtype
             )
 
+    # @classmethod
+    # def from_sampling_list(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+    #     return cls(
+    #         config=config,
+    #         bsz=bsz,
+    #         temperature=torch.tensor([sampling.temperature if sampling is not None and sampling.temperature is not None else config.temperature for sampling in samplings], device=config.device, dtype=config.dtype),
+    #         top_k=torch.tensor([sampling.top_k if sampling is not None and sampling.top_k is not None else config.top_k for sampling in samplings], device=config.device, dtype=torch.int64),
+    #         top_p=torch.tensor([sampling.top_p if sampling is not None and sampling.top_p is not None else config.top_p for sampling in samplings], device=config.device, dtype=config.dtype),
+    #         rep_pen=torch.tensor([sampling.rep_pen if sampling is not None and sampling.rep_pen is not None else config.repetition_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
+    #         freq_pen=torch.tensor([sampling.freq_pen if sampling is not None and sampling.freq_pen is not None else config.frequency_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
+    #         pres_pen=torch.tensor([sampling.pres_pen if sampling is not None and sampling.pres_pen is not None else config.presence_penalty for sampling in samplings], device=config.device, dtype=config.dtype)
+    #     )
+
     @classmethod
     def from_sampling_list(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
-        return cls(
-            config=config,
-            bsz=bsz,
-            temperature=torch.tensor([sampling.temperature if sampling is not None and sampling.temperature is not None else config.temperature for sampling in samplings], device=config.device, dtype=config.dtype),
-            top_k=torch.tensor([sampling.top_k if sampling is not None and sampling.top_k is not None else config.top_k for sampling in samplings], device=config.device, dtype=torch.int64),
-            top_p=torch.tensor([sampling.top_p if sampling is not None and sampling.top_p is not None else config.top_p for sampling in samplings], device=config.device, dtype=config.dtype),
-            rep_pen=torch.tensor([sampling.rep_pen if sampling is not None and sampling.rep_pen is not None else config.repetition_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
-            freq_pen=torch.tensor([sampling.freq_pen if sampling is not None and sampling.freq_pen is not None else config.frequency_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
-            pres_pen=torch.tensor([sampling.pres_pen if sampling is not None and sampling.pres_pen is not None else config.presence_penalty for sampling in samplings], device=config.device, dtype=config.dtype)
-        )
+        def pick(attr: str, default):
+            return [getattr(s, attr) if s is not None and getattr(s, attr) is not None else default
+                    for s in samplings]
+
+        # One staging buffer, one HtoD copy instead of six.
+        rows = [
+            pick("temperature", config.temperature),
+            pick("top_p",       config.top_p),
+            pick("rep_pen",     config.repetition_penalty),
+            pick("freq_pen",    config.frequency_penalty),
+            pick("pres_pen",    config.presence_penalty),
+        ]
+        assert config.device is not None, "config.device must be set"
+        pin_memory = torch.cuda.is_available() and config.device.type == "cuda"
+        staging = torch.tensor(rows, dtype=torch.float32, pin_memory=pin_memory)
+        dev = staging.to(config.device, non_blocking=True)   # async: source is pinned
+        temperature, top_p, rep_pen, freq_pen, pres_pen = dev.unbind(0)
+
+        top_k = torch.tensor(pick("top_k", config.top_k), dtype=torch.int64,
+                            pin_memory=pin_memory).to(config.device, non_blocking=True)
+        return cls(config=config, bsz=bsz, temperature=temperature, top_k=top_k,
+                top_p=top_p, rep_pen=rep_pen, freq_pen=freq_pen, pres_pen=pres_pen)
 
 def bin_counts_and_mask(
     token_ids: list[list[int]],
