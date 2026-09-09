@@ -1,3 +1,4 @@
+import argparse
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -62,11 +63,18 @@ def pytest_collection_modifyitems(session, config, items):
     # list.sort is stable, so unlisted modules keep their original order
     items.sort(key=sort_key)
 
+def _str2bool(v: str) -> bool:
+    v = v.strip().lower()
+    if v in ("true", "1", "yes", "y", "on"):
+        return True
+    if v in ("false", "0", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected a boolean value, got {v!r}")
 
 # options
 def pytest_addoption(parser):
     parser.addoption(
-        "--req_num",
+        "--req-num",
         action="store",
         default=SHARE_GPT_REQ_NUM,
         type=int,
@@ -74,7 +82,7 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--max_model_len",
+        "--max-model-len",
         action="store",
         default=MAX_MODEL_LEN,
         type=int,
@@ -82,7 +90,7 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--max_num_seqs",
+        "--max-num-seqs",
         action="store",
         default=SHARE_GPT_MAX_SEQS,
         type=int,
@@ -90,7 +98,7 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--num_blocks",
+        "--num-blocks",
         action="store",
         default=MAX_NUM_BLOCKS,
         type=int,
@@ -98,32 +106,56 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--log_dir",
+        "--log-dir",
         action="store",
         default=LOG_DIR,
         type=str,
         help="The log directory for metrics (e.g.: ./log)"
     )
 
+    parser.addoption(
+        "--compile-rope",
+        action="store",
+        default=None,
+        type=_str2bool,
+        help="compile rope switch (true/false); default None means unset",
+    )
+
+    parser.addoption(
+        "--make-sampling-tensor-strategy",
+        action="store",
+        default=1,
+        type=int,
+        help="Sampling tensor strategy (e.g.: 1/0)"
+    )
+
+@pytest.fixture(scope="session")
+def make_sampling_tensor_strategy(request) -> int:
+    return request.config.getoption("--make-sampling-tensor-strategy")
+
+@pytest.fixture(scope="session")
+def compile_rope(request) -> bool:
+    return request.config.getoption("--compile-rope")
+
 @pytest.fixture(scope="session")
 def req_num(request) -> int:
-    return request.config.getoption("--req_num")
+    return request.config.getoption("--req-num")
 
 @pytest.fixture(scope="session")
 def max_model_len(request) -> int:
-    return request.config.getoption("--max_model_len")
+    return request.config.getoption("--max-model-len")
 
 @pytest.fixture(scope="session")
 def max_num_seqs(request) -> int:
-    return request.config.getoption("--max_num_seqs")
+    return request.config.getoption("--max-num-seqs")
 
 @pytest.fixture(scope="session")
 def num_blocks(request) -> int:
-    return request.config.getoption("--num_blocks")
+    return request.config.getoption("--num-blocks")
 
 @pytest.fixture(scope="session")
 def log_dir(request) -> str:
-    return request.config.getoption("--log_dir")
+    return request.config.getoption("--log-dir")
 
 
 # instances for testing
@@ -298,10 +330,11 @@ def target_engine_for_sharegpt_benchmarking(
 
 
 @pytest.fixture(scope="function")
-def tmp_target_config_for_sharegpt_benchmarking(tmp_target_config: ModelConfig) -> ModelConfig:
+def tmp_target_config_for_sharegpt_benchmarking(tmp_target_config: ModelConfig, compile_rope: bool, make_sampling_tensor_strategy: int) -> ModelConfig:
     tmp_target_config.req_metrics_interval = 60.
     tmp_target_config.is_benchmarking = True
     tmp_target_config.do_sample = False
-    tmp_target_config.compile_rope = True   # enable rope compilation for benchmarking
+    tmp_target_config.compile_rope = compile_rope
+    tmp_target_config.make_sampling_tensor_strategy = make_sampling_tensor_strategy
 
     return tmp_target_config

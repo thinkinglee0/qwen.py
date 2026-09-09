@@ -51,12 +51,12 @@ def _test_benchmark(engine: LLMEngine, input_ids:list[list[int]], tok, max_new_t
                 f.write(line.encode())
 
     num_output_ids = sum([len(o) for o in output_ids])
-    logger.info(f"Benchmark results: {elapsed} seconds, rate: {num_output_ids/elapsed} /s")
+    logger.info(f"Benchmark results: {round(elapsed, 2)} seconds, rate: {round(num_output_ids/elapsed, 2)} /s")
 
 def test_benchmark_on_pc(target_engine_for_pc_benchmarking, batch_for_regular_benchmarking, tokenizer):
     _test_benchmark(target_engine_for_pc_benchmarking, batch_for_regular_benchmarking, tok=tokenizer, save_output=True)
 
-# pytest -x --log-file-level=DEBUG tests/test_benchmark.py::test_benchmark_sharegpt --max_model_len=512 --req_num=512 --max_num_seqs=16
+# pytest -x --log-file-level=DEBUG tests/test_benchmark.py::test_benchmark_sharegpt --max-model-len=512 --req-num=512 --max-num-seqs=16
 # excluded from execution from file, only allowed from specified execution.
 def test_benchmark_sharegpt(target_engine_for_sharegpt_benchmarking, sharegpt_batch, tokenizer):
     _test_benchmark(target_engine_for_sharegpt_benchmarking, sharegpt_batch, tok=tokenizer, save_output=True)
@@ -148,7 +148,7 @@ def test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold(tmp_tar
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-# pytest tests/test_benchmark.py::test_parse_metrics_sweep_batch_size --log_dir=log_vast/log3
+# pytest tests/test_benchmark.py::test_parse_metrics_sweep_batch_size --log-dir=log_vast/log3
 def test_parse_metrics_sweep_batch_size(log_dir: str):
     dir_path = Path(log_dir)
     assert dir_path.exists()

@@ -104,11 +104,12 @@ class ModelConfig():
     req_metrics_interval: float = 60               # sec
     cache_verification_interval: float = 60 # sec
 
-    # rope compilation
-    compile_rope: bool | None = None   # None = 自动：CUDA 上开，CPU/mac 上关
-
     # log
     log_dir: str = LOG_DIR
+
+    # optimization switches
+    compile_rope: bool | None = None   # rope compilation. None = automatically: CUDA on, CPU/mac off
+    make_sampling_tensor_strategy: int = 0  # 0 = single tensors, 1 = one staging tensor
 
     def __post_init__(self):
         assert self.block_size % 256 == 0, f"flash-attn paged KV requires block_size % 256 == 0, got {self.block_size}"
@@ -142,10 +143,10 @@ class ModelConfig():
         self.eos_token_id = None
         self.eos_token_id_set = _normalize_eos(self.eos_token_id)
 
-    def as_json(self):
+    def as_json(self) -> str:
         EXCLUDE = frozenset({"weights"})
         tmp_dict = {f.name: getattr(self, f.name) for f in dataclasses.fields(self) if f.name not in EXCLUDE}
-        return orjson.dumps(tmp_dict, default=_orjson_default)
+        return orjson.dumps(tmp_dict, default=_orjson_default).decode()
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":

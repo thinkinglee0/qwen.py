@@ -1,6 +1,8 @@
 import pytest
 import logging
+import dataclasses
 
+from qwen.config import ModelConfig
 from utils import parse_env_list_value
 
 logger = logging.getLogger(__name__)
@@ -23,5 +25,8 @@ def test_parse_env_list_value_uses_default_when_var_missing(monkeypatch):
     assert parse_env_list_value("TEST_PARSE_ENV_LIST_VALUE", ["left", "right"]) == ["left", "right"]
 
 
-def test_config(tmp_target_config_for_sharegpt_benchmarking):
-    logger.info(f"config to json: {tmp_target_config_for_sharegpt_benchmarking.as_json()}")
+def test_config(tmp_target_config_for_sharegpt_benchmarking: ModelConfig, compile_rope:bool):
+    logger.info(f"compile_rope: {compile_rope}")
+    tmp_target_config_for_sharegpt_benchmarking.compile_rope = compile_rope
+    cfg = dataclasses.replace(tmp_target_config_for_sharegpt_benchmarking, weights=None)    # deep copy without weights
+    logger.info(f"config to json: {cfg.as_json()}")

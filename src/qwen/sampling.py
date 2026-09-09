@@ -35,7 +35,7 @@ class TensorSampling:
                 size=(bsz,), 
                 fill_value=config.temperature, 
                 device=config.device,
-                dtype=config.dtype
+                dtype=torch.float32
             )
         if self.top_k is None:
             self.top_k = torch.full(
@@ -49,45 +49,54 @@ class TensorSampling:
                 size=(bsz,), 
                 fill_value=config.top_p, 
                 device=config.device,
-                dtype=config.dtype
+                dtype=torch.float32
             )
         if self.rep_pen is None:
             self.rep_pen = torch.full(
                 size=(bsz,), 
                 fill_value=config.repetition_penalty, 
                 device=config.device,
-                dtype=config.dtype
+                dtype=torch.float32
             )
         if self.freq_pen is None:
             self.freq_pen = torch.full(
                 size=(bsz,), 
                 fill_value=config.frequency_penalty, 
                 device=config.device,
-                dtype=config.dtype
+                dtype=torch.float32
             )
         if self.pres_pen is None:
             self.pres_pen = torch.full(
                 size=(bsz,), 
                 fill_value=config.presence_penalty, 
                 device=config.device,
-                dtype=config.dtype
+                dtype=torch.float32
             )
-
-    # @classmethod
-    # def from_sampling_list(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
-    #     return cls(
-    #         config=config,
-    #         bsz=bsz,
-    #         temperature=torch.tensor([sampling.temperature if sampling is not None and sampling.temperature is not None else config.temperature for sampling in samplings], device=config.device, dtype=config.dtype),
-    #         top_k=torch.tensor([sampling.top_k if sampling is not None and sampling.top_k is not None else config.top_k for sampling in samplings], device=config.device, dtype=torch.int64),
-    #         top_p=torch.tensor([sampling.top_p if sampling is not None and sampling.top_p is not None else config.top_p for sampling in samplings], device=config.device, dtype=config.dtype),
-    #         rep_pen=torch.tensor([sampling.rep_pen if sampling is not None and sampling.rep_pen is not None else config.repetition_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
-    #         freq_pen=torch.tensor([sampling.freq_pen if sampling is not None and sampling.freq_pen is not None else config.frequency_penalty for sampling in samplings], device=config.device, dtype=config.dtype),
-    #         pres_pen=torch.tensor([sampling.pres_pen if sampling is not None and sampling.pres_pen is not None else config.presence_penalty for sampling in samplings], device=config.device, dtype=config.dtype)
-    #     )
 
     @classmethod
     def from_sampling_list(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+        if config.make_sampling_tensor_strategy == 0:
+            return cls.from_sampling_list_0(samplings, config, bsz)
+        if config.make_sampling_tensor_strategy == 1:
+            return cls.from_sampling_list_1(samplings, config, bsz)
+
+        raise ValueError(f"Unknown sampling tensor strategy: {config.make_sampling_tensor_strategy}")
+
+    @classmethod
+    def from_sampling_list_0(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+        return cls(
+            config=config,
+            bsz=bsz,
+            temperature=torch.tensor([sampling.temperature if sampling is not None and sampling.temperature is not None else config.temperature for sampling in samplings], device=config.device, dtype=torch.float32),
+            top_k=torch.tensor([sampling.top_k if sampling is not None and sampling.top_k is not None else config.top_k for sampling in samplings], device=config.device, dtype=torch.int64),
+            top_p=torch.tensor([sampling.top_p if sampling is not None and sampling.top_p is not None else config.top_p for sampling in samplings], device=config.device, dtype=torch.float32),
+            rep_pen=torch.tensor([sampling.rep_pen if sampling is not None and sampling.rep_pen is not None else config.repetition_penalty for sampling in samplings], device=config.device, dtype=torch.float32),
+            freq_pen=torch.tensor([sampling.freq_pen if sampling is not None and sampling.freq_pen is not None else config.frequency_penalty for sampling in samplings], device=config.device, dtype=torch.float32),
+            pres_pen=torch.tensor([sampling.pres_pen if sampling is not None and sampling.pres_pen is not None else config.presence_penalty for sampling in samplings], device=config.device, dtype=torch.float32)
+        )
+
+    @classmethod
+    def from_sampling_list_1(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
         def pick(attr: str, default):
             return [getattr(s, attr) if s is not None and getattr(s, attr) is not None else default
                     for s in samplings]
