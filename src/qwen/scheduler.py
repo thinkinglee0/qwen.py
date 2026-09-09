@@ -136,17 +136,18 @@ class SchedulerOutput:
         self.finished: list[bool] = [req.finished for req in self.reqs]
 
         # metrics
-        num_prefill_tokens, num_decode_tokens = 0, 0
+        num_prefill, num_prefill_tokens, num_decode_tokens = 0, 0, 0
         for req in self.reqs:
             if req.metrics.first_schedule_time is None:
                 req.metrics.first_schedule_time = time.perf_counter()
             if not req.is_decoding:
                 # prefill
+                num_prefill += 1
                 num_prefill_tokens += scheduled[req.request_id].want
                 req.metrics.num_prefill_chunk += 1
             else:
                 # decode
-                num_decode_tokens += scheduled[req.request_id].want
+                num_decode_tokens += 1
 
         self.step_metrics: SchedulerStepMetrices | None = None
         if scheduler is not None:
@@ -156,7 +157,8 @@ class SchedulerOutput:
             metrics_dict = {
                 "step": step,
                 "bz": self.batch_size,
-                "n_p": num_prefill_tokens,
+                "n_p": num_prefill,
+                "n_p_tok": num_prefill_tokens,
                 "n_d": num_decode_tokens,
                 "run": len(scheduler.running),
                 "wait": len(scheduler.waiting),
@@ -270,15 +272,19 @@ class Scheduler:
     def commit_step(self, sch_out: SchedulerOutput, num_truncated:int):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"call commit_step, ")
+        fin = 0
         for req in sch_out.reqs:
             if req.finished:
                 self.cleanup_on_finished(req=req)
+                fin += 1
 
         self.sch_metrics.report_on_truncated(num_truncated)
 
-        if sch_out.step_metrics is not None and not sch_out.step_metrics.is_stopped():
-            assert len(sch_out.step_metrics.pending_evs) == 1   # there should be only one pending event, which is "ci"
-            sch_out.step_metrics.stop("ci") # "ci" set in engine.forward usually
+        if sch_out.step_metrics is not None:
+            sch_out.step_metrics.fin = fin      # number of finished reqs in this step
+            if not sch_out.step_metrics.is_stopped():
+                assert len(sch_out.step_metrics.pending_evs) == 1   # there should be only one pending event, which is "ci"
+                sch_out.step_metrics.stop("ci") # "ci" set in engine.forward usually
         self.log_metrics(sch_out=sch_out)
 
     def cleanup_on_finished(self, req: ModelRequest):
@@ -648,7 +654,7 @@ class Scheduler:
                                      is_benchmarking=self.is_benchmarking, config=self.config)
         logger.info(f"analyzed scheduler metrics: {json_bytes.decode()}")
 
-        # save to file
+        # save scheduler metrics to file
         log_path = Path(self.config.log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
         stats_path = log_path / f'sch_metrics.{self.log_name_flag}.json'
@@ -656,6 +662,19 @@ class Scheduler:
             f.write(json_bytes)
             f.write(b"\n")
             f.flush()
+
+        if is_exiting and self.is_benchmarking:
+            # save benchmark metrics to file
+            assert len(self.total_metrics) > 0
+            json_bytes = analyze_metrics(req_metrics_list=self.total_metrics,
+                                        sch_metrics=self.sch_metrics,
+                                        is_benchmarking=True, config=self.config)
+            logger.info(f"benchmark_metrics: {json_bytes.decode()}")
+            stats_log_file = log_path / f'benchmark_metrics.{self.log_name_flag}.json'
+            with open(stats_log_file, "wb") as f:
+                f.write(json_bytes)
+                f.write(b"\n")
+                f.flush()
 
     def log_step_metrics(self, sch_out: SchedulerOutput):
         assert sch_out.step_metrics and sch_out.step_metrics.is_stopped(), "step_metrics must be stopped before logging"

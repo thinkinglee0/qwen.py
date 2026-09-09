@@ -20,9 +20,12 @@ def get_apply_rotary(compile: bool):
     # So HF-parity tests must run eager; serving can take the compiled path's speed.
     global _compiled_apply_rotary
     if not compile:
+        logger.info("Using eager path for apply_rotary")
         return apply_rotary
     if _compiled_apply_rotary is None:
         _compiled_apply_rotary = torch.compile(apply_rotary, dynamic=True, fullgraph=True)
+
+    logger.info("Using compiled path for apply_rotary")
     return _compiled_apply_rotary
 
 class BaseRoPE(nn.Module):

@@ -110,6 +110,9 @@ echo "==> project deps"
 pip install --no-cache-dir -c /opt/constraints.txt einops
 [ -f "${REQ}" ] && pip install --no-cache-dir -c /opt/constraints.txt -r "${REQ}"
 
+# for Linux
+apt install -y screen
+
 echo "==> verify"
 python -c "
 import torch, flash_attn, transformers

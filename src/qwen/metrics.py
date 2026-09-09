@@ -58,10 +58,12 @@ class SchedulerStepMetrices:
 
     step: int = 0       # step_id
     bz: int = 0         # batch_size
-    n_p: int = 0        # number_prefill_tokens
-    n_d: int = 0        # number_decode_tokens
+    n_p: int = 0        # number_prefill_requests
+    n_p_tok: int = 0    # number_prefill_tokens
+    n_d: int = 0        # number_decode_tokens = number_decode currently
     run: int = 0        # num_running
     wait: int = 0       # num_waiting
+    fin: int = 0        # number of finished requests after this step will be set at the end of the step commit_step
     blk_used: int = 0   # kv_blocks_used
     sched: float = 0.
     sched_pre: float = 0.

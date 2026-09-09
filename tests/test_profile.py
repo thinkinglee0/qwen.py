@@ -89,7 +89,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
     assert kv_drift < 0.05
 
     cfg = tmp_target_config_for_sharegpt_benchmarking
-    cfg.eos_token_id = []      # ignore eos
+    cfg.ignore_eos()
     cfg.max_num_seqs = batch_size
     cfg.max_model_len = 1024
     cfg.max_num_batched_tokens = 8*1024
@@ -97,6 +97,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
     cfg.num_blocks = 1024*2
     cfg.max_waiting = batch_size    # exactly one wave, no refill needed
     cfg.use_d_first_schedule = use_d_first_schedule
+    logger.info(f"after localized: {cfg.as_json()}")
 
     assert cfg.device is not None
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")

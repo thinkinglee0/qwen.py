@@ -14,6 +14,15 @@ from qwen.constants import LOG_DIR
 
 logger = logging.getLogger(__name__)
 
+def _orjson_default(obj):
+    if isinstance(obj, torch.dtype):
+        return str(obj)     # "torch.float16"
+    if isinstance(obj, torch.device):
+        return str(obj)     # "cuda:0", "cpu", "cuda"
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj)  # sorted for deterministic output
+    raise TypeError
+
 def _normalize_eos(value: int | Iterable[int] | None) -> frozenset[int]:
     """HF configs expose eos_token_id as int, list[int], or None."""
     if value is None:
@@ -128,6 +137,15 @@ class ModelConfig():
     def set_default_compile_rope(self):
         assert self.device is not None, "device is not set"
         self.compile_rope = self.device.type == "cuda"  # enable rope compilation for CUDA
+
+    def ignore_eos(self):
+        self.eos_token_id = None
+        self.eos_token_id_set = _normalize_eos(self.eos_token_id)
+
+    def as_json(self):
+        EXCLUDE = frozenset({"weights"})
+        tmp_dict = {f.name: getattr(self, f.name) for f in dataclasses.fields(self) if f.name not in EXCLUDE}
+        return orjson.dumps(tmp_dict, default=_orjson_default)
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "ModelConfig":
