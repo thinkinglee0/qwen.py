@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field, asdict, fields
+from typing import ClassVar
 import numpy as np
 import logging
 import time
@@ -13,8 +14,9 @@ from qwen.config import ModelConfig
 logger = logging.getLogger(__name__)
 
 class StepEvents:
-    """CUDA events for one step. record() is async; read() must run after a sync."""
+    """CUDA events for one step. record() is async; read() must run after a sync (e.g.: next_tokens.tolist())."""
 
+    # shared across all instances
     SEGMENTS = ("fwd", "logits", "sample", "rope")
 
     def __init__(self):
@@ -40,7 +42,7 @@ class StepEvents:
 
         if seg not in self.SEGMENTS:
             return
-        
+
         self._ev[seg][1].record()  # type: ignore[call-arg]
 
     def read(self) -> dict[str, float]:
@@ -51,12 +53,17 @@ class StepEvents:
         return {f"{s}_gpu": a.elapsed_time(b) for s, (a, b) in self._ev.items()}
 
 @dataclass
-class SchedulerStepMetrices:
-    EXCLUDE = frozenset({"EXCLUDE", "events", "pending_evs"})
-    events = StepEvents()
+class SchedulerStepMetrics:
+    # ClassVar: one frozenset shared by all instances (not a dataclass field itself).
+    # Names listed here are skipped when summing in merge() and when building output_dict().
+    EXCLUDE: ClassVar[frozenset[str]] = frozenset({"events", "pending_evs"})
+
+    # NOTE: needs the annotation + default_factory. A bare `events = StepEvents()` is a plain
+    # class attribute shared by every instance, so all 24 layers would record into one event dict.
+    events: StepEvents = field(default_factory=StepEvents, repr=False, compare=False)
     pending_evs: deque[tuple[str, float]] = field(default_factory=deque, repr=False)
 
-    step: int = 0       # step_id
+    step_id: int = 0       # step_id
     bz: int = 0         # batch_size
     n_p: int = 0        # number_prefill_requests
     n_p_tok: int = 0    # number_prefill_tokens
@@ -65,6 +72,8 @@ class SchedulerStepMetrices:
     wait: int = 0       # num_waiting
     fin: int = 0        # number of finished requests after this step will be set at the end of the step commit_step
     blk_used: int = 0   # kv_blocks_used
+
+    step: float = 0.
     sched: float = 0.
     sched_pre: float = 0.
     sched_run: float = 0.
@@ -101,17 +110,45 @@ class SchedulerStepMetrices:
     def is_stopped(self) -> bool:
         return len(self.pending_evs) == 0
 
+    def merge(self, other: 'SchedulerStepMetrics'):
+        # merge the events from other into self, and sum the metrics
+        for k, v in other.events.read().items():
+            setattr(other, k, v)
+
+        for f in fields(self):
+            if f.name not in self.EXCLUDE:
+                setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
+
     def output_dict(self):
         for k, v in self.events.read().items():
+            assert k != "rope_gpu"
             setattr(self, k, v)
-        
+
         return {f.name: getattr(self, f.name)
                     for f in fields(self)
                     if f.name not in self.EXCLUDE}
 
+class timed:
+    __slots__ = ("metrics", "ev")
+
+    def __init__(self, metrics: SchedulerStepMetrics | None, ev: str):
+        self.metrics = metrics
+        self.ev = ev
+
+    def __enter__(self):
+        if self.metrics is not None:
+            self.metrics.start(self.ev)
+        return self.metrics
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.metrics is not None:
+            self.metrics.stop(self.ev)
+        return False
+
+
 @dataclass
-class SchedulerMetrices:
-    step: int = 0               # step_id
+class SchedulerMetrics:
+    step_id: int = 0               # step_id
     num_cache_exhausted: int = 0
     num_preempted: int = 0      # number of preempted reqeusts
     num_scheduled: int = 0      # number of scheduled reqeusts
@@ -183,7 +220,7 @@ def summarize(samples: list[float], scale: float = 1e3) -> dict[str, float]:
     }
 
 
-def analyze_metrics(req_metrics_list: list[RequestMetrics], sch_metrics: SchedulerMetrices, is_benchmarking:bool, config: ModelConfig) -> bytes:
+def analyze_metrics(req_metrics_list: list[RequestMetrics], sch_metrics: SchedulerMetrics, is_benchmarking:bool, config: ModelConfig) -> bytes:
     req_cnt = len(req_metrics_list)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"req_cnt:{req_cnt}, req_metrics_list: {req_metrics_list}")

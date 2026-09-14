@@ -23,7 +23,7 @@ class QwenModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.layers = nn.ModuleList(
-            [DecoderLayer(config, layer_idx, self.rope) for layer_idx in range(config.num_hidden_layers)]
+            [DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
 
     def forward(self, input_ids: torch.Tensor, meta: AttentionMetadata) -> torch.Tensor:
@@ -41,6 +41,8 @@ class QwenForCausalLM(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = dataclasses.replace(config, weights=None)    # deep copy without weights
+        logger.info(f"localized config (without weights): {self.config.as_json()}")
+
         self.config.weights = config.weights   # shallow copy, keep the original weights
 
         self.device = self.config.device     # resolved in config

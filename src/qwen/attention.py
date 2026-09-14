@@ -11,7 +11,7 @@ from qwen.config import ModelConfig
 from qwen.cache import KVCacheData
 from qwen.scheduler import SchedulerOutput
 from qwen.rope import BaseRoPE
-from qwen.metrics import SchedulerStepMetrices
+from qwen.metrics import SchedulerStepMetrics, timed
 
 
 # attention backend selection — resolved once at import
@@ -45,7 +45,6 @@ def _bottom_right_causal_bias(q_len: int, k_len: int, device: torch.device, dtyp
 
 @dataclass
 class AttentionMetadata:
-    cache: KVCacheData
 
     # query side
     cu_seqlens_q: Tensor   # (num_seqs + 1,) prefix-sum of query lengths
@@ -60,15 +59,23 @@ class AttentionMetadata:
     # block_tables: list[list[int]]   # [num_seqs, num_blocks]
     # k_lens:       list[int]         # 
 
-    position_ids: Tensor    # rope
     slot_mapping: Tensor    # scatter q/v projections to kv cache
+    position_ids: Tensor    # rope
+    rope: BaseRoPE | None = None
+    cos_sin: tuple[Tensor, Tensor] | None = None   # optional pre-gathered cos/sin for rope
 
     # metrics
-    step_metrics: SchedulerStepMetrices | None = None
+    step_metrics_lst: list[SchedulerStepMetrics] | None = None
+
+    cache: KVCacheData | None = None
 
     # debug cache issue
     debug_k_list: list[Tensor] | None = None
     debug_v_list: list[Tensor] | None = None
+
+    def layer_metrics(self, layer_index: int) -> SchedulerStepMetrics | None:
+        """Per-layer metrics slot, or None when metrics collection is off."""
+        return self.step_metrics_lst[layer_index] if self.step_metrics_lst is not None else None
 
 def build_block_table(tables, device):
     max_blocks = max(len(t) for t in tables)
@@ -84,7 +91,7 @@ def build_block_table(tables, device):
 
     return bt   # [num_seqs, max_blocks];  padding entries never read, truncated by seqused_k
 
-def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, config: ModelConfig) -> tuple[Tensor, AttentionMetadata]:
+def build_attn_metadata(sch_out: SchedulerOutput, config: ModelConfig, cache_data: KVCacheData | None = None, rope: BaseRoPE | None = None) -> tuple[Tensor, AttentionMetadata]:
     # packing
     packed_id_list: list[int] = []
     lens: list[int] = []
@@ -123,14 +130,23 @@ def build_attn_metadata(sch_out: SchedulerOutput, cache_data: KVCacheData, confi
     position_ids = torch.tensor(position_id_lst, device=device, dtype=torch.int32)
     slot_mapping = torch.tensor(slots, device=device, dtype=torch.int64)
 
+    # optional pre-gathered cos/sin for rope
+    cos_sin = rope.gather_cos_sin(position_ids) if rope is not None else None
+
     block_table = build_block_table(sch_out.block_tables, device)
 
-    return packed_ids, AttentionMetadata(cache=cache_data,
+    # for each layer
+    step_metrics_lst = None
+    if sch_out.step_metrics is not None:
+        step_metrics_lst = [SchedulerStepMetrics() for _ in range(config.num_hidden_layers)]
+
+    return packed_ids, AttentionMetadata(cache=cache_data, rope=rope,
                              cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
                              cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max_seqlen_k,
                              cache_seqlens=cache_seqlens, block_table=block_table,
                              position_ids=position_ids, slot_mapping=slot_mapping,
-                             step_metrics=sch_out.step_metrics,
+                             cos_sin=cos_sin,
+                             step_metrics_lst=step_metrics_lst,
                              )
 
 def sdpa_one_seq(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -217,10 +233,9 @@ def scatter_to_kv_cache(k_cache, v_cache, k, v, slot_mapping):
     v_flat.index_copy_(0, slot_mapping, v.to(v_flat.dtype))
 
 class Attention(nn.Module):
-    def __init__(self, cfg: ModelConfig, layer_index: int, rope: BaseRoPE):
+    def __init__(self, cfg: ModelConfig, layer_index: int):
         super().__init__()
         self.layer_index = layer_index
-        self.rope = rope
 
         self.num_query_heads = cfg.num_attention_heads
         self.num_key_value_heads = cfg.num_key_value_heads
@@ -248,6 +263,8 @@ class Attention(nn.Module):
         )                                       # [T, Hq, D]
 
     def forward(self, hidden_states: Tensor, meta: AttentionMetadata) -> Tensor:
+        assert meta.cache is not None and meta.rope is not None, "cache and rope must be provided in AttentionMetadata"
+
         # [T, hidden_size]
         T, _ = hidden_states.size()
 
@@ -256,13 +273,12 @@ class Attention(nn.Module):
         key_states = self.k_proj(hidden_states).view(T, self.num_key_value_heads, self.head_dim)
         value_states = self.v_proj(hidden_states).view(T, self.num_key_value_heads, self.head_dim)
 
-        # rope
-        if meta.step_metrics is None:
-            query_states, key_states = self.rope.forward(query_states, key_states, meta.position_ids)
-        else:
-            meta.step_metrics.start("rope")
-            query_states, key_states = self.rope.forward(query_states, key_states, meta.position_ids)
-            meta.step_metrics.stop("rope")
+        # rope -- timing is a no-op when metrics collection is off
+        with timed(meta.layer_metrics(self.layer_index), "rope"):
+            if meta.cos_sin is not None:
+                query_states, key_states = meta.rope.forward2(query_states, key_states, *meta.cos_sin)
+            else:
+                query_states, key_states = meta.rope.forward(query_states, key_states, meta.position_ids)
 
         # debug
         if meta.debug_k_list is not None and meta.debug_v_list is not None:

@@ -6,6 +6,7 @@ import torch
 import asyncio
 from typing import AsyncIterator
 
+from qwen.metrics import SchedulerStepMetrics, timed
 from qwen.model import QwenForCausalLM
 from qwen.attention import build_attn_metadata
 from qwen.sampling import Sampling
@@ -28,7 +29,9 @@ class LLMEngine:
         self.scheduler = Scheduler(config=self.model.config)
 
     def step(self) -> bool:
-        sch_out = self.scheduler.schedule()
+        step_metrics = SchedulerStepMetrics()
+        step_metrics.start("step")
+        sch_out = self.scheduler.schedule(step_metrics=step_metrics)
         if sch_out is None:
             logger.info("Scheduler: no work, next loop iteration")
             return False
@@ -41,34 +44,39 @@ class LLMEngine:
     def forward(self, sch_out: SchedulerOutput):
         assert sch_out.step_metrics is not None
 
-        sch_out.step_metrics.start("bld_meta")
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"batch size: {len(sch_out.reqs)}")
 
-        packed_input_ids, md = build_attn_metadata(
-            sch_out, self.scheduler.cache.data, config=self.model.config)
-        sch_out.step_metrics.stop("bld_meta")
+        with timed(sch_out.step_metrics, "bld_meta"):
+            packed_input_ids, md = build_attn_metadata(
+                sch_out,
+                cache_data=self.scheduler.cache.data,
+                config=self.model.config,
+                rope=self.model.model.rope)
 
-        sch_out.step_metrics.start("fwd")
-        # torch.cuda.set_sync_debug_mode("error")
-        hidden = self.model.forward(packed_input_ids, md)       # [total_tokens, H]
-        # torch.cuda.set_sync_debug_mode("default")
-        sch_out.step_metrics.stop("fwd")
+        with timed(sch_out.step_metrics, "fwd"):
+            # torch.cuda.set_sync_debug_mode("error")
+            hidden = self.model.forward(packed_input_ids, md)       # [total_tokens, H]
+            # torch.cuda.set_sync_debug_mode("default")
 
-        sch_out.step_metrics.start("logits")
-        # gather each seq's LAST token -> logits -> first generated token
-        last_idx = md.cu_seqlens_q[1:] - 1          # [B]
-        logits = self.model.compute_logits(hidden[last_idx])   # [B, vocab]
-        sch_out.step_metrics.stop("logits")
+        with timed(sch_out.step_metrics, "logits"):
+            # gather each seq's LAST token -> logits -> first generated token
+            last_idx = md.cu_seqlens_q[1:] - 1          # [B]
+            logits = self.model.compute_logits(hidden[last_idx])   # [B, vocab]
 
-        sch_out.step_metrics.start("sample")
-        next_tokens = self.model.sampler(logits, sch_out)          # [B]
-        sch_out.step_metrics.stop("sample")
+        with timed(sch_out.step_metrics, "sample"):
+            next_tokens = self.model.sampler(logits, sch_out)          # [B]
 
-        sch_out.step_metrics.start("dth")
-        next_tokens_cpu = next_tokens.tolist()
-        sch_out.step_metrics.stop("dth")
+        with timed(sch_out.step_metrics, "dth"):
+            next_tokens_cpu = next_tokens.tolist()
+
         sch_out.step_metrics.n_sample = len(next_tokens_cpu)
+
+        # merge md.step_metrics_lst to sch_out.step_metrics
+        # must be placed after next_tokens.tolist(), a synchronous operation, otherwise all events would be not ready.
+        if md.step_metrics_lst:
+            for layer_metrics in md.step_metrics_lst:
+                sch_out.step_metrics.merge(layer_metrics)
 
         sch_out.step_metrics.start("ci")
         num_truncated = sch_out.add_sampled_tokens(next_tokens_cpu, self.model.config.eos_token_id_set)
@@ -175,7 +183,9 @@ class ServingDriver:
                         break
 
                     # may return None when the waiting is not empty due to backoff
-                    scheduler_output = self.engine.scheduler.schedule()
+                    step_metrics = SchedulerStepMetrics()
+                    step_metrics.start("step")
+                    scheduler_output = self.engine.scheduler.schedule(step_metrics=step_metrics)
 
                 if not scheduler_output:
                     if logger.isEnabledFor(logging.DEBUG):
@@ -184,17 +194,25 @@ class ServingDriver:
 
                 self.engine.forward(sch_out=scheduler_output)
             except Exception as e:
-                logger.exception("Error occurred in schedule or _generate")
-                try:
-                    if scheduler_output is not None:
-                        for req in scheduler_output.reqs:
-                            self.engine.scheduler.cleanup_on_error(req=req, e=e)
-                    else:
-                        # error occured in schedule, clean up the running queue
-                        self.engine.scheduler.cleanup_running_on_error(e=e)
+                logger.exception("Error occurred in schedule or forward")
+                self._cleanup_on_error(scheduler_output, e)
 
-                except RuntimeError as e:
-                    logger.exception(f"runtime error when clean up {req.request_id}")
+    def _cleanup_on_error(self, scheduler_output: SchedulerOutput | None, e: Exception):
+        """Best-effort cleanup after a failed step: never let it raise out of run_loop."""
+        if scheduler_output is None:
+            # the error occurred in schedule(), so there is no batch to blame: drop the running queue
+            try:
+                self.engine.scheduler.cleanup_running_on_error(e=e)
+            except Exception:
+                logger.exception("error while cleaning up the running queue")
+            return
+
+        # keep going over the whole batch even if one request fails to clean up
+        for req in scheduler_output.reqs:
+            try:
+                self.engine.scheduler.cleanup_on_error(req=req, e=e)
+            except Exception:
+                logger.exception(f"error while cleaning up {req.request_id}")
 
 async def async_generate(
     driver: ServingDriver,

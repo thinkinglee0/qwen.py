@@ -93,12 +93,12 @@ def test_build_attn_metadata(tmp_target_config):
 
     block_tables: list[list[int]] = [[100], [200, 400], [300]]
 
-    sch_out = SchedulerOutput(step=0, reqs=[req1, req2, req3], scheduled=scheduled,
+    sch_out = SchedulerOutput(step_id=0, reqs=[req1, req2, req3], scheduled=scheduled,
                               block_tables=block_tables, config=tmp_target_config, scheduler=None)
     assert sch_out.tensor_sampling.temperature is not None and sch_out.tensor_sampling.temperature.tolist() == [1.0]*3
     assert sch_out.tensor_sampling.top_k is not None and sch_out.tensor_sampling.top_k.tolist() == [3]*3
 
-    packed_ids, md = build_attn_metadata(sch_out, cache_data=None, config=tmp_target_config)
+    packed_ids, md = build_attn_metadata(sch_out, cache_data=None, config=tmp_target_config, rope=None)
 
     assert len(packed_ids) == 6
     assert packed_ids.tolist() == req1.input_ids[req1.num_computed_tokens:req1.num_computed_tokens+s_info_1.want] \

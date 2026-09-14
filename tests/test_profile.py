@@ -81,7 +81,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
     '''
     logger.info(f"batch_size: {batch_size}, use_d_first_schedule: {use_d_first_schedule}")
 
-    PROMPT_LEN, WARMUP_STEPS, PROFILE_STEPS = 256, 32, 5
+    PROMPT_LEN, WARMUP_STEPS, PROFILE_STEPS = 512, 32, 5
     output_len = WARMUP_STEPS + PROFILE_STEPS*2 + 1    # ensure that it does not hit the max_new_tokens ceiling before profiling finishes.
 
     kv_drift = PROFILE_STEPS / (PROMPT_LEN + WARMUP_STEPS)
@@ -94,10 +94,9 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
     cfg.max_model_len = 1024
     cfg.max_num_batched_tokens = 8*1024
     cfg.long_prefill_token_threshold = 8*1024
-    cfg.num_blocks = 1024*2
+    cfg.num_blocks = int(1024*5.5)
     cfg.max_waiting = batch_size    # exactly one wave, no refill needed
     cfg.use_d_first_schedule = use_d_first_schedule
-    logger.info(f"after localized: {cfg.as_json()}")
 
     assert cfg.device is not None
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -142,7 +141,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
         # run B: interleave
         torch.cuda.synchronize()
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                     with_stack=True,
+                    #  with_stack=True,     # only needed for export_stacks() -- not needed for key_averages() or export_chrome_trace()
                      experimental_config=_ExperimentalConfig(verbose=True, enable_cuda_sync_events=True)) as prof:
             for _ in range(PROFILE_STEPS):
                 engine.step()
@@ -199,7 +198,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
                     f"gpu_idle_fraction={1 - gpu_utilization:.1%}")
         logger.info(f"key_averages len: {len(ka)} distinct rows")
         logger.info(ka.table(sort_by=_ATTR, row_limit=-1))
-        logger.info(ka.table(sort_by="self_cpu_time_total", row_limit=-1))
+        # logger.info(ka.table(sort_by="self_cpu_time_total", row_limit=-1))
     finally:
         # explicitly release kv cache
         if engine is not None:

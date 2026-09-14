@@ -9,7 +9,7 @@ from qwen.config import ModelConfig
 from qwen.scheduler import SchedulerOutput, ModelRequest, ScheduledInfo, Scheduler
 from qwen.sampling import Sampling, TensorSampling
 from qwen.cache import cdiv
-from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrices
+from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrics
 from constants import TOK, TOK_EOS
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ def test_schedule(tmp_target_config: ModelConfig):
     # req3: P, i_len=300, o_len=0, num_computed_tokens=0
     for req in sch.running:
         req.metrics.first_schedule_time = None  # for counters
-    sch.sch_metrics = SchedulerMetrices()   # reset counters
+    sch.sch_metrics = SchedulerMetrics()   # reset counters
     sch_out2 = sch.preemptive_schedule()
     assert sch_out2 is not None
     assert sch_out.reqs == sch_out2.reqs
@@ -237,7 +237,7 @@ def test_schedule(tmp_target_config: ModelConfig):
     sch.req_metrics_list = []
     for req in sch.running:
         req.metrics.first_schedule_time = None  # for counters
-    sch.sch_metrics = SchedulerMetrices()
+    sch.sch_metrics = SchedulerMetrics()
 
     sch_out = sch.preemptive_schedule()    # expected want [1, 200, 1]
     assert sch_out is not None
@@ -356,7 +356,7 @@ def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, su
     assert not preempted_req.is_decoding
     assert preempted_req.num_computed_tokens == 0
     assert preempted_req.metrics.first_schedule_time is not None     # do not reset first_schedule_time on preemption
-    assert preempted_req.preempt_count == 1 and preempted_req.not_before_step == sch.sch_metrics.step + 1     # not be delayed the first time it's preempted
+    assert preempted_req.preempt_count == 1 and preempted_req.not_before_step == sch.sch_metrics.step_id + 1     # not be delayed the first time it's preempted
     assert sch.cache.get_block_table(preempted_req) is None
     assert sch.sch_metrics.num_preempted == 1
     assert sch.sch_metrics.num_scheduled == 1
@@ -593,7 +593,7 @@ def test_backoff(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     sch._preempt(req1, victims=victims)
     assert sch.sch_metrics.num_preempted == 1
     assert req1.request_id in victims
-    assert req1.not_before_step == sch.sch_metrics.step+1
+    assert req1.not_before_step == sch.sch_metrics.step_id+1
     assert req1 not in sch.running and req1 in list(sch.waiting)
 
     # second time to preempt manually
@@ -602,7 +602,7 @@ def test_backoff(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
     sch._preempt(req1, victims=victims)
     assert sch.sch_metrics.num_preempted == 2
     assert req1.request_id in victims
-    assert req1.not_before_step == sch.sch_metrics.step+2
+    assert req1.not_before_step == sch.sch_metrics.step_id+2
     assert req1 not in sch.running and req1 in list(sch.waiting)
 
     # req3: P, i_len=30, o_len=0, num_computed_tokens=0

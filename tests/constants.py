@@ -3,13 +3,11 @@
 # constant variables
 NINF = float("-inf")
 MAX_NEW_TOKENS_FOR_TEST = 40
-MAX_MODEL_LEN = 512
+NUM_BLOCKS_FOR_TEST = 16
+MAX_MODEL_LEN_FOR_TEST = 256
 
 # benchmark
 SHARE_GPT_FILE_NAME = "../models/sharegpt_data/ShareGPT_V3_unfiltered_cleaned_split.json"
-SHARE_GPT_REQ_NUM = 128
-SHARE_GPT_MAX_SEQS = 8
-MAX_NUM_BLOCKS = 2048
 
 DATA_DIR = "./data"
 LOG_DIR = "./log"

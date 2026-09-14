@@ -10,7 +10,7 @@ import logging
 from collections.abc import Iterable
 
 from qwen.utils import resolve_device, default_dtype
-from qwen.constants import LOG_DIR
+from qwen.constants import *
 
 logger = logging.getLogger(__name__)
 
@@ -82,18 +82,19 @@ class ModelConfig():
     weights: Any | None = None
     device: torch.device | None = None
     dtype: torch.dtype | None = None
+    cuda_device_name: str | None = None
 
     # continuous batching
     use_d_first_schedule: bool=True         # D_first_preemptive_schedule if True else preemptive_schedule
-    max_model_len: int = 512                # todo: find a suitable value.
-    max_num_batched_tokens: int = 1024      # idem
-    long_prefill_token_threshold: int = 256 # idem
-    max_num_seqs: int = 128                 # batch size; idem
-    max_waiting: int = 64                   # idem
+    max_model_len: int = DEFAULT_MAX_MODEL_LEN  # todo: find a suitable value.
+    max_num_batched_tokens: int = 1024          # idem
+    long_prefill_token_threshold: int = 256     # idem
+    max_num_seqs: int = DEFAULT_MAX_NUM_SEQS    # batch size; idem
+    max_waiting: int = DEFAULT_MAX_WAITING      # idem
 
     # paged cache
-    num_blocks: int = 1024*2   # 2 * 24 * 1024*2 * 256 * 2 * 64 * 2 B = 6442450944 B ≈ 6.4 GB
-    block_size: int = 256
+    num_blocks: int = DEFAULT_NUM_BLOCKS   # 2 * 24 * 1024*2 * 256 * 2 * 64 * 2 B = 6442450944 B ≈ 6.4 GB
+    block_size: int = BLOCK_SIZE_FOR_FLASH_ATTENTION
 
     # backoff after preempted
     backoff_base: int = 2
@@ -110,9 +111,10 @@ class ModelConfig():
     # optimization switches
     compile_rope: bool | None = None   # rope compilation. None = automatically: CUDA on, CPU/mac off
     make_sampling_tensor_strategy: int = 0  # 0 = single tensors, 1 = one staging tensor
+    pre_gather_cos_sin: bool = True
 
     def __post_init__(self):
-        assert self.block_size % 256 == 0, f"flash-attn paged KV requires block_size % 256 == 0, got {self.block_size}"
+        assert self.block_size % BLOCK_SIZE_FOR_FLASH_ATTENTION == 0, f"flash-attn paged KV requires block_size % {BLOCK_SIZE_FOR_FLASH_ATTENTION} == 0, got {self.block_size}"
 
         if self.head_dim == 0:
             self.head_dim = self.hidden_size // self.num_attention_heads
@@ -127,6 +129,8 @@ class ModelConfig():
             self.device = resolve_device()
         if self.dtype is None:
             self.dtype = default_dtype(self.device)
+        if self.cuda_device_name is None:
+            self.cuda_device_name = torch.cuda.get_device_name() if self.device.type == "cuda" else None
 
         assert self.max_model_len <= self.max_position_embeddings
 
@@ -163,7 +167,7 @@ class ModelConfig():
         valid = {f.name for f in dataclasses.fields(cls)}
         config = cls(**{k: v for k, v in raw.items() if k in valid})
 
-        logger.info(f"config: {config}")
+        logger.info(f"default config: {config}")
 
         assert config.dtype in [torch.float16, torch.bfloat16, torch.float32], f"unsupported dtype: {config.dtype}"
         config.weights = load_qwen_weights(config, config.dtype)

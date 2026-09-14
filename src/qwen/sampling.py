@@ -84,6 +84,9 @@ class TensorSampling:
 
     @classmethod
     def from_sampling_list_0(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"from_sampling_list_0: bsz: {bsz}")
+
         return cls(
             config=config,
             bsz=bsz,
@@ -97,6 +100,9 @@ class TensorSampling:
 
     @classmethod
     def from_sampling_list_1(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"from_sampling_list_1: bsz: {bsz}")
+
         def pick(attr: str, default):
             return [getattr(s, attr) if s is not None and getattr(s, attr) is not None else default
                     for s in samplings]

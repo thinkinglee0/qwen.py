@@ -11,13 +11,22 @@ regimes that a raw latency-vs-batch plot hides:
   (2) sublinear scaling   throughput gain > TPOT cost, still worth it
   (3) past the knee       TPOT cost > throughput gain, pure loss
 
-Usage: python bench_viz.py [--out fig.png]
+Usage: python bench_viz.py --log-dir DIR [--model qwen2.5-0.5b] [--out fig.png]
+
+Both outputs land next to the logs in --log-dir: the figure at --out, and the
+textual report at the same stem with a .txt suffix (concurrency_sweep.txt by
+default). Pass --stdout to print the report to the terminal instead.
+
+The roofline annotations (MBU / MFU) depend on which model was served. The
+benchmark logs do not record that, so pass --model; it defaults to the 0.5B.
 """
 
 import argparse
+import contextlib
 
 import numpy as np
 import matplotlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import orjson
@@ -26,12 +35,96 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ----------------------------------------------------------------------------
-# Hardware / model constants, used only for the roofline annotations.
-# Set to None to disable that part of the report.
+# Hardware constants, used only for the roofline annotations.
+# Set PEAK_HBM_BW_BPS to None to disable that part of the report.
 PEAK_HBM_BW_BPS = 1008e9  # RTX 4090, 24 GB GDDR6X
-WEIGHT_BYTES = 15.2e9  # Qwen2.5-7B-Instruct, fp16/bf16
-PEAK_DENSE_FLOPS = 165e12  # fp16 with fp32 accumulate
-MODEL_PARAMS = 7.6e9
+PEAK_DENSE_FLOPS = 165e12  # fp16/bf16 with fp32 accumulate, dense (non-sparse)
+HARDWARE_NAME = "RTX 4090"
+
+
+# ----------------------------------------------------------------------------
+# Model registry. Derived from the architecture instead of hard-coded totals, so
+# a new model is one row and the numbers stay auditable against config.json.
+#
+# Two different quantities are needed and they are NOT the same once embeddings
+# are untied:
+#   weight_bytes -- every distinct stored weight, streamed once per decode step
+#                   -> denominator of MBU
+#   flop_params  -- weights that are actually a GEMM: transformer body + one
+#                   lm_head pass. The input embedding is a gather, not a matmul
+#                   -> N in the 2*N*tok/s FLOP estimate, i.e. MFU
+# With tied embeddings the two coincide; with untied ones flop_params drops the
+# duplicated copy while weight_bytes keeps both.
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    hidden_size: int
+    num_hidden_layers: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    tie_word_embeddings: bool
+    dtype_bytes: int = 2  # fp16 / bf16
+
+    @property
+    def body_params(self) -> int:
+        """Transformer blocks + final norm; everything except the vocab matrices."""
+        h, d = self.hidden_size, self.head_dim
+        q, kv = self.num_attention_heads * d, self.num_key_value_heads * d
+        attn = (h * q + q) + 2 * (h * kv + kv) + q * h  # q,k,v carry a bias; o does not
+        mlp = 3 * h * self.intermediate_size
+        norms = 2 * h  # input_layernorm + post_attention_layernorm
+        return (attn + mlp + norms) * self.num_hidden_layers + h  # + model.norm
+
+    @property
+    def embed_params(self) -> int:
+        return self.vocab_size * self.hidden_size
+
+    @property
+    def total_params(self) -> int:
+        """What a checkpoint actually stores (one vocab matrix if tied, two if not)."""
+        return self.body_params + self.embed_params * (1 if self.tie_word_embeddings else 2)
+
+    @property
+    def flop_params(self) -> int:
+        """Params that do matmul work on a forward pass: body + a single lm_head."""
+        return self.body_params + self.embed_params
+
+    @property
+    def weight_bytes(self) -> float:
+        return self.total_params * self.dtype_bytes
+
+
+MODELS: dict[str, ModelSpec] = {
+    # https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/config.json
+    "qwen2.5-0.5b": ModelSpec(
+        name="Qwen2.5-0.5B-Instruct",
+        hidden_size=896,
+        num_hidden_layers=24,
+        intermediate_size=4864,
+        num_attention_heads=14,
+        num_key_value_heads=2,
+        head_dim=64,
+        vocab_size=151936,
+        tie_word_embeddings=True,
+    ),
+    # https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/config.json
+    "qwen2.5-7b": ModelSpec(
+        name="Qwen2.5-7B-Instruct",
+        hidden_size=3584,
+        num_hidden_layers=28,
+        intermediate_size=18944,
+        num_attention_heads=28,
+        num_key_value_heads=4,
+        head_dim=128,
+        vocab_size=152064,
+        tie_word_embeddings=False,
+    ),
+}
+DEFAULT_MODEL = "qwen2.5-0.5b"
+
 
 # Editorial Warm palette, kept consistent across panels.
 BG = "#faf6ef"
@@ -56,7 +149,7 @@ def interval_x(x):
     return np.sqrt(x[1:] * x[:-1])
 
 
-def report(batch, ttft, tpot, throughput):
+def report(batch, ttft, tpot, throughput, model: ModelSpec):
     """Derived per-point metrics. Every column answers a scheduling question."""
     per_req = 1000.0 / tpot  # tok/s seen by a single client
     ideal_tp = throughput[0] * batch  # perfect linear scaling from batch=1
@@ -92,11 +185,19 @@ def report(batch, ttft, tpot, throughput):
         print(f"last profitable doubling ends at batch = {knee:.0f} (gain/cost > 1)")
     print(f"saturated aggregate throughput  ~ {throughput[-1]:.0f} tok/s")
 
-    if PEAK_HBM_BW_BPS and WEIGHT_BYTES:
-        mbu = WEIGHT_BYTES / (tpot[0] * 1e-3) / PEAK_HBM_BW_BPS
-        mfu = 2 * MODEL_PARAMS * throughput[-1] / PEAK_DENSE_FLOPS
-        print(f"MBU at batch={batch[0]} (weights only)   ~ {mbu * 100:.0f} %")
-        print(f"MFU at batch={batch[-1]} (2*N*tok/s)    ~ {mfu * 100:.0f} %")
+    if PEAK_HBM_BW_BPS and PEAK_DENSE_FLOPS:
+        # Roofline numbers are only as good as the two assumptions below, and a
+        # model/hardware mismatch is silent -- so always print what was assumed.
+        print(
+            f"roofline assumes {model.name} "
+            f"({model.total_params / 1e9:.3f} B params, {model.weight_bytes / 1e9:.2f} GB "
+            f"@ {model.dtype_bytes} B/param) on {HARDWARE_NAME} "
+            f"({PEAK_HBM_BW_BPS / 1e9:.0f} GB/s, {PEAK_DENSE_FLOPS / 1e12:.0f} TFLOP/s)"
+        )
+        mbu = model.weight_bytes / (tpot[0] * 1e-3) / PEAK_HBM_BW_BPS
+        mfu = 2 * model.flop_params * throughput[-1] / PEAK_DENSE_FLOPS
+        print(f"MBU at batch={batch[0]} (weights only)   ~ {mbu * 100:.1f} %")
+        print(f"MFU at batch={batch[-1]} (2*N*tok/s)    ~ {mfu * 100:.1f} %")
     print("=" * 78)
 
 
@@ -111,15 +212,15 @@ def style(ax, title, xlabel, ylabel):
     ax.tick_params(colors=INK, labelsize=8)
 
 
-def make_figure(path, batch, ttft, tpot, itl, throughput):
+def make_figure(path, batch, ttft, tpot, itl, throughput, model: ModelSpec):
     plt.rcParams["font.family"] = "serif"
     plt.rcParams["font.serif"] = ["DejaVu Serif", "Georgia", "Charter"]
     fig, axes = plt.subplots(3, 2, figsize=(13.5, 13.0), facecolor=BG)
     fig.suptitle(
-        "Concurrency sweep: throughput / latency trade-off",
+        f"Concurrency sweep: throughput / latency trade-off\n{model.name} on {HARDWARE_NAME}",
         fontsize=14,
         color=INK,
-        y=0.985,
+        y=0.99,
     )
 
     # --- 1. throughput vs concurrency, against perfect linear scaling ---------
@@ -238,7 +339,6 @@ def make_figure(path, batch, ttft, tpot, itl, throughput):
 
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(path, dpi=140, facecolor=BG)
-    print(f"wrote {path}")
 
 
 def parse_benchmark_result(args):
@@ -308,11 +408,44 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated batch sizes to include, e.g. 1,2,4,8. Defaults to all found in --log-dir.",
     )
+    p.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        choices=sorted(MODELS),
+        help=f"Model the sweep was run against; sets the roofline constants. Default: {DEFAULT_MODEL}. "
+        "The log files do not record the model, so this must match the run.",
+    )
+    p.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print the report to the terminal instead of writing it beside the figure.",
+    )
     args = p.parse_args()
     dir_path = Path(args.log_dir)
     assert dir_path.exists()
 
-    batch, ttft, tpot, itl, throughput = parse_benchmark_result(args)
-    report(batch, ttft, tpot, throughput)
-    out_path = str(dir_path / args.out)
-    make_figure(out_path, batch, ttft, tpot, itl, throughput)
+    model = MODELS[args.model]
+    fig_path = dir_path / args.out
+    # Same stem as the figure: the two always belong to one run, so one name
+    # identifies both. with_suffix() also normalises a --out given without one.
+    report_path = fig_path.with_suffix(".txt")
+    assert report_path != fig_path, f"--out must not already be a .txt path: {args.out}"
+
+    # The report is the artifact worth keeping; sending it to a file next to the
+    # figure means a sweep no longer has to be reconstructed from a shell scrollback.
+    with contextlib.ExitStack() as stack:
+        if not args.stdout:
+            sink = stack.enter_context(open(report_path, "w"))
+            stack.enter_context(contextlib.redirect_stdout(sink))
+
+        print(f"log-dir: {dir_path}")
+        print(f"model:   {args.model} ({model.name})")
+        batch, ttft, tpot, itl, throughput = parse_benchmark_result(args)
+        report(batch, ttft, tpot, throughput, model)
+        make_figure(str(fig_path), batch, ttft, tpot, itl, throughput, model)
+
+    # back on the real stdout: say where everything went
+    print(f"wrote {fig_path}")
+    if not args.stdout:
+        print(f"wrote {report_path}")

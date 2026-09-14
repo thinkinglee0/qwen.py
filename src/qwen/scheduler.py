@@ -13,7 +13,7 @@ import uuid
 from qwen.utils import round_floats
 from qwen.sampling import TensorSampling, Sampling
 from qwen.config import ModelConfig
-from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrices, SchedulerStepMetrices
+from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrics, SchedulerStepMetrics, timed
 from qwen.cache import KVCache, cdiv
 from qwen.constants import DEFAULT_MAX_NEW_TOKEN
 
@@ -117,9 +117,9 @@ class ScheduledInfo:
         assert self.want == len(self.slots)
 
 class SchedulerOutput:
-    def __init__(self, step: int, reqs: list[ModelRequest], scheduled: dict[str, ScheduledInfo],
+    def __init__(self, step_id: int, reqs: list[ModelRequest], scheduled: dict[str, ScheduledInfo],
                  block_tables: list[list[int]], config: ModelConfig, scheduler: "Scheduler | None" = None,
-                 step_metrics: SchedulerStepMetrices | None = None):
+                 step_metrics: SchedulerStepMetrics | None = None):
         assert len(reqs) > 0, "SchedulerOutput must have at least one request"
         self.reqs = reqs
         self.scheduled = scheduled
@@ -149,27 +149,16 @@ class SchedulerOutput:
                 # decode
                 num_decode_tokens += 1
 
-        self.step_metrics: SchedulerStepMetrices | None = None
-        if scheduler is not None:
-            # Build common metrics dict
-            # use values from the arugment step_metrics if provided, otherwise create a new SchedulerStepMetrices instance
-            pending_evs = step_metrics.pending_evs if step_metrics is not None else deque()
-            metrics_dict = {
-                "step": step,
-                "bz": self.batch_size,
-                "n_p": num_prefill,
-                "n_p_tok": num_prefill_tokens,
-                "n_d": num_decode_tokens,
-                "run": len(scheduler.running),
-                "wait": len(scheduler.waiting),
-                "blk_used": scheduler.cache.pool.used(),
-                "pending_evs": pending_evs,
-            }
-
-            if step_metrics is not None:
-                self.step_metrics = dataclasses.replace(step_metrics, **metrics_dict)
-            else:
-                self.step_metrics = SchedulerStepMetrices(**metrics_dict)
+        self.step_metrics: SchedulerStepMetrics | None = step_metrics
+        if scheduler is not None and self.step_metrics is not None:
+            self.step_metrics.step_id = step_id
+            self.step_metrics.bz = self.batch_size
+            self.step_metrics.n_p = num_prefill
+            self.step_metrics.n_p_tok = num_prefill_tokens
+            self.step_metrics.n_d = num_decode_tokens
+            self.step_metrics.run = len(scheduler.running)
+            self.step_metrics.wait = len(scheduler.waiting)
+            self.step_metrics.blk_used = scheduler.cache.pool.used()
 
     # return the number of truncated reqs which are finished just now
     def add_sampled_tokens(self, next_tokens_cpu: list[int], eos_token_id_set) -> int:
@@ -221,7 +210,7 @@ class Scheduler:
         self.backoff_cap = config.backoff_cap
 
         # metrics
-        self.sch_metrics = SchedulerMetrices()
+        self.sch_metrics = SchedulerMetrics()
         self.req_metrics_list: list[RequestMetrics] = []   # store temporarily
         self.req_metrics_interval = config.req_metrics_interval
         self._last_req_metrics_time = time.perf_counter()  # starting time
@@ -266,7 +255,7 @@ class Scheduler:
         victim.reset_on_preemption()  # recompute from scratch, preempt_count += 1
 
         delay = min(self.backoff_base ** (victim.preempt_count - 1), self.backoff_cap)  # mininum of delay is 1
-        victim.not_before_step = self.sch_metrics.step + delay
+        victim.not_before_step = self.sch_metrics.step_id + delay
         self.waiting.appendleft(victim)
 
     def commit_step(self, sch_out: SchedulerOutput, num_truncated:int):
@@ -282,9 +271,12 @@ class Scheduler:
 
         if sch_out.step_metrics is not None:
             sch_out.step_metrics.fin = fin      # number of finished reqs in this step
-            if not sch_out.step_metrics.is_stopped():
-                assert len(sch_out.step_metrics.pending_evs) == 1   # there should be only one pending event, which is "ci"
-                sch_out.step_metrics.stop("ci") # "ci" set in engine.forward usually
+            if not sch_out.step_metrics.is_stopped():   # pending events: [ci*, step]
+                if len(sch_out.step_metrics.pending_evs) > 1:
+                    sch_out.step_metrics.stop("ci") # "ci" set in engine.forward usually
+                sch_out.step_metrics.stop("step")
+
+            assert sch_out.step_metrics.is_stopped()
         self.log_metrics(sch_out=sch_out)
 
     def cleanup_on_finished(self, req: ModelRequest):
@@ -317,8 +309,9 @@ class Scheduler:
             self._do_cleanup_on_error(req, e)
 
         # maybe cuased by the front of waiting
-        req = self.waiting.popleft()
-        self._do_cleanup_on_error(req, e)
+        if self.waiting:
+            req = self.waiting.popleft()
+            self._do_cleanup_on_error(req, e)
 
     def cleanup_on_error(self, req: ModelRequest, e: Exception):
         assert req in self.running
@@ -364,7 +357,7 @@ class Scheduler:
             logger.debug(f"len, victims: {len(victims)}, waiting: {len(self.waiting)}")
 
         for r in self.waiting:
-            if r.request_id not in victims and r.not_before_step <= self.sch_metrics.step:
+            if r.request_id not in victims and r.not_before_step <= self.sch_metrics.step_id:
                 return r
 
         # ignore backoff when len(running)==0 and len(waiting)>0 and nothing available due to backoff, avoiding the starvation of scheduler.
@@ -375,99 +368,96 @@ class Scheduler:
 
         return None
 
-    def schedule(self) -> SchedulerOutput | None:            # called by run_loop
-        self.sch_metrics.step += 1
-        return self.D_first_preemptive_schedule() if self.use_d_first_schedule else self.preemptive_schedule()
+    def schedule(self, step_metrics: SchedulerStepMetrics | None = None) -> SchedulerOutput | None:            # called by run_loop
+        self.sch_metrics.step_id += 1
+        with timed(step_metrics, "sched"):
+            if self.use_d_first_schedule:
+                return self.D_first_preemptive_schedule(step_metrics)
+            else:
+                return self.preemptive_schedule(step_metrics)
 
     # D-first scheduling with no-cross preemption
-    def D_first_preemptive_schedule(self) -> SchedulerOutput | None:            # called by run_loop when idle
-        step_metrics = SchedulerStepMetrices()
-        step_metrics.start("sched")
-        step_metrics.start("sched_pre")
-        budget = self.max_num_batched_tokens
-        scheduled: dict[str, ScheduledInfo] = {}
-        victims: set[str] = set()
+    def D_first_preemptive_schedule(self, step_metrics: SchedulerStepMetrics | None = None) -> SchedulerOutput | None:            # called by run_loop when idle
+        with timed(step_metrics, "sched_pre"):
+            budget = self.max_num_batched_tokens
+            scheduled: dict[str, ScheduledInfo] = {}
+            victims: set[str] = set()
 
-        # pre-process: ensure that all Ds are before all Ps
-        decoding, prefill = [], []
-        for req in list(self.running):
-            (decoding if req.is_decoding else prefill).append(req)
-        self.running: list[ModelRequest] = decoding + prefill
+            # pre-process: ensure that all Ds are before all Ps
+            decoding, prefill = [], []
+            for req in list(self.running):
+                (decoding if req.is_decoding else prefill).append(req)
+            self.running: list[ModelRequest] = decoding + prefill
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
-        step_metrics.stop("sched_pre")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
 
         # 1) running first — protect in-flight decodes' TPOT.
-        step_metrics.start("sched_run")
-        scheduled_running: list[ModelRequest] = []
-        for req in list(self.running):
-            assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
+        with timed(step_metrics, "sched_run"):
+            scheduled_running: list[ModelRequest] = []
+            for req in list(self.running):
+                assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
 
-            if req.request_id in victims:
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"{req.request_id} has been prempted")
-                break
-            
-            want = 1 if req.is_decoding else min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
-            if want <= 0:
-                # only when in prefill (is_decoding=False) and budget <= 0, which means all Ds has been scheduled and budget exhausted, the loop breaks.
-                # then kept the rest in running, but not be scheduled
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"no more budget for {req.request_id} to prefill, skip over")
-                break
-
-            new_slots = self.cache.allocate_slots(req, want)
-            while new_slots is None:       # KV pool exhausted
-                self.sch_metrics.report_on_cache_exhausted()
-
-                victim = self.running.pop()     # traverse reversely, so it may have finished.
-                self._preempt(victim, victims)     # yield no matter whether it's in decoding
-
-                if req.request_id == victim.request_id:     # cur req preempted
+                if req.request_id in victims:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"{req.request_id} has been prempted")
+                    break
+                
+                want = 1 if req.is_decoding else min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
+                if want <= 0:
+                    # only when in prefill (is_decoding=False) and budget <= 0, which means all Ds has been scheduled and budget exhausted, the loop breaks.
+                    # then kept the rest in running, but not be scheduled
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"no more budget for {req.request_id} to prefill, skip over")
                     break
 
                 new_slots = self.cache.allocate_slots(req, want)
+                while new_slots is None:       # KV pool exhausted
+                    self.sch_metrics.report_on_cache_exhausted()
 
-            if new_slots is None:               # still cannot get new blocks
-                break
+                    victim = self.running.pop()     # traverse reversely, so it may have finished.
+                    self._preempt(victim, victims)     # yield no matter whether it's in decoding
 
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"add {req.request_id} to scheduled_running")
-            scheduled_running.append(req)
-            s_info = ScheduledInfo(want=want, slots=new_slots)
-            scheduled[req.request_id] = s_info
-            budget -= want
+                    if req.request_id == victim.request_id:     # cur req preempted
+                        break
 
-        step_metrics.stop("sched_run")
-    
+                    new_slots = self.cache.allocate_slots(req, want)
+
+                if new_slots is None:               # still cannot get new blocks
+                    break
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"add {req.request_id} to scheduled_running")
+                scheduled_running.append(req)
+                s_info = ScheduledInfo(want=want, slots=new_slots)
+                scheduled[req.request_id] = s_info
+                budget -= want
+
         # 2) waiting next — fill remaining budget with (chunked) prefills
-        step_metrics.start("sched_wait")
-        while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
-            req = self._pick_waiting(victims=victims)
-            if req is None:
+        with timed(step_metrics, "sched_wait"):
+            while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
+                req = self._pick_waiting(victims=victims)
+                if req is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"not find a suitable waiting request, waiting len: {len(self.waiting)}, victims len: {len(victims)}")
+                    break
+
+                want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
+                slots = self.cache.allocate_slots(req, want=want, respect_watermark=True)
+                if slots is None:
+                    self.sch_metrics.report_on_cache_exhausted()
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"failed to allocate slots for {req.request_id}")
+                    break                                 # no room, stop admitting
+
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"not find a suitable waiting request, waiting len: {len(self.waiting)}, victims len: {len(victims)}")
-                break
-
-            want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
-            slots = self.cache.allocate_slots(req, want=want, respect_watermark=True)
-            if slots is None:
-                self.sch_metrics.report_on_cache_exhausted()
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"failed to allocate slots for {req.request_id}")
-                break                                 # no room, stop admitting
-
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"move {req.request_id} from waiting to running and scheduled_running")
-            scheduled_running.append(req)
-            self.running.append(req)
-            self.waiting.remove(req)
-            s_info = ScheduledInfo(want=want, slots=slots)
-            scheduled[req.request_id] = s_info
-            budget -= want
-
-        step_metrics.stop("sched_wait")
+                    logger.debug(f"move {req.request_id} from waiting to running and scheduled_running")
+                scheduled_running.append(req)
+                self.running.append(req)
+                self.waiting.remove(req)
+                s_info = ScheduledInfo(want=want, slots=slots)
+                scheduled[req.request_id] = s_info
+                budget -= want
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"schedule1, scheduled: {len(scheduled_running)}, running: {len(self.running)}, waiting: {len(self.waiting)}")
@@ -475,20 +465,16 @@ class Scheduler:
         if not scheduled_running:
             return None     # no work to do
 
-        step_metrics.start("sched_ret")
-        block_tables = []
-        for req in scheduled_running:
-            bt = self.cache.get_block_table(req)
-            assert bt is not None
-            block_tables.append(bt)
+        with timed(step_metrics, "sched_ret"):
+            block_tables = []
+            for req in scheduled_running:
+                bt = self.cache.get_block_table(req)
+                assert bt is not None
+                block_tables.append(bt)
 
-        self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
-        s_out = SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
-                               config=self.config, scheduler=self, step_metrics=step_metrics)
-        assert s_out.step_metrics is not None
-        s_out.step_metrics.stop("sched_ret")
-        s_out.step_metrics.stop("sched")  # stop the whole scheduling step
-        return s_out
+            self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
+            return SchedulerOutput(self.sch_metrics.step_id, scheduled_running, scheduled, block_tables=block_tables,
+                                config=self.config, scheduler=self, step_metrics=step_metrics)
     
     def _pick_victim(self, cur_req):
         # pick strategies
@@ -506,101 +492,93 @@ class Scheduler:
         return None if newest.request_id == cur_req.request_id else newest
 
     # Preemptive scheduling with victim eviction
-    def preemptive_schedule(self) -> SchedulerOutput | None:            # called by run_loop when idle
-        step_metrics = SchedulerStepMetrices()
-        step_metrics.start("sched")
-        step_metrics.start("sched_pre")
-        budget = self.max_num_batched_tokens
-        scheduled: dict[str, ScheduledInfo] = {}
-        victims: set[str] = set()
+    def preemptive_schedule(self, step_metrics: SchedulerStepMetrics | None = None) -> SchedulerOutput | None:            # called by run_loop when idle
+        with timed(step_metrics, "sched_pre"):
+            budget = self.max_num_batched_tokens
+            scheduled: dict[str, ScheduledInfo] = {}
+            victims: set[str] = set()
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
-        finish_time = time.perf_counter()
-        step_metrics.stop("sched_pre")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
         
         # 1) running first — protect in-flight decodes' TPOT.
         #    Note: Ps and Ds may interleave.
-        step_metrics.start("sched_run")
-        scheduled_running: list[ModelRequest] = []
-        for req in list(self.running):  # snapshot
-            assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
+        with timed(step_metrics, "sched_run"):
+            scheduled_running: list[ModelRequest] = []
+            for req in list(self.running):  # snapshot
+                assert not req.finished     # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
 
-            if req.request_id in victims:    # evicted
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"{req.request_id} has been prempted")
-                continue
-
-            want = 1 if req.is_decoding else min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
-            if want <= 0:
-                # only when is_decoding=False and budget <= 0, which means there is no room for current in-flight prefill request.
-                # then kept the rest in running, but not be scheduled
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"no more budget for {req.request_id} to prefill, skip over")
-                continue
-
-            new_slots = self.cache.allocate_slots(req, want)
-            while new_slots is None:                # KV pool exhausted
-                self.sch_metrics.report_on_cache_exhausted()
-
-                victim = self._pick_victim(req)
-                if victim is None:
-                    self._preempt(req, victims)     # yield no matter whether it's in decoding
+                if req.request_id in victims:    # evicted
                     if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"{req.request_id} preempts itself")
-                    break
+                        logger.debug(f"{req.request_id} has been prempted")
+                    continue
 
-                self._preempt(victim, victims)
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"{req.request_id} preempts {victim.request_id}")
-
-                # roll back budget and blocks just allocated
-                s_info = scheduled.pop(victim.request_id, None)
-                if s_info is not None:
-                    scheduled_running.remove(victim)
+                want = 1 if req.is_decoding else min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
+                if want <= 0:
+                    # only when is_decoding=False and budget <= 0, which means there is no room for current in-flight prefill request.
+                    # then kept the rest in running, but not be scheduled
                     if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"remove {req.request_id} from scheduled_running")
-                    budget += s_info.want
+                        logger.debug(f"no more budget for {req.request_id} to prefill, skip over")
+                    continue
 
                 new_slots = self.cache.allocate_slots(req, want)
+                while new_slots is None:                # KV pool exhausted
+                    self.sch_metrics.report_on_cache_exhausted()
 
-            if new_slots is None:                   # yield, according to "victim is None"
-                continue
+                    victim = self._pick_victim(req)
+                    if victim is None:
+                        self._preempt(req, victims)     # yield no matter whether it's in decoding
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"{req.request_id} preempts itself")
+                        break
 
-            s_info = ScheduledInfo(want=want, slots=new_slots)
-            scheduled[req.request_id] = s_info
-            scheduled_running.append(req)
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"add {req.request_id} to scheduled_running")
-            budget -= want
+                    self._preempt(victim, victims)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"{req.request_id} preempts {victim.request_id}")
 
-        step_metrics.stop("sched_run")
-    
-        # 2) waiting next — fill remaining budget with (chunked) prefills
-        step_metrics.start("sched_wait")
-        while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
-            req = self._pick_waiting(victims=victims)
-            if req is None:
+                    # roll back budget and blocks just allocated
+                    s_info = scheduled.pop(victim.request_id, None)
+                    if s_info is not None:
+                        scheduled_running.remove(victim)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"remove {req.request_id} from scheduled_running")
+                        budget += s_info.want
+
+                    new_slots = self.cache.allocate_slots(req, want)
+
+                if new_slots is None:                   # yield, according to "victim is None"
+                    continue
+
+                s_info = ScheduledInfo(want=want, slots=new_slots)
+                scheduled[req.request_id] = s_info
+                scheduled_running.append(req)
                 if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"not find a suitable waiting request, waiting len: {len(self.waiting)}, victims len: {len(victims)}")
-                break
+                    logger.debug(f"add {req.request_id} to scheduled_running")
+                budget -= want
 
-            want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
-            slots = self.cache.allocate_slots(req, want, respect_watermark=True)
-            if slots is None:
-                self.sch_metrics.report_on_cache_exhausted()
-                break                                 # no room, stop admitting
+        # 2) waiting next — fill remaining budget with (chunked) prefills
+        with timed(step_metrics, "sched_wait"):
+            while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
+                req = self._pick_waiting(victims=victims)
+                if req is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"not find a suitable waiting request, waiting len: {len(self.waiting)}, victims len: {len(victims)}")
+                    break
 
-            self.running.append(req)
-            self.waiting.remove(req)
-            s_info = ScheduledInfo(want=want, slots=slots)
-            scheduled[req.request_id] = s_info
-            scheduled_running.append(req)
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"add {req.request_id} to scheduled_running")
-            budget -= want
+                want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
+                slots = self.cache.allocate_slots(req, want, respect_watermark=True)
+                if slots is None:
+                    self.sch_metrics.report_on_cache_exhausted()
+                    break                                 # no room, stop admitting
 
-        step_metrics.stop("sched_wait")
+                self.running.append(req)
+                self.waiting.remove(req)
+                s_info = ScheduledInfo(want=want, slots=slots)
+                scheduled[req.request_id] = s_info
+                scheduled_running.append(req)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"add {req.request_id} to scheduled_running")
+                budget -= want
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"schedule1, scheduled: {len(scheduled_running)}, running: {len(self.running)}, waiting: {len(self.waiting)}")
@@ -608,20 +586,16 @@ class Scheduler:
         if not scheduled_running:
             return None     # no work to do
 
-        step_metrics.start("sched_ret")
-        block_tables = []
-        for req in scheduled_running:
-            bt = self.cache.get_block_table(req)
-            assert bt is not None
-            block_tables.append(bt)
+        with timed(step_metrics, "sched_ret"):
+            block_tables = []
+            for req in scheduled_running:
+                bt = self.cache.get_block_table(req)
+                assert bt is not None
+                block_tables.append(bt)
 
-        self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
-        s_out = SchedulerOutput(self.sch_metrics.step, scheduled_running, scheduled, block_tables=block_tables,
-                               config=self.config, scheduler=self, step_metrics=step_metrics)
-        assert s_out.step_metrics is not None
-        s_out.step_metrics.stop("sched_ret")
-        s_out.step_metrics.stop("sched")  # stop the whole scheduling step
-        return s_out
+            self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
+            return SchedulerOutput(self.sch_metrics.step_id, scheduled_running, scheduled, block_tables=block_tables,
+                                config=self.config, scheduler=self, step_metrics=step_metrics)
 
     def log_metrics(self, sch_out: SchedulerOutput, is_exiting: bool=False):
         self.log_step_metrics(sch_out=sch_out)
@@ -639,7 +613,7 @@ class Scheduler:
             return
 
         # snapshot
-        tmp_counters: SchedulerMetrices = copy.deepcopy(self.sch_metrics)
+        tmp_counters: SchedulerMetrics = copy.deepcopy(self.sch_metrics)
         req_metrics_list = self.req_metrics_list
         self.req_metrics_list = []      # reset
         self.total_metrics.extend(req_metrics_list) if self.is_benchmarking else None
@@ -677,7 +651,8 @@ class Scheduler:
                 f.flush()
 
     def log_step_metrics(self, sch_out: SchedulerOutput):
-        assert sch_out.step_metrics and sch_out.step_metrics.is_stopped(), "step_metrics must be stopped before logging"
+        if sch_out.step_metrics is None:
+            return
 
         json_bytes = orjson.dumps(round_floats(sch_out.step_metrics.output_dict(), nd=3))
 

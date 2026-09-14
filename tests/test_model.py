@@ -60,7 +60,7 @@ def build_scheduler_output_on_prefill(model, cache, input_ids_lst) -> SchedulerO
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
 
 def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
     scheduled: dict[str, ScheduledInfo] = {}
@@ -73,7 +73,7 @@ def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
 
 class HookManager:
     hooks: dict[str, Any]   # save_i/save_o store a Tensor directly; patch_rope's hooks store list[Tensor]
@@ -306,17 +306,38 @@ class HookManager:
 
         # target, rope
         # q,k [T, H, D]
-        original_target_rope = DefaultRoPE.forward
-        def patched_target_func(self, q, k, position_ids):
+        def record_before(q, k, position_ids):
             hooks.setdefault("target_model.q_before_rope", []).append(q.detach().clone().transpose(0, 1))
             hooks.setdefault("target_model.k_before_rope", []).append(k.detach().clone().transpose(0, 1))
-            if position_ids is not None:
-                hooks.setdefault("target_model.position_ids_on_rope", []).append(position_ids.detach().clone())
-            else:
-                hooks.setdefault("target_model.position_ids_on_rope", []).append(None)
-            q_embed, k_embed = original_target_rope(self, q, k, position_ids)
+            hooks.setdefault("target_model.position_ids_on_rope", []).append(
+                position_ids.detach().clone() if position_ids is not None else None)
+
+        def record_after(q_embed, k_embed):
             hooks.setdefault("target_model.q_embed_returned", []).append(q_embed.detach().clone().transpose(0, 1))
             hooks.setdefault("target_model.k_embed_returned", []).append(k_embed.detach().clone().transpose(0, 1))
+
+        original_target_rope = DefaultRoPE.forward
+        def patched_target_func(self, q, k, position_ids):
+            record_before(q, k, position_ids)
+            q_embed, k_embed = original_target_rope(self, q, k, position_ids)
+            record_after(q_embed, k_embed)
+            return q_embed, k_embed
+
+        # config.pre_gather_cos_sin routes attention to forward2 instead, which never sees
+        # position_ids -- gather_cos_sin runs once per step, forward2 once per layer, so a
+        # single-slot cache replays the step's position_ids per layer and stays index-aligned
+        # with the ref hooks (which also append once per layer).
+        gathered_position_ids: list = []
+        original_gather_cos_sin = DefaultRoPE.gather_cos_sin
+        def patched_gather_cos_sin(self, position_ids):
+            gathered_position_ids[:] = [position_ids]
+            return original_gather_cos_sin(self, position_ids)
+
+        original_target_rope2 = DefaultRoPE.forward2
+        def patched_target_func2(self, q, k, cos, sin):
+            record_before(q, k, gathered_position_ids[0] if gathered_position_ids else None)
+            q_embed, k_embed = original_target_rope2(self, q, k, cos, sin)
+            record_after(q_embed, k_embed)
             return q_embed, k_embed
 
         # target, sdpa_one_seq
@@ -331,6 +352,8 @@ class HookManager:
 
         with patch.object(qwen2_modeling, "apply_rotary_pos_emb", new=patched_ref_func), \
              patch.object(DefaultRoPE, "forward", new=patched_target_func), \
+             patch.object(DefaultRoPE, "forward2", new=patched_target_func2), \
+             patch.object(DefaultRoPE, "gather_cos_sin", new=patched_gather_cos_sin), \
              patch.object(qwen.attention, "sdpa_one_seq", new=patched_target_sdpa):
             yield
 
@@ -349,7 +372,7 @@ def test_forward_matches_reference_on_math(target_model, tmp_cache, ref_model, B
             # target model
             lst = input_ids.tolist()
             sch_out = build_scheduler_output_on_prefill(target_model, tmp_cache, lst)
-            packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, config=target_model.config)
+            packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, config=target_model.config, rope=target_model.model.rope)
             
             hidden = target_model.forward(packed_ids, md)       # [total_tokens, H]
 
@@ -403,7 +426,7 @@ def test_forward_matches_reference_on_long_prompt(L, target_model, ref_model, tm
 
         # target model
         sch_out = build_scheduler_output_on_prefill(target_model, tmp_cache, slice_list)
-        packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, config=target_model.config)
+        packed_ids, md = build_attn_metadata(sch_out, cache_data=tmp_cache.data, config=target_model.config, rope=target_model.model.rope)
         hidden = target_model.forward(packed_ids, md)       # [total_tokens, H]
 
         # gather each seq's LAST token -> logits -> first generated token
@@ -683,7 +706,7 @@ def test_kv_cache_correctness(target_model, tmp_cache, B:int):
     cache1 = copy.deepcopy(tmp_cache)
     sch_out = build_scheduler_output_on_prefill(target_model, cache1, ids.tolist())
     req_ids1 = [r.request_id for r in sch_out.reqs]
-    packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache1.data, config=target_model.config)
+    packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache1.data, config=target_model.config, rope=target_model.model.rope)
     hidden = target_model.forward(packed_ids, meta_prefill)       # [total_tokens, H]
     last_idx = meta_prefill.cu_seqlens_q[1:] - 1          # [B]
     logits_only_prefill = target_model.compute_logits(hidden[last_idx])   # [B, vocab]
@@ -693,7 +716,7 @@ def test_kv_cache_correctness(target_model, tmp_cache, B:int):
         # sample 2: prefill + decode
         prefill_ids = ids[:, :P]
         sch_out = build_scheduler_output_on_prefill(target_model, cache2, prefill_ids.tolist())
-        packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache2.data, config=target_model.config)
+        packed_ids, meta_prefill = build_attn_metadata(sch_out, cache_data=cache2.data, config=target_model.config, rope=target_model.model.rope)
         req_ids2 = [r.request_id for r in sch_out.reqs]
 
         ###########################################################################
@@ -719,7 +742,7 @@ def test_kv_cache_correctness(target_model, tmp_cache, B:int):
                 assert req.is_decoding
 
             sch_out = build_scheduler_output_on_decoding(target_model, cache2, sch_out.reqs)
-            packed_ids, meta_decode = build_attn_metadata(sch_out, cache_data=cache2.data, config=target_model.config)
+            packed_ids, meta_decode = build_attn_metadata(sch_out, cache_data=cache2.data, config=target_model.config, rope=target_model.model.rope)
             assert packed_ids.tolist() == decode_ids
 
             meta_decode.debug_k_list, meta_decode.debug_v_list = debug_k_list, debug_v_list   # turn on debug
@@ -824,7 +847,7 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
         ######### prefill #########
         # target model's prefill
         sch_out = build_scheduler_output_on_prefill(target_model, cache, input_list)
-        packed_ids, md_prefill = build_attn_metadata(sch_out, cache_data=cache.data, config=target_model.config)
+        packed_ids, md_prefill = build_attn_metadata(sch_out, cache_data=cache.data, config=target_model.config, rope=target_model.model.rope)
         hidden = target_model.forward(packed_ids, md_prefill)       # [total_tokens, H]
         last_idx = md_prefill.cu_seqlens_q[1:] - 1          # [B]
         target_logits = target_model.compute_logits(hidden[last_idx])   # [B, vocab], last one
@@ -849,7 +872,7 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
         ######### decode #########
         # target model
         sch_out = build_scheduler_output_on_decoding(target_model, cache, sch_out.reqs)
-        packed_ids, md_decode = build_attn_metadata(sch_out, cache_data=cache.data, config=target_model.config)
+        packed_ids, md_decode = build_attn_metadata(sch_out, cache_data=cache.data, config=target_model.config, rope=target_model.model.rope)
 
         # capture layer 1's REAL q (post-RoPE) + cache tensors during this actual forward call,
         # to redo the flash_attn paged-vs-flat probe with real activations instead of random data

@@ -22,6 +22,8 @@ def get_apply_rotary(compile: bool):
     if not compile:
         logger.info("Using eager path for apply_rotary")
         return apply_rotary
+
+    assert torch.cuda.is_available(), "compiled path requires CUDA"
     if _compiled_apply_rotary is None:
         _compiled_apply_rotary = torch.compile(apply_rotary, dynamic=True, fullgraph=True)
 
@@ -51,14 +53,26 @@ class BaseRoPE(nn.Module):
         self.register_buffer("cos_cached", freqs.cos()[:, None, :], persistent=False)   # shape [seq_len, H=1, d/2]
         self.register_buffer("sin_cached", freqs.sin()[:, None, :], persistent=False)
 
+    def gather_cos_sin(self, position_ids):
+        # q,k [T, H, D]
+        # position_ids [T]
+
+        cos = self.cos_cached[position_ids]
+        sin = self.sin_cached[position_ids]
+        return cos, sin
+
+    def forward2(self, q, k, cos, sin):
+        # q,k [T, H, D]
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"pre-gathered cos/sin, q.shape: {q.shape}, k.shape: {k.shape}, cos.shape: {cos.shape}, sin.shape: {sin.shape}")
+
+        return self._apply_rotary(q, cos, sin), self._apply_rotary(k, cos, sin)
+
     def forward(self, q, k, position_ids):
         # q,k [T, H, D]
         # position_ids [T]
-        # if self.fixed_max_seq_len:
-        #     assert position_ids.max() < self.cos_cached.shape[0], \
-        #         f"seq overflow: position_ids={position_ids.max()}, max={self.max_seq_len}"
-        cos = self.cos_cached[position_ids]
-        sin = self.sin_cached[position_ids]
+        cos, sin = self.gather_cos_sin(position_ids)
 
         return self._apply_rotary(q, cos, sin), self._apply_rotary(k, cos, sin)
 

@@ -9,9 +9,8 @@ import gc
 from constants import *
 from qwen.config import ModelConfig
 from qwen.model import QwenForCausalLM
-from qwen.constants import MODEL_DIR
+from qwen.constants import MODEL_DIR, DEFAULT_MAX_WAITING, DEFAULT_MAX_NUM_SEQS
 from qwen.engine import ServingDriver, LLMEngine
-from qwen.scheduler import Scheduler
 from qwen.cache import KVCache
 from qwen.utils import sample_sharegpt
 from collections.abc import Iterator
@@ -76,15 +75,15 @@ def pytest_addoption(parser):
     parser.addoption(
         "--req-num",
         action="store",
-        default=SHARE_GPT_REQ_NUM,
+        default=DEFAULT_MAX_WAITING,
         type=int,
-        help="The number of requests for benchmark (e.g.: 128)"
+        help="The number of requests for benchmark (e.g.: 64)"
     )
 
     parser.addoption(
         "--max-model-len",
         action="store",
-        default=MAX_MODEL_LEN,
+        default=MAX_MODEL_LEN_FOR_TEST,
         type=int,
         help="The maximum length of kv cache for benchmark (e.g.: 512)"
     )
@@ -92,7 +91,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--max-num-seqs",
         action="store",
-        default=SHARE_GPT_MAX_SEQS,
+        default=DEFAULT_MAX_NUM_SEQS,
         type=int,
         help="The maximum number of sequences in scheduling for benchmark (e.g.: 8)"
     )
@@ -100,7 +99,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--num-blocks",
         action="store",
-        default=MAX_NUM_BLOCKS,
+        default=NUM_BLOCKS_FOR_TEST,
         type=int,
         help="The maximum number of blocks in kv cache pool (e.g.: 1024)"
     )
@@ -116,7 +115,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--compile-rope",
         action="store",
-        default=None,
+        default=False,
         type=_str2bool,
         help="compile rope switch (true/false); default None means unset",
     )
@@ -128,6 +127,18 @@ def pytest_addoption(parser):
         type=int,
         help="Sampling tensor strategy (e.g.: 1/0)"
     )
+
+    parser.addoption(
+        "--pre-gather-cos-sin",
+        action="store",
+        default=True,
+        type=_str2bool,
+        help="Pre-gather cos and sin for rope (true/false); default True",
+    )
+
+@pytest.fixture(scope="session")
+def pre_gather_cos_sin(request) -> bool:
+    return request.config.getoption("--pre-gather-cos-sin")
 
 @pytest.fixture(scope="session")
 def make_sampling_tensor_strategy(request) -> int:
@@ -218,12 +229,26 @@ def batch_for_regular_benchmarking(tokenizer) -> list[list[int]]:
 
 # my implementation
 @pytest.fixture(scope="session")
-def target_config(log_dir):
+def target_config(
+    log_dir,
+    make_sampling_tensor_strategy: int,
+    pre_gather_cos_sin: bool,
+    req_num:int, max_num_seqs:int,
+    max_model_len:int, num_blocks: int
+    ) -> ModelConfig:
     config = ModelConfig.from_pretrained(MODEL_DIR)       # load weights
-    config.num_blocks = 16
     config.cache_verification_interval = 1. 
     config.log_dir = log_dir
-    config.compile_rope = False     # disable rope compilation for testing
+    config.max_num_seqs = max_num_seqs
+    config.max_model_len = max_model_len
+    config.max_waiting=req_num
+    config.num_blocks = num_blocks
+    config.compile_rope = False
+
+    # optimization switches
+    config.compile_rope = False
+    config.make_sampling_tensor_strategy = make_sampling_tensor_strategy
+    config.pre_gather_cos_sin = pre_gather_cos_sin
     return config
 
 @pytest.fixture(scope="function")
@@ -287,7 +312,9 @@ def sharegpt_batch(tokenizer, req_num, max_model_len) -> list[list[int]]:
 
 
 @pytest.fixture(scope="function")
-def target_engine_for_pc_benchmarking(tmp_target_config: ModelConfig) -> LLMEngine:
+def target_engine_for_pc_benchmarking(
+    tmp_target_config: ModelConfig,
+    ) -> LLMEngine:
     # overwrite max_num_seqs and max_model_len for benchmarking
     tmp_target_config.max_model_len = 128
     tmp_target_config.req_metrics_interval = 10.
@@ -302,17 +329,11 @@ def target_engine_for_pc_benchmarking(tmp_target_config: ModelConfig) -> LLMEngi
 
 @pytest.fixture(scope="function")
 def target_engine_for_sharegpt_benchmarking(
-    tmp_target_config: ModelConfig, req_num:int, max_num_seqs:int,
-    max_model_len:int, num_blocks: int
+    tmp_target_config: ModelConfig,
 ) -> Iterator[LLMEngine]:
-    # overwrite max_num_seqs and max_model_len for benchmarking
-    tmp_target_config.max_num_seqs = max_num_seqs
-    tmp_target_config.max_model_len = max_model_len
-    tmp_target_config.max_waiting=req_num
-    tmp_target_config.num_blocks = num_blocks
     tmp_target_config.req_metrics_interval = 60.
     tmp_target_config.is_benchmarking = True
-    tmp_target_config.do_sample = False
+    # tmp_target_config.do_sample = False
     tmp_target_config.compile_rope = True   # enable rope compilation for benchmarking
 
     try:
@@ -330,11 +351,13 @@ def target_engine_for_sharegpt_benchmarking(
 
 
 @pytest.fixture(scope="function")
-def tmp_target_config_for_sharegpt_benchmarking(tmp_target_config: ModelConfig, compile_rope: bool, make_sampling_tensor_strategy: int) -> ModelConfig:
+def tmp_target_config_for_sharegpt_benchmarking(
+    tmp_target_config: ModelConfig,
+    compile_rope: bool,
+) -> ModelConfig:
     tmp_target_config.req_metrics_interval = 60.
     tmp_target_config.is_benchmarking = True
-    tmp_target_config.do_sample = False
+    # tmp_target_config.do_sample = False
     tmp_target_config.compile_rope = compile_rope
-    tmp_target_config.make_sampling_tensor_strategy = make_sampling_tensor_strategy
 
     return tmp_target_config
