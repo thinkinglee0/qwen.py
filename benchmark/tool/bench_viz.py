@@ -201,6 +201,10 @@ def report(batch, ttft, tpot, throughput, model: ModelSpec):
     print("=" * 78)
 
 
+# batch-1 TTFT must exceed batch-2 by this factor before it is worth annotating
+TTFT_HEAD_ANOMALY = 1.05
+
+
 def style(ax, title, xlabel, ylabel):
     ax.set_title(title, fontsize=11, color=INK, pad=8)
     ax.set_xlabel(xlabel, fontsize=9, color=INK)
@@ -254,14 +258,19 @@ def make_figure(path, batch, ttft, tpot, itl, throughput, model: ModelSpec):
     ax.plot(batch, ttft, "o-", color=C_TTFT, lw=1.8, ms=5, label="TTFT (prefill)")
     ax.plot(batch, tpot, "s-", color=C_TPOT, lw=1.8, ms=5, label="TPOT")
     ax.plot(batch, itl, "^--", color=C_ITL, lw=1.2, ms=4, alpha=0.8, label="ITL")
-    ax.annotate(
-        "batch=1 TTFT above batch=2:\nwarmup / cudagraph capture artifact",
-        xy=(1, ttft[0]),
-        xytext=(3.2, 90),
-        fontsize=8,
-        color=INK,
-        arrowprops=dict(arrowstyle="->", color=C_TTFT, lw=1.0),
-    )
+    # Annotate only when the phenomenon is in the data. This used to be drawn
+    # unconditionally and blamed "cudagraph capture" -- on an engine that has no
+    # cudagraph, and on sweeps where batch 1 sits *below* batch 2 (log915: 23.40
+    # vs 23.43 ms). State the observation; do not name a cause we have not shown.
+    if len(ttft) > 1 and ttft[0] > TTFT_HEAD_ANOMALY * ttft[1]:
+        ax.annotate(
+            f"batch=1 TTFT {100 * (ttft[0] / ttft[1] - 1):.0f}% above batch=2\n(warm-up not amortised?)",
+            xy=(1, ttft[0]),
+            xytext=(3.2, 90),
+            fontsize=8,
+            color=INK,
+            arrowprops=dict(arrowstyle="->", color=C_TTFT, lw=1.0),
+        )
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
     ax.set_xticks(batch)
