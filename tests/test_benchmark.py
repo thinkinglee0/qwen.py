@@ -51,7 +51,7 @@ def _test_benchmark(engine: LLMEngine, input_ids:list[list[int]], tok, max_new_t
                 f.write(line.encode())
 
     num_output_ids = sum([len(o) for o in output_ids])
-    logger.info(f"Benchmark results: {round(elapsed, 2)} seconds, rate: {round(num_output_ids/elapsed, 2)} /s")
+    logger.info(f"Benchmark results: {round(elapsed, 2)} seconds, rate: {round(num_output_ids/elapsed, 2)} tok/s")
 
 def test_benchmark_on_pc(target_engine_for_pc_benchmarking, batch_for_regular_benchmarking, tokenizer):
     _test_benchmark(target_engine_for_pc_benchmarking, batch_for_regular_benchmarking, tok=tokenizer, save_output=True)
@@ -64,15 +64,13 @@ def test_benchmark_sharegpt(target_engine_for_sharegpt_benchmarking, sharegpt_ba
 _DEFAULT_BATCH_SIZES = [
     512,      # warm up
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-_DEFAULT_BLOCKS = [int(1024*5.5)]  # 5.5 * 24 * 1024*2 * 256 * 2 * 64 * 2 B = 17716740096 B ≈ 17 GB
+_DEFAULT_BLOCKS = [int(4*1024)]  # 4 * 24 * 1024*2 * 256 * 2 * 64 * 2 B = 17716740096 B ≈ 12.8 GB
 # excluded from execution from file, only allowed from specified execution.
 # SWEEP_BATCH_SIZES=64,128 pytest -x tests/test_benchmark.py::test_benchmark_sweep_batch_size
 @pytest.mark.parametrize("batch_size", parse_env_list_value(env_name="SWEEP_BATCH_SIZES", default_value=_DEFAULT_BATCH_SIZES))
-# NOTE: the argname must NOT collide with a conftest fixture. parametrize generates a
-# function-scoped pseudo-fixture that shadows the session-scoped one, and session-scoped
-# target_config consumes num_blocks -> ScopeMismatch.
 @pytest.mark.parametrize("sweep_num_blocks", parse_env_list_value(env_name="SWEEP_BLOCKS", default_value=_DEFAULT_BLOCKS))
-def test_benchmark_sweep_batch_size(tmp_target_config_for_sharegpt_benchmarking: ModelConfig, tokenizer, batch_size:int, sweep_num_blocks:int):
+@pytest.mark.parametrize("use_d_first_schedule", parse_env_list_value(env_name="SWEEP_PROFILE_USE_D_FIRST_SCHEDULE", default_value=[False]))
+def test_benchmark_sweep_batch_size(tmp_target_config_for_sharegpt_benchmarking: ModelConfig, tokenizer, batch_size:int, sweep_num_blocks:int, use_d_first_schedule:bool):
     '''
     1. fixed input len 512, fixed output len 128
     2. ignore EOS
@@ -84,6 +82,7 @@ def test_benchmark_sweep_batch_size(tmp_target_config_for_sharegpt_benchmarking:
     cfg.max_num_batched_tokens = 8*1024
     cfg.long_prefill_token_threshold = 8*1024
     cfg.num_blocks = sweep_num_blocks
+    cfg.use_d_first_schedule = use_d_first_schedule
     req_num = max(64, 10*batch_size)
     cfg.max_waiting = req_num
 
@@ -127,7 +126,7 @@ def test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold(tmp_tar
     assert max_num_batched_tokens >= 2 * batch_size, "budget must be non-binding for decode"
     cfg.long_prefill_token_threshold = (max_num_batched_tokens - batch_size) // num_prefill_seqs
     assert cfg.long_prefill_token_threshold >= 128, f"threshold {cfg.long_prefill_token_threshold} below the free-chunk floor"
-    cfg.num_blocks = int(5.5*1024)     # 5.5 * 24 * 1024*2 * 256 * 2 * 64 * 2 B = 17716740096 B ≈ 17 GB
+    cfg.num_blocks = int(4*1024)     # 4 * 24 * 1024*2 * 256 * 2 * 64 * 2 B = 17716740096 B ≈ 12.8 GB
     req_num = max(64, 10*batch_size)
     cfg.max_waiting = req_num
 
