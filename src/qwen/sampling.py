@@ -9,7 +9,7 @@ from qwen.constants import EPS
 logger = logging.getLogger(__name__)
 
 @dataclass
-class Sampling:
+class SamplingParams:
     temperature: float | None = None
     top_k: int | None = None
     top_p: float | None = None
@@ -17,111 +17,66 @@ class Sampling:
     freq_pen: float | None = None
     pres_pen: float | None = None
 
+
+# resident sampling params on device, one column per sequence, for async H2D copy
+class SamplingParamTable:
+    FLOAT32_FIELDS = ("temperature", "top_p", "rep_pen", "freq_pen", "pres_pen")
+
+    def __init__(self, config: ModelConfig):
+        '''Called once in the constructor of Scheduler'''
+
+        n = config.max_num_seqs
+        self._f32 = torch.empty(len(self.FLOAT32_FIELDS), n, dtype=torch.float32, device=config.device)
+        self._stage = torch.empty(len(self.FLOAT32_FIELDS), n, pin_memory=True)    # host tensor for async H2D copy
+
+        self._top_k = torch.empty(n, dtype=torch.int64, device=config.device)
+        self._k_stage = torch.empty(n, dtype=torch.int64, pin_memory=True)    # host tensor for async H2D copy
+
+    def set_slot(self, slot: int, user_sampling: SamplingParams | None, config: ModelConfig):
+        """Called once in _alloc_resources_on_admission when a request is admitted, not once per step."""
+
+        for i, name in enumerate(self.FLOAT32_FIELDS):
+            v = getattr(user_sampling, name, None) if user_sampling is not None else None
+            self._stage[i, slot] = v if v is not None else getattr(config, name)
+        self._f32[:, slot].copy_(self._stage[:, slot], non_blocking=True)
+
+        self._k_stage[slot] = user_sampling.top_k if user_sampling is not None and user_sampling.top_k is not None else config.top_k
+        self._top_k[slot].copy_(self._k_stage[slot], non_blocking=True)
+
+    def gather(self, slot_idx: torch.Tensor):
+        """Per step: one index_select on device, zero Python iteration."""
+        sel = self._f32.index_select(1, slot_idx)
+        return sel.unbind(0), self._top_k.index_select(0, slot_idx)
+
 @dataclass
-class TensorSampling:
-    config: InitVar[ModelConfig]
-    bsz: InitVar[int]
-
-    temperature: torch.Tensor | None = None
-    top_k: torch.Tensor | None = None
-    top_p: torch.Tensor | None = None
-    rep_pen: torch.Tensor | None = None
-    freq_pen: torch.Tensor | None = None
-    pres_pen: torch.Tensor | None = None
-
-    def __post_init__(self, config: ModelConfig, bsz: int):
-        if self.temperature is None:
-            self.temperature = torch.full(
-                size=(bsz,), 
-                fill_value=config.temperature, 
-                device=config.device,
-                dtype=torch.float32
-            )
-        if self.top_k is None:
-            self.top_k = torch.full(
-                size=(bsz,), 
-                fill_value=config.top_k, 
-                device=config.device,
-                dtype=torch.int64
-            )
-        if self.top_p is None:
-            self.top_p = torch.full(
-                size=(bsz,), 
-                fill_value=config.top_p, 
-                device=config.device,
-                dtype=torch.float32
-            )
-        if self.rep_pen is None:
-            self.rep_pen = torch.full(
-                size=(bsz,), 
-                fill_value=config.repetition_penalty, 
-                device=config.device,
-                dtype=torch.float32
-            )
-        if self.freq_pen is None:
-            self.freq_pen = torch.full(
-                size=(bsz,), 
-                fill_value=config.frequency_penalty, 
-                device=config.device,
-                dtype=torch.float32
-            )
-        if self.pres_pen is None:
-            self.pres_pen = torch.full(
-                size=(bsz,), 
-                fill_value=config.presence_penalty, 
-                device=config.device,
-                dtype=torch.float32
-            )
+class SamplingTensors:
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    rep_pen: torch.Tensor
+    freq_pen: torch.Tensor
+    pres_pen: torch.Tensor
 
     @classmethod
-    def from_sampling_list(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
-        if config.stage_sampling_params:
-            return cls.from_sampling_list_staged(samplings, config, bsz)
-
-        return cls.from_sampling_list_per_tensor(samplings, config, bsz)
-
-    @classmethod
-    def from_sampling_list_per_tensor(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+    def from_params_list(cls, samplings: list[SamplingParams | None], config: ModelConfig):
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"from_sampling_list_per_tensor: bsz: {bsz}")
-
+            logger.debug(f"from_params_list, len: {len(samplings)}")
         return cls(
-            config=config,
-            bsz=bsz,
             temperature=torch.tensor([sampling.temperature if sampling is not None and sampling.temperature is not None else config.temperature for sampling in samplings], device=config.device, dtype=torch.float32),
             top_k=torch.tensor([sampling.top_k if sampling is not None and sampling.top_k is not None else config.top_k for sampling in samplings], device=config.device, dtype=torch.int64),
             top_p=torch.tensor([sampling.top_p if sampling is not None and sampling.top_p is not None else config.top_p for sampling in samplings], device=config.device, dtype=torch.float32),
-            rep_pen=torch.tensor([sampling.rep_pen if sampling is not None and sampling.rep_pen is not None else config.repetition_penalty for sampling in samplings], device=config.device, dtype=torch.float32),
-            freq_pen=torch.tensor([sampling.freq_pen if sampling is not None and sampling.freq_pen is not None else config.frequency_penalty for sampling in samplings], device=config.device, dtype=torch.float32),
-            pres_pen=torch.tensor([sampling.pres_pen if sampling is not None and sampling.pres_pen is not None else config.presence_penalty for sampling in samplings], device=config.device, dtype=torch.float32)
+            rep_pen=torch.tensor([sampling.rep_pen if sampling is not None and sampling.rep_pen is not None else config.rep_pen for sampling in samplings], device=config.device, dtype=torch.float32),
+            freq_pen=torch.tensor([sampling.freq_pen if sampling is not None and sampling.freq_pen is not None else config.freq_pen for sampling in samplings], device=config.device, dtype=torch.float32),
+            pres_pen=torch.tensor([sampling.pres_pen if sampling is not None and sampling.pres_pen is not None else config.pres_pen for sampling in samplings], device=config.device, dtype=torch.float32)
         )
 
     @classmethod
-    def from_sampling_list_staged(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+    def from_table(cls, sampling_param_tab: SamplingParamTable, slot_idx: torch.Tensor):
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"from_sampling_list_staged: bsz: {bsz}")
+            logger.debug(f"from_table, {slot_idx}")
+        (temperature, top_p, rep_pen, freq_pen, pres_pen), top_k = sampling_param_tab.gather(slot_idx=slot_idx)
 
-        def pick(attr: str, default):
-            return [getattr(s, attr) if s is not None and getattr(s, attr) is not None else default
-                    for s in samplings]
-
-        # One staging buffer, one HtoD copy instead of six.
-        rows = [
-            pick("temperature", config.temperature),
-            pick("top_p",       config.top_p),
-            pick("rep_pen",     config.repetition_penalty),
-            pick("freq_pen",    config.frequency_penalty),
-            pick("pres_pen",    config.presence_penalty),
-        ]
-        assert config.device is not None, "config.device must be set"
-        pin_memory = torch.cuda.is_available() and config.device.type == "cuda"
-        staging = torch.tensor(rows, dtype=torch.float32, pin_memory=pin_memory)
-        dev = staging.to(config.device, non_blocking=True)   # async: source is pinned
-        temperature, top_p, rep_pen, freq_pen, pres_pen = dev.unbind(0)
-
-        top_k = torch.tensor(pick("top_k", config.top_k), dtype=torch.int64,
-                            pin_memory=pin_memory).to(config.device, non_blocking=True)
-        return cls(config=config, bsz=bsz, temperature=temperature, top_k=top_k,
+        return cls(temperature=temperature, top_k=top_k,
                 top_p=top_p, rep_pen=rep_pen, freq_pen=freq_pen, pres_pen=pres_pen)
 
 def bin_counts_and_mask(
@@ -149,10 +104,10 @@ def bin_counts_and_mask(
     return counts, counts > 0
 
 def apply_penalties2(logits, prompt_tokens: list[list[int]], output_tokens: list[list[int]],
-                     tensor_sampling: TensorSampling, vocab_size: int):
-    assert tensor_sampling.rep_pen is not None and tensor_sampling.freq_pen is not None and tensor_sampling.pres_pen is not None
+                     sampling_tensors: SamplingTensors, vocab_size: int):
+    assert sampling_tensors.rep_pen is not None and sampling_tensors.freq_pen is not None and sampling_tensors.pres_pen is not None
     return apply_penalties(logits, prompt_tokens, output_tokens,
-                           tensor_sampling.rep_pen, tensor_sampling.freq_pen, tensor_sampling.pres_pen, vocab_size)
+                           sampling_tensors.rep_pen, sampling_tensors.freq_pen, sampling_tensors.pres_pen, vocab_size)
 
 def apply_penalties(logits, prompt_tokens: list[list[int]], output_tokens: list[list[int]],
                     rep_pen: torch.Tensor, freq_pen: torch.Tensor, pres_pen: torch.Tensor, vocab_size: int):
@@ -209,9 +164,9 @@ def apply_top_p(logits: torch.Tensor, top_p: torch.Tensor):
     remove.scatter_(1, sorted_idx, sorted_remove)
     return logits.masked_fill(remove, float("-inf"))
 
-def sample2(logits: torch.Tensor, tensor_sampling: TensorSampling):
-    assert tensor_sampling.temperature is not None and tensor_sampling.top_k is not None and tensor_sampling.top_p is not None
-    return sample(logits, tensor_sampling.temperature, tensor_sampling.top_k, tensor_sampling.top_p)
+def sample2(logits: torch.Tensor, sampling_tensors: SamplingTensors):
+    assert sampling_tensors.temperature is not None and sampling_tensors.top_k is not None and sampling_tensors.top_p is not None
+    return sample(logits, sampling_tensors.temperature, sampling_tensors.top_k, sampling_tensors.top_p)
 
 def sample(logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor):
     # logits: [n, vocab] (penalties already applied); all three params are [n]

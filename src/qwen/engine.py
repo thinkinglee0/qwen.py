@@ -9,7 +9,7 @@ from typing import AsyncIterator
 from qwen.metrics import SchedulerStepMetrics, timed
 from qwen.model import QwenForCausalLM
 from qwen.attention import build_attn_metadata
-from qwen.sampling import Sampling
+from qwen.sampling import SamplingParams
 from qwen.scheduler import Scheduler, SchedulerOutput, ModelRequest
 from qwen.constants import DEFAULT_MAX_NEW_TOKEN
 from qwen.config import ModelConfig
@@ -98,7 +98,7 @@ class LLMEngine:
         del self.scheduler
 
 def benchmark(engine: LLMEngine, batch_input_ids: list[list[int]],
-              sampling: Sampling | None = None, max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN) -> tuple[list[list[int]], float]:
+              sampling: SamplingParams | None = None, max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN) -> tuple[list[list[int]], float]:
     """Run all requests to completion without blocking, for benchmarking."""
     assert len(batch_input_ids) > 0 and len(batch_input_ids) <= engine.scheduler.max_waiting, "batch_input_ids must not be empty or longer than max_waiting queue"
     logger.info(f"request count: {len(batch_input_ids)}")
@@ -202,7 +202,7 @@ class ServingDriver:
         if scheduler_output is None:
             # the error occurred in schedule(), so there is no batch to blame: drop the running queue
             try:
-                self.engine.scheduler.cleanup_running_on_error(e=e)
+                self.engine.scheduler.cleanup_all_on_error(e=e)
             except Exception:
                 logger.exception("error while cleaning up the running queue")
             return
@@ -218,7 +218,7 @@ async def async_generate(
     driver: ServingDriver,
     input_ids: list[int],    # one variable-length id sequence
     request_id: str | None = None,
-    sampling: Sampling | None = None,
+    sampling: SamplingParams | None = None,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN,
 ) -> AsyncIterator[int]:
     if logger.isEnabledFor(logging.DEBUG):

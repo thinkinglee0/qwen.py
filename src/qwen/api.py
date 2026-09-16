@@ -13,7 +13,7 @@ from qwen.model import QwenForCausalLM
 from qwen.config import ModelConfig
 from qwen.engine import async_generate, ServingDriver, LLMEngine
 from qwen.constants import MODEL_DIR, DEFAULT_MAX_NEW_TOKEN
-from qwen.sampling import Sampling
+from qwen.sampling import SamplingParams
 from qwen.scheduler import Scheduler
 
 logging.basicConfig(
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
 class GenRequest(BaseModel):
     prompt: str
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN
-    sampling: Sampling = Sampling()
+    sampling: SamplingParams = SamplingParams()
 
 app = FastAPI(lifespan=lifespan)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)

@@ -69,9 +69,9 @@ class ModelConfig():
     top_k: int = 0
     top_p: float = 1.
     do_penalities: bool = True
-    repetition_penalty: float = 1.
-    frequency_penalty: float = 0.
-    presence_penalty: float = 0.
+    rep_pen: float = 1.
+    freq_pen: float = 0.
+    pres_pen: float = 0.
 
     # derived
     head_dim: int = 0
@@ -85,7 +85,6 @@ class ModelConfig():
     cuda_device_name: str | None = None
 
     # continuous batching
-    use_d_first_schedule: bool=True         # D_first_preemptive_schedule if True else preemptive_schedule
     max_model_len: int = DEFAULT_MAX_MODEL_LEN  # todo: find a suitable value.
     max_num_batched_tokens: int = 1024          # idem
     long_prefill_token_threshold: int = 256     # idem
@@ -109,8 +108,10 @@ class ModelConfig():
     log_dir: str = LOG_DIR
 
     # optimization switches
-    compile_rope: bool | None = None   # rope compilation. None = automatically: CUDA on, CPU/mac off
-    stage_sampling_params: bool = True
+    use_d_first_schedule: bool=True         # D_first_preemptive_schedule if True else preemptive_schedule
+    compile_rope: bool | None = None        # rope compilation. None = automatically: CUDA on, CPU/mac off
+    # stage_sampling_params: bool = True      # deprecated
+    use_sampling_param_table: bool | None = None # None: automatically
     pre_gather_cos_sin: bool = True
 
     def __post_init__(self):
@@ -138,6 +139,9 @@ class ModelConfig():
 
         if self.compile_rope is None:
             self.set_default_compile_rope()
+
+        if self.use_sampling_param_table is None:
+            self.use_sampling_param_table = self.device.type == "cuda"  # enable on CUDA
 
     def set_default_compile_rope(self):
         assert self.device is not None, "device is not set"

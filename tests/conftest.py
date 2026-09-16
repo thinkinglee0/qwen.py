@@ -122,11 +122,11 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--stage-sampling-params",
+        "--use-sampling-param-table",
         action="store",
-        default=True,
+        default=None,
         type=_str2bool,
-        help="stage the sampling params through one pinned buffer (true/false); default True",
+        help="build the per-step sampling tensors by gathering from the resident SamplingParamTable (true/false); default True",
     )
 
     parser.addoption(
@@ -142,8 +142,8 @@ def pre_gather_cos_sin(request) -> bool:
     return request.config.getoption("--pre-gather-cos-sin")
 
 @pytest.fixture(scope="session")
-def stage_sampling_params(request) -> bool:
-    return request.config.getoption("--stage-sampling-params")
+def use_sampling_param_table(request) -> bool:
+    return request.config.getoption("--use-sampling-param-table")
 
 @pytest.fixture(scope="session")
 def compile_rope(request) -> bool:
@@ -232,7 +232,7 @@ def batch_for_regular_benchmarking(tokenizer) -> list[list[int]]:
 @pytest.fixture(scope="session")
 def target_config(
     log_dir,
-    stage_sampling_params: bool,
+    use_sampling_param_table: bool,
     pre_gather_cos_sin: bool,
     req_num:int, max_num_seqs:int,
     max_model_len:int, num_blocks: int
@@ -248,7 +248,7 @@ def target_config(
 
     # optimization switches
     config.compile_rope = False
-    config.stage_sampling_params = stage_sampling_params
+    config.use_sampling_param_table = use_sampling_param_table
     config.pre_gather_cos_sin = pre_gather_cos_sin
     return config
 

@@ -97,11 +97,11 @@ def build_attn_metadata(sch_out: SchedulerOutput, config: ModelConfig, cache_dat
     lens: list[int] = []
     cache_lens: list[int] = []
     position_id_lst: list[int] = []
-    slots: list[int] = []
+    cache_slots: list[int] = []
     for req in sch_out.reqs:
         s_info = sch_out.scheduled[req.request_id]
         lens.append(s_info.want)
-        slots.extend(s_info.slots)
+        cache_slots.extend(s_info.cache_slots)
         packed_id_list.extend(req.get_existing_ids(s_info.want))    # compatible for recompute
 
         start = req.num_computed_tokens
@@ -128,7 +128,7 @@ def build_attn_metadata(sch_out: SchedulerOutput, config: ModelConfig, cache_dat
     )
 
     position_ids = torch.tensor(position_id_lst, device=device, dtype=torch.int32)
-    slot_mapping = torch.tensor(slots, device=device, dtype=torch.int64)
+    slot_mapping = torch.tensor(cache_slots, device=device, dtype=torch.int64)
 
     # optional pre-gathered cos/sin for rope
     cos_sin = rope.gather_cos_sin(position_ids) if rope is not None and config.pre_gather_cos_sin else None

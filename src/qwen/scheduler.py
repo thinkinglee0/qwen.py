@@ -9,25 +9,46 @@ from pathlib import Path
 import copy
 import orjson
 import uuid
+import torch
 
 from qwen.utils import round_floats
-from qwen.sampling import TensorSampling, Sampling
+from qwen.sampling import SamplingTensors, SamplingParams, SamplingParamTable
 from qwen.config import ModelConfig
 from qwen.metrics import analyze_metrics, RequestMetrics, SchedulerMetrics, SchedulerStepMetrics, timed
 from qwen.cache import KVCache, cdiv
+from qwen.slot import RequestSlotPool
 from qwen.constants import DEFAULT_MAX_NEW_TOKEN
 
 logger = logging.getLogger(__name__)
 
 
+class SlotIndexBuffer:
+    def __init__(self, capacity: int, device: torch.device):
+        self.capacity = capacity
+        self.idx = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.stage = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.n = 0     # effective number of reqs
+
+    def set(self, reqs: list) -> torch.Tensor:
+        self.n = len(reqs)
+        for i, req in enumerate(reqs):
+            assert req.slot is not None
+            self.stage[i] = req.slot
+        self.idx[:self.n].copy_(self.stage[:self.n], non_blocking=True)     # async prepare indices for gather
+        return self.current()
+    
+    def current(self) -> torch.Tensor:
+        return self.idx[:self.n]
+
 class ModelRequest:
-    def __init__(self, config: ModelConfig, loop, input_ids: list[int], request_id: str | None=None, sampling: Sampling | None = None, max_new_tokens: int=DEFAULT_MAX_NEW_TOKEN):
+    def __init__(self, config: ModelConfig, loop, input_ids: list[int], request_id: str | None=None, sampling: SamplingParams | None = None, max_new_tokens: int=DEFAULT_MAX_NEW_TOKEN):
         self.request_id = request_id if request_id is not None else str(uuid.uuid4())
         self.input_ids = input_ids
         self.sampling = sampling
         self.max_new_tokens = max(1, min(config.max_model_len-len(input_ids), max_new_tokens))
         self.loop = loop
         self.token_queue: asyncio.Queue[int | None | Exception] = asyncio.Queue()
+        self.slot: int | None = None
 
         # for backoff
         self.preempt_count: int = 0
@@ -111,25 +132,30 @@ class ModelRequest:
 @dataclass
 class ScheduledInfo:
     want: int
-    slots: list[int]
+    cache_slots: list[int]
 
     def __post_init__(self):
-        assert self.want == len(self.slots)
+        assert self.want == len(self.cache_slots)
 
 class SchedulerOutput:
-    def __init__(self, step_id: int, reqs: list[ModelRequest], scheduled: dict[str, ScheduledInfo],
+    def __init__(self, step_id: int, reqs: list[ModelRequest], slot_idx: torch.Tensor | None, scheduled: dict[str, ScheduledInfo],
                  block_tables: list[list[int]], config: ModelConfig, scheduler: "Scheduler | None" = None,
                  step_metrics: SchedulerStepMetrics | None = None):
         assert len(reqs) > 0, "SchedulerOutput must have at least one request"
         self.reqs = reqs
+        self.slot_idx = slot_idx
         self.scheduled = scheduled
         self.block_tables = block_tables
         self.config = config
 
         self.batch_size = len(reqs)
         self.prompt_ids = [req.input_ids for req in reqs]
-        batch_sampling = [req.sampling for req in reqs]     # list[Sampling | None]
-        self.tensor_sampling = TensorSampling.from_sampling_list(batch_sampling, self.config, self.batch_size)
+        if config.use_sampling_param_table and scheduler is not None:
+            assert scheduler.sampling_param_tab is not None and self.slot_idx is not None
+            self.sampling_tensors = SamplingTensors.from_table(sampling_param_tab=scheduler.sampling_param_tab, slot_idx=self.slot_idx)
+        else:
+            sampling_lst = [req.sampling for req in reqs]
+            self.sampling_tensors = SamplingTensors.from_params_list(sampling_lst, self.config)
 
         # intermediate states for the batch
         self.output_ids: list[list[int]] = [req.output_ids for req in self.reqs]      # for repetition penalty and synchronous generation
@@ -198,6 +224,16 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         assert self.max_num_batched_tokens >= self.max_num_seqs # ensure that all reqs in decoding can be admitted.
 
+        # slot
+        self.req_slot_pool: RequestSlotPool | None = None
+        self.slot_index_buf: SlotIndexBuffer | None = None
+        self.sampling_param_tab: SamplingParamTable | None = None
+        if config.use_sampling_param_table:
+            self.req_slot_pool = RequestSlotPool(capacity=self.max_num_seqs)
+            assert config.device is not None
+            self.slot_index_buf = SlotIndexBuffer(capacity=self.max_num_seqs, device=config.device)
+            self.sampling_param_tab = SamplingParamTable(self.config)
+
         # scheduling strategy
         self.use_d_first_schedule = config.use_d_first_schedule
 
@@ -243,6 +279,8 @@ class Scheduler:
         new issue: how to choose between swap out and recompute
         '''
         assert not victim.finished
+        if self.sampling_param_tab is not None:
+            assert victim.slot is not None
 
         self.sch_metrics.report_on_preemption()
         if logger.isEnabledFor(logging.DEBUG):
@@ -250,7 +288,9 @@ class Scheduler:
 
         victims.add(victim.request_id)
         self.running.remove(victim) if victim in self.running else None   # compatible for D_first_preemptive_schedule
-        self.cache.free(victim)     # must execute before reset_on_preemption because the original num_computed_tokens is needed for freeing cache
+
+        # must execute before reset_on_preemption because the original num_computed_tokens is needed for freeing cache
+        self._free_resources(victim)
 
         victim.reset_on_preemption()  # recompute from scratch, preempt_count += 1
 
@@ -281,6 +321,8 @@ class Scheduler:
 
     def cleanup_on_finished(self, req: ModelRequest):
         assert req.finished and req.is_decoding
+        if self.sampling_param_tab is not None:
+            assert req.slot is not None
         assert req in self.running
 
         self.sch_metrics.report_on_finish()
@@ -288,30 +330,28 @@ class Scheduler:
             logger.debug(f"{req.request_id} finished, removed")
 
         self.running.remove(req)
-        self.cache.free(req)
+        self._free_resources(req)
         self.req_metrics_list.append(req.metrics)
 
     def _do_cleanup_on_error(self, req: ModelRequest, e: Exception):
+        # assert not req.finished   # may have finished but the client closed the connection, so do not assert
         req.finished = True
         if req.loop is not None:
             req.loop.call_soon_threadsafe(req.token_queue.put_nowait, e)
 
-        self.cache.free(req)
+        self._free_resources(req)
         self.req_metrics_list.append(req.metrics)
         self.sch_metrics.report_on_error()
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"an error occured in {req.request_id}, removed")
 
-    def cleanup_running_on_error(self, e: Exception):
+    def cleanup_all_on_error(self, e: Exception):
         while self.running:
-            req = self.running.pop()
-            self._do_cleanup_on_error(req, e)
+            self._do_cleanup_on_error(self.running.pop(), e)
 
-        # maybe cuased by the front of waiting
-        if self.waiting:
-            req = self.waiting.popleft()
-            self._do_cleanup_on_error(req, e)
+        while self.waiting:
+            self._do_cleanup_on_error(self.waiting.popleft(), e)
 
     def cleanup_on_error(self, req: ModelRequest, e: Exception):
         assert req in self.running
@@ -340,7 +380,7 @@ class Scheduler:
                 logger.debug(f"the aborted request may have finished, do nothing.")
             return
 
-        self.cache.free(req)
+        self._free_resources(req)
         self.req_metrics_list.append(req.metrics)
         self.sch_metrics.report_on_error()
         if logger.isEnabledFor(logging.DEBUG):
@@ -367,6 +407,34 @@ class Scheduler:
             return self.waiting[0]      # oldest one
 
         return None
+
+    def _alloc_resources_on_admission(self, req: ModelRequest, want: int) -> list[int] | None:
+        if self.config.use_sampling_param_table:
+            assert req.slot is None and self.req_slot_pool is not None
+            req.slot = self.req_slot_pool.alloc()
+            if self.sampling_param_tab is not None:
+                self.sampling_param_tab.set_slot(req.slot, req.sampling, self.config)
+
+        # allocate cache slots for admitted requests
+        cache_slots = self.cache.allocate_slots(req, want=want, respect_watermark=True)
+        if cache_slots is None:
+            if self.config.use_sampling_param_table:
+                # free req slot when cache allocation fails,
+                # otherwise the req slot will be leaked and the scheduler will receive an IndexError while the req pool exhausted.
+                assert req.slot is not None and self.req_slot_pool is not None
+                self.req_slot_pool.free(req)
+
+            self.sch_metrics.report_on_cache_exhausted()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"failed to allocate cache slots for {req.request_id}")
+            return None
+
+        return cache_slots
+
+    def _free_resources(self, req: ModelRequest):
+        self.cache.free(req)
+        if self.req_slot_pool is not None:
+            self.req_slot_pool.free(req)
 
     def schedule(self, step_metrics: SchedulerStepMetrics | None = None) -> SchedulerOutput | None:            # called by run_loop
         self.sch_metrics.step_id += 1
@@ -429,7 +497,7 @@ class Scheduler:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"add {req.request_id} to scheduled_running")
                 scheduled_running.append(req)
-                s_info = ScheduledInfo(want=want, slots=new_slots)
+                s_info = ScheduledInfo(want=want, cache_slots=new_slots)
                 scheduled[req.request_id] = s_info
                 budget -= want
 
@@ -443,11 +511,8 @@ class Scheduler:
                     break
 
                 want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
-                slots = self.cache.allocate_slots(req, want=want, respect_watermark=True)
-                if slots is None:
-                    self.sch_metrics.report_on_cache_exhausted()
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"failed to allocate slots for {req.request_id}")
+                cache_slots = self._alloc_resources_on_admission(req, want=want)    # alloc cache slots and req slot, if failed, return None
+                if cache_slots is None:
                     break                                 # no room, stop admitting
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -455,7 +520,7 @@ class Scheduler:
                 scheduled_running.append(req)
                 self.running.append(req)
                 self.waiting.remove(req)
-                s_info = ScheduledInfo(want=want, slots=slots)
+                s_info = ScheduledInfo(want=want, cache_slots=cache_slots)
                 scheduled[req.request_id] = s_info
                 budget -= want
 
@@ -473,8 +538,13 @@ class Scheduler:
                 block_tables.append(bt)
 
             self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
-            return SchedulerOutput(self.sch_metrics.step_id, scheduled_running, scheduled, block_tables=block_tables,
-                                config=self.config, scheduler=self, step_metrics=step_metrics)
+            slot_idx =self.slot_index_buf.set(reqs=scheduled_running) if self.slot_index_buf is not None else None
+            return SchedulerOutput(
+                step_id=self.sch_metrics.step_id,
+                reqs=scheduled_running, slot_idx=slot_idx,
+                scheduled=scheduled, block_tables=block_tables,
+                config=self.config, scheduler=self,
+                step_metrics=step_metrics)
     
     def _pick_victim(self, cur_req):
         # pick strategies
@@ -549,7 +619,7 @@ class Scheduler:
                 if new_slots is None:                   # yield, according to "victim is None"
                     continue
 
-                s_info = ScheduledInfo(want=want, slots=new_slots)
+                s_info = ScheduledInfo(want=want, cache_slots=new_slots)
                 scheduled[req.request_id] = s_info
                 scheduled_running.append(req)
                 if logger.isEnabledFor(logging.DEBUG):
@@ -566,14 +636,13 @@ class Scheduler:
                     break
 
                 want = min(req.num_prompt_remaining, budget, self.long_prefill_token_threshold)
-                slots = self.cache.allocate_slots(req, want, respect_watermark=True)
-                if slots is None:
-                    self.sch_metrics.report_on_cache_exhausted()
+                cache_slots = self._alloc_resources_on_admission(req, want=want)    # alloc cache slots and req slot, if failed, return None
+                if cache_slots is None:
                     break                                 # no room, stop admitting
 
                 self.running.append(req)
                 self.waiting.remove(req)
-                s_info = ScheduledInfo(want=want, slots=slots)
+                s_info = ScheduledInfo(want=want, cache_slots=cache_slots)
                 scheduled[req.request_id] = s_info
                 scheduled_running.append(req)
                 if logger.isEnabledFor(logging.DEBUG):
@@ -594,8 +663,13 @@ class Scheduler:
                 block_tables.append(bt)
 
             self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
-            return SchedulerOutput(self.sch_metrics.step_id, scheduled_running, scheduled, block_tables=block_tables,
-                                config=self.config, scheduler=self, step_metrics=step_metrics)
+            slot_idx =self.slot_index_buf.set(reqs=scheduled_running) if self.slot_index_buf is not None else None
+            return SchedulerOutput(
+                step_id=self.sch_metrics.step_id,
+                reqs=scheduled_running, slot_idx=slot_idx,
+                scheduled=scheduled, block_tables=block_tables,
+                config=self.config, scheduler=self,
+                step_metrics=step_metrics)
 
     def log_metrics(self, sch_out: SchedulerOutput, is_exiting: bool=False):
         self.log_step_metrics(sch_out=sch_out)

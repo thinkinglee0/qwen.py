@@ -8,7 +8,7 @@ from qwen.config import ModelConfig
 from qwen.decode_layer import DecoderLayer
 from qwen.attention import AttentionMetadata
 from qwen.utils import RMSNorm
-from qwen.sampling import apply_penalties2, sample2, TensorSampling
+from qwen.sampling import apply_penalties2, sample2, SamplingTensors
 from qwen.scheduler import SchedulerOutput
 from qwen.rope import init_rope
 
@@ -81,10 +81,10 @@ class QwenForCausalLM(nn.Module):
             output_tokens.append(req.output_ids)
 
         if self.config.do_penalities:
-            logits = apply_penalties2(logits, prompt_tokens, output_tokens, sch_out.tensor_sampling, self.config.vocab_size)
+            logits = apply_penalties2(logits, prompt_tokens, output_tokens, sch_out.sampling_tensors, self.config.vocab_size)
 
         if self.config.do_sample:
-            next_tokens = sample2(logits, sch_out.tensor_sampling)
+            next_tokens = sample2(logits, sch_out.sampling_tensors)
         else:
             next_tokens = logits.argmax(dim=-1)
 

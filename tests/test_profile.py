@@ -99,11 +99,11 @@ excluded from execution from file, only allowed from specified execution.
 Usage:
 baseline:
 for bz in 1 8 32 128 512; do
-SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --stage-sampling-params=false --pre-gather-cos-sin=false;
+SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --use-sampling-param-table=false --pre-gather-cos-sin=false;
 done
 
 # in one line:
-for bz in 1 8 32 128 512; do SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --stage-sampling-params=false --pre-gather-cos-sin=false; done
+for bz in 1 8 32 128 512; do SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --use-sampling-param-table=false --pre-gather-cos-sin=false; done
 '''
 _DEFAULT_PROFILE_BATCH_SIZES = [512]
 @pytest.mark.parametrize("batch_size", parse_env_list_value(env_name="SWEEP_PROFILE_BATCH_SIZES", default_value=_DEFAULT_PROFILE_BATCH_SIZES))

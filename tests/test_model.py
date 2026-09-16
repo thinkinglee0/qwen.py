@@ -54,26 +54,26 @@ def build_scheduler_output_on_prefill(model, cache, input_ids_lst) -> SchedulerO
         req = ModelRequest(model.config, loop=None, input_ids=input_ids, sampling=None)
         reqs.append(req)
         want = len(input_ids)
-        slots = cache.allocate_slots(req, want)
-        scheduled[req.request_id] = ScheduledInfo(want, slots)
+        cache_slots = cache.allocate_slots(req, want)
+        scheduled[req.request_id] = ScheduledInfo(want, cache_slots)
         block_table = cache.get_block_table(req)
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, slot_idx=None, scheduled=scheduled, block_tables=block_tables, config=model.config)
 
 def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
     scheduled: dict[str, ScheduledInfo] = {}
     block_tables: list[list[int]] = []
     for req in reqs:
         want = 1
-        slots = cache.allocate_slots(req, want)
-        scheduled[req.request_id] = ScheduledInfo(want, slots)
+        cache_slots = cache.allocate_slots(req, want)
+        scheduled[req.request_id] = ScheduledInfo(want, cache_slots)
         block_table = cache.get_block_table(req)
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, slot_idx=None, scheduled=scheduled, block_tables=block_tables, config=model.config)
 
 class HookManager:
     hooks: dict[str, Any]   # save_i/save_o store a Tensor directly; patch_rope's hooks store list[Tensor]

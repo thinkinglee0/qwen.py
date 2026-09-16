@@ -5,7 +5,7 @@ from qwen.utils import resolve_device, default_dtype
 from qwen.attention import _bottom_right_causal_bias, build_attn_metadata
 from qwen.scheduler import SchedulerOutput, ModelRequest, ScheduledInfo
 from qwen.cache import KVCacheData, cdiv
-from qwen.sampling import Sampling, TensorSampling
+from qwen.sampling import SamplingParams, SamplingTensors
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def test_causal_mask():
     torch.testing.assert_close(mask, expected)
 
 def test_build_attn_metadata(tmp_target_config):
-    sampling = Sampling(temperature=1.0, top_k=3)
+    sampling = SamplingParams(temperature=1.0, top_k=3)
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()    # rectangular tensor
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req1.num_computed_tokens = 10
@@ -81,9 +81,9 @@ def test_build_attn_metadata(tmp_target_config):
     # uuid
     assert req1.request_id != req2.request_id and req1.request_id != req3.request_id and req2.request_id != req3.request_id
 
-    s_info_1 = ScheduledInfo(want=1, slots=[110])
-    s_info_2 = ScheduledInfo(want=2, slots=[120, 121])
-    s_info_3 = ScheduledInfo(want=3, slots=[130, 131, 132])
+    s_info_1 = ScheduledInfo(want=1, cache_slots=[110])
+    s_info_2 = ScheduledInfo(want=2, cache_slots=[120, 121])
+    s_info_3 = ScheduledInfo(want=3, cache_slots=[130, 131, 132])
 
     scheduled: dict[str, ScheduledInfo] = {
         req1.request_id: s_info_1,
@@ -93,10 +93,10 @@ def test_build_attn_metadata(tmp_target_config):
 
     block_tables: list[list[int]] = [[100], [200, 400], [300]]
 
-    sch_out = SchedulerOutput(step_id=0, reqs=[req1, req2, req3], scheduled=scheduled,
+    sch_out = SchedulerOutput(step_id=0, reqs=[req1, req2, req3], slot_idx=None, scheduled=scheduled,
                               block_tables=block_tables, config=tmp_target_config, scheduler=None)
-    assert sch_out.tensor_sampling.temperature is not None and sch_out.tensor_sampling.temperature.tolist() == [1.0]*3
-    assert sch_out.tensor_sampling.top_k is not None and sch_out.tensor_sampling.top_k.tolist() == [3]*3
+    assert sch_out.sampling_tensors.temperature is not None and sch_out.sampling_tensors.temperature.tolist() == [1.0]*3
+    assert sch_out.sampling_tensors.top_k is not None and sch_out.sampling_tensors.top_k.tolist() == [3]*3
 
     packed_ids, md = build_attn_metadata(sch_out, cache_data=None, config=tmp_target_config, rope=None)
 
