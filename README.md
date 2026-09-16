@@ -17,7 +17,7 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M4**    | sampling, restructure the project layout                        | ✅ done, add repetition/frequency/presence penalties, temperature, top_k/top_p, multinomial; isolate source code from unit tests; extract attention/mlp/decode_layer/norm from model.py, and bind weights to the `nn.Module` tree through the `load_state_dict` function. |
 | **M5**    | static batching                                                 | ✅done. pack a list of **variable-length** id sequences into a 1-dim id list, opt for SDPA attention in my local macbook for quick functional verifications; add request to `StaticScheduler`, and then scheduler in a fixed batch.                                       |
 | **M6**    | continuous batching                                             | ✅done. continuous batching with paged kv cache; two interchangable scheduling strategies (preemptive_schedule and D_first_preemptive_schedule); watermark block reservation; expential backoff; KVCache.verify_invariant periodically checks; metrics (schedule metrics, step metrics, and request metrics).|
-| **M7**    | performance profiling     | 🔜 next. performance profiling of continuous batching on NVIDIA 4090    |
+| **M7**    | performance profiling     | ✅ done for the 0.5B baseline. Three rounds on an RTX 4090 — concurrency sweeps (batch 1 → 1 024) and a decode-step profiler reporting GPU idle fraction from the chrome trace, every configuration run **twice** for a measured noise floor. Reports: [log910](./docs/performance_analysis_log910.md), [log914](./docs/performance_analysis_log914.md), [log915](./docs/performance_analysis_log915.md) ([中文](./docs/performance_analysis_log915.zh.md)) and the switch matrix [log915](./docs/performance_switches_log915.md) ([中文](./docs/performance_switches_log915.zh.md)). |
 | later     | Fused kernels in Trition | planed  |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
@@ -97,7 +97,85 @@ stay tuned
 
 ### 2 Continuous Batching
 
-stay tuned
+#### 2.1 Platform: NVIDIA RTX 4090
+
+**Model**: Qwen2.5-0.5B-Instruct, bf16 · **Workload**: 512 random ids in, 128 tokens out, EOS ignored, closed-loop
+
+Three rounds, every configuration swept **twice with no code change in between** — so the noise floor
+is measured, not assumed. The latest round reproduces to **1.21 % on all 11 batch sizes**, which is
+the bar every claim below has to clear.
+
+| | log910 | log914 | **log915** |
+| --- | --- | --- | --- |
+| `do_sample` | false (penalties + `argmax`) | true | true |
+| `pre_gather_cos_sin` | — | declared false, **ignored by the code** | false, **honoured** |
+| Peak throughput | 7 028 tok/s @ 1024 | 5 300 tok/s @ 1024 | 5 095 tok/s @ 1024 |
+| TPOT @ batch 1 | 22.8 ms | 19.0 ms | 22.9 ms |
+| Last profitable doubling | batch 256 | batch 256 | **batch 128** |
+| Run-to-run spread | — | ≤ 5.5 % | **≤ 1.21 %** |
+| Report | [log910](./docs/performance_analysis_log910.md) | [log914](./docs/performance_analysis_log914.md) | [log915](./docs/performance_analysis_log915.md) · [中文](./docs/performance_analysis_log915.zh.md) |
+
+The three baselines are **not** directly comparable: `do_sample` was off in log910, and
+`pre_gather_cos_sin` was a declared-but-unread flag until log915 (so log914's "baseline" was silently
+running with pre-gather on). Each report states its own configuration; the structural findings below
+hold across all three.
+
+**Conclusions**:
+
+1. **The GPU is not the limit — it is idle 50–85 % of every decode step.** 3.3 ms of kernels inside a
+   19.1 ms step at batch 1. At peak throughput the model's weight traffic is ~5.8 GB/s against the
+   card's 1 008 GB/s: **4.3 % MBU at batch 1, 2.6 % MFU at batch 1 024.**
+
+2. **The model forward costs ~22 ms regardless of what goes into it** — 20.5 ms at batch 1 and
+   23.5 ms at batch 1 024, +14 % for 1 024× the tokens; a prefill step carrying 7 511 tokens spends
+   77 ms in the same window. That is ~280 eager kernel launches per step with ~50 µs of gap between
+   them, not model compute. It sets the **latency floor** and is why batch 1 reaches only 44 tok/s.
+   `rope` alone is 28 % of it.
+
+3. **Sampling is the throughput ceiling, and it scales linearly with batch** — **60.4 % of total
+   wall-clock time** at batch 512, 82 % of a decode step at batch 1 024, a **127×** rise for a 1 024×
+   batch. Two full-vocabulary passes per step are responsible: `apply_top_p` sorts all 151 936 logits
+   per sequence (a 78 M-element sort at batch 512), and `apply_penalties` materialises
+   `[batch, vocab]` fp32 tensors (311 MB at batch 512, 622 MB at batch 1 024). With `top_k = 20`,
+   top-p only needs the 20 survivors ranked.
+
+4. **Chunked prefill pays the sampling bill twice.** A prefill step also samples every running decode
+   row, so at batch 1 024 prefill steps hold 54 % of all steps and **63.7 s of their 149 s is
+   sampling**, against 79.5 s of genuine prefill compute.
+
+5. **The kernels themselves are healthy.** The LM-head projection hits 146 TFLOP/s (**88 % of the
+   4090's BF16 peak**) and prefill reaches 70 TFLOP/s (42 % MFU) on 8 192-token steps. The deficit is
+   orchestration, not arithmetic. Zero preemptions and zero cache exhaustions across 11 batch sizes
+   × 2 runs, in every round.
+
+#### 2.2 Optimisation switches
+
+Measured one at a time in log915 — [report](./docs/performance_switches_log915.md) ·
+[中文](./docs/performance_switches_log915.zh.md):
+
+| Switch | GPU kernel time | Step wall time | Verdict |
+| --- | --- | --- | --- |
+| `pre_gather_cos_sin` | −0.3 … −4.2 % | **−1.6 … −10.9 %** | **Keep it on** (and it already defaults to `True`) — the only switch that cuts host *and* device work |
+| `compile_rope` | −1.0 … −12.3 % | **+1.2 … +4.7 %** | Off. Measured three times, negative three times: it trades GPU time for more wall time |
+| `stage_sampling_params` | ±0.1 % | −0.1 … −1.8 % | Off. Consistent in direction, never outside noise — its mechanism caps the win at ~0.4 ms/step |
+
+**In a launch-bound engine, cutting GPU work is not merely low-value — it is negative-value.**
+`compile_rope` genuinely removes ~0.4 ms of kernel time per step and still makes the step slower,
+because the host pays more to reach the fused kernel (48 guard evaluations per step). That sign
+should flip once the decode path is CUDA-graphed; until then, kernel-level tuning is premature.
+
+**Reading the metrics** — four traps, documented in
+[log914 §7](./docs/performance_analysis_log914.md#7-three-traps-in-this-instrumentation) and
+[log915 switches §1.2](./docs/performance_switches_log915.md):
+
+* CPU-side timings are meaningless in mixed prefill/decode steps — the host is blocking on the GPU backlog there.
+* A `*_gpu` field is a CUDA-event **window**, not busy time; gaps inside it are counted.
+* `rope_gpu` at batch 1 024 is a known-bad metric (per-layer event merge).
+* **`torch.profiler` leaves ~30 % of host overhead behind in the process**, so every batch point after
+  the first in a profiling session is inflated — and with it the reported GPU idle fraction. Confirmed
+  by isolation: give each batch size its own pytest process and the two harnesses agree to **0.05 %**
+  at batch 512 (100.218 vs 100.17 ms), having been 5 % apart; the reported idle fraction there drops
+  52.3 % → 50.2 %. The sweep harness is unaffected; where the two disagree, trust the sweep.
 
 ---
 
@@ -165,8 +243,28 @@ Other following verifications see `tests/` folder for details. The main ones `te
 
 ## Roadmap
 
-1. **Performance** — move to GPU, profile against the 7B / RTX 4090 target.
-2. **Continuous batching** — evict finished requests and add waiting request in flight.
+Ordered by measured cost — see [log915 §7](./docs/performance_analysis_log915.md#7-recommendations-in-order).
+
+1. **Rewrite sampling to work on the candidate set** — `topk(k)` first, then sort/softmax/multinomial
+   over *k* instead of over all 151 936 logits; penalties on gathered candidates instead of a
+   `[batch, vocab]` materialisation. The only change that moves throughput by a multiple (≈2× at
+   batch 512), and it pays twice because chunked-prefill steps sample too.
+2. **CUDA-graph the decode step** — shapes are static once the batch is fixed. The only change that
+   improves single-stream latency, it lifts small-batch throughput where `fwd` is 90 % of the step,
+   and it is the prerequisite for kernel-level tuning to have the sign one expects.
+3. **Stop sweeping with `--pre-gather-cos-sin=false`** — free, already the `config.py` default, worth
+   1.6–10.9 % of the step. The published baselines are pessimistic by that much.
+4. **Apply the verified fix for the profiler contamination** — one batch size per pytest process is
+   known to remove it entirely (log916); what remains is to make that the harness default rather than
+   a shell loop around `pytest`. Every `gpu_idle_fraction` published from a multi-batch session is
+   overstated by ~2 points for all but its first batch point.
+5. **Un-block the token read-back** — `next_tokens.tolist()` is 5.2 ms at batch 1 024 and a hard sync;
+   stage through pinned memory on a side stream once the step is short enough for 5 ms to matter.
+6. **Chase the host-path tail, not its mean** — 43 of 965 decode steps at batch 512 carry a
+   multi-millisecond spike in `ci`/`bld_meta`/`sched`; they are enumerated in the `.anomaly` files
+   the profiling harness writes.
+7. **Fused kernels in Triton**, once the orchestration overhead above no longer hides them.
+8. **Scale to the 7B target** on the same harness.
 
 ## License
 
