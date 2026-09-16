@@ -131,7 +131,7 @@ def build_attn_metadata(sch_out: SchedulerOutput, config: ModelConfig, cache_dat
     slot_mapping = torch.tensor(slots, device=device, dtype=torch.int64)
 
     # optional pre-gathered cos/sin for rope
-    cos_sin = rope.gather_cos_sin(position_ids) if rope is not None else None
+    cos_sin = rope.gather_cos_sin(position_ids) if rope is not None and config.pre_gather_cos_sin else None
 
     block_table = build_block_table(sch_out.block_tables, device)
 
