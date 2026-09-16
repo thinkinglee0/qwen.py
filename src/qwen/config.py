@@ -102,15 +102,15 @@ class ModelConfig():
 
     # timing tasks
     is_benchmarking: bool=False
-    req_metrics_interval: float = 60               # sec
-    cache_verification_interval: float = 60 # sec
+    req_metrics_interval: float = 60            # sec
+    cache_verification_interval: float = 60     # sec
 
     # log
     log_dir: str = LOG_DIR
 
     # optimization switches
     compile_rope: bool | None = None   # rope compilation. None = automatically: CUDA on, CPU/mac off
-    make_sampling_tensor_strategy: int = 0  # 0 = single tensors, 1 = one staging tensor
+    stage_sampling_params: bool = True
     pre_gather_cos_sin: bool = True
 
     def __post_init__(self):

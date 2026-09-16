@@ -29,6 +29,7 @@ def pytest_collection_modifyitems(session, config, items):
                           "test_benchmark_sweep_batched_tokens_and_long_prefill_token_threshold",
                           "test_parse_metrics_sweep_batch_size",
                           "test_profile_decode_idle_fraction",
+                          "test_mean_step_metrics",
                           "test_parse_chrome_trace",
                           ]
     excluded_module_names = ["test_playground"]
@@ -121,11 +122,11 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--make-sampling-tensor-strategy",
+        "--stage-sampling-params",
         action="store",
-        default=1,
-        type=int,
-        help="Sampling tensor strategy (e.g.: 1/0)"
+        default=True,
+        type=_str2bool,
+        help="stage the sampling params through one pinned buffer (true/false); default True",
     )
 
     parser.addoption(
@@ -141,8 +142,8 @@ def pre_gather_cos_sin(request) -> bool:
     return request.config.getoption("--pre-gather-cos-sin")
 
 @pytest.fixture(scope="session")
-def make_sampling_tensor_strategy(request) -> int:
-    return request.config.getoption("--make-sampling-tensor-strategy")
+def stage_sampling_params(request) -> bool:
+    return request.config.getoption("--stage-sampling-params")
 
 @pytest.fixture(scope="session")
 def compile_rope(request) -> bool:
@@ -231,7 +232,7 @@ def batch_for_regular_benchmarking(tokenizer) -> list[list[int]]:
 @pytest.fixture(scope="session")
 def target_config(
     log_dir,
-    make_sampling_tensor_strategy: int,
+    stage_sampling_params: bool,
     pre_gather_cos_sin: bool,
     req_num:int, max_num_seqs:int,
     max_model_len:int, num_blocks: int
@@ -247,7 +248,7 @@ def target_config(
 
     # optimization switches
     config.compile_rope = False
-    config.make_sampling_tensor_strategy = make_sampling_tensor_strategy
+    config.stage_sampling_params = stage_sampling_params
     config.pre_gather_cos_sin = pre_gather_cos_sin
     return config
 

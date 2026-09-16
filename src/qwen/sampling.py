@@ -75,17 +75,15 @@ class TensorSampling:
 
     @classmethod
     def from_sampling_list(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
-        if config.make_sampling_tensor_strategy == 0:
-            return cls.from_sampling_list_0(samplings, config, bsz)
-        if config.make_sampling_tensor_strategy == 1:
-            return cls.from_sampling_list_1(samplings, config, bsz)
+        if config.stage_sampling_params:
+            return cls.from_sampling_list_staged(samplings, config, bsz)
 
-        raise ValueError(f"Unknown sampling tensor strategy: {config.make_sampling_tensor_strategy}")
+        return cls.from_sampling_list_per_tensor(samplings, config, bsz)
 
     @classmethod
-    def from_sampling_list_0(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+    def from_sampling_list_per_tensor(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"from_sampling_list_0: bsz: {bsz}")
+            logger.debug(f"from_sampling_list_per_tensor: bsz: {bsz}")
 
         return cls(
             config=config,
@@ -99,9 +97,9 @@ class TensorSampling:
         )
 
     @classmethod
-    def from_sampling_list_1(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
+    def from_sampling_list_staged(cls, samplings: list[Sampling | None], config: ModelConfig, bsz: int):
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"from_sampling_list_1: bsz: {bsz}")
+            logger.debug(f"from_sampling_list_staged: bsz: {bsz}")
 
         def pick(attr: str, default):
             return [getattr(s, attr) if s is not None and getattr(s, attr) is not None else default
