@@ -115,6 +115,11 @@ the bar every claim below has to clear.
 | Run-to-run spread | — | ≤ 5.5 % | **≤ 1.21 %** |
 | Report | [log910](./docs/performance_analysis_log910.md) | [log914](./docs/performance_analysis_log914.md) | [log915](./docs/performance_analysis_log915.md) · [中文](./docs/performance_analysis_log915.zh.md) |
 
+The log915 sweep is also plotted —
+[throughput / latency trade-off, six panels](./docs/attachments/concurrency_sweep.log915.baseline.run1.png)
+([run 2](./docs/attachments/concurrency_sweep.log915.baseline.run2.png)) — where the marginal-effect
+panel shows the last profitable doubling directly.
+
 The three baselines are **not** directly comparable: `do_sample` was off in log910, and
 `pre_gather_cos_sin` was a declared-but-unread flag until log915 (so log914's "baseline" was silently
 running with pre-gather on). Each report states its own configuration; the structural findings below

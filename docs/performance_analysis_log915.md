@@ -111,6 +111,25 @@ one to trust.
 | 512 | 5 120 | 4 681.7 | +0.50 % | 9.14 | 0.21 | 0.38 | 107.5 | 102.5 | 129.0 | 256.7 | 140.0 |
 | 1024 | 10 240 | 5 094.6 | +0.47 % | 4.98 | 0.11 | 0.11 | 195.3 | 204.3 | 223.0 | 488.6 | 257.3 |
 
+![Concurrency sweep, log915 baseline, run 1](./attachments/concurrency_sweep.log915.baseline.run1.png)
+
+*The same run, drawn. Three panels carry what the table cannot: **top-left**, the shape of the
+departure from linear scaling and the 5 095 tok/s ceiling; **middle-left**, the throughput gain and
+the TPOT cost of each doubling crossing over — the red area is where a doubling is a net loss;
+**middle-right**, the throughput reachable under a latency budget (≤ 2 834 tok/s at a 50 ms TPOT SLO,
+≤ 1 121 tok/s at 30 ms), which appears nowhere in the numbers above. The bottom row is a soundness
+check: slot occupancy stays at 0.97–1.00, so none of this is a queueing artefact.*
+
+*Configuration is the pessimistic one — all switches off, `pre_gather_cos_sin=false` included (see the
+note at the top). Run 2 gives the same figure, beside it as `…run2.png`. Regenerate with*
+
+```bash
+python benchmark/tool/bench_viz.py --log-dir=log_vast/log915/benchmark_baseline \
+  --out=$PWD/docs/attachments/concurrency_sweep.log915.baseline.run1.png
+```
+
+*which also writes a `.txt` report of the same numbers next to the figure.*
+
 * **The last profitable doubling ends at batch 128** (throughput gain ÷ TPOT cost > 1). Past it you
   buy 34 % more throughput for 49 % more latency, then 23 % for 62 %, then 9 % for 82 %.
 * **TPOT is flat from batch 1 to 16** (22.9 → 25.7 ms): 16× the work for 12 % more time. That is a
@@ -181,6 +200,11 @@ row as well as its own new sequences: at batch 1 024, prefill steps are 54 % of 
 | Achieved | 43.5 GB/s | 9.9 GB/s | 5.8 GB/s |
 | **MBU** (vs 1 008 GB/s) | **4.3 %** | 1.0 % | 0.6 % |
 | **MFU** (decode, vs 165.2 TFLOP/s) | 0.2 % | 1.4 % | **2.6 %** |
+
+`bench_viz.py` reports **3.1 % MFU** for this same run rather than the 2.6 % above: it counts all
+494 M parameters (the LM head included) against the run-average throughput, where this table counts
+the 357.9 M body against the decode step alone. Both are right about what they measure — quote the
+definition with the number.
 
 Utilisation gets *worse* with batch, because the step grows while the weight read does not. For
 contrast, the two pieces that are doing real work: **prefill reaches 70 TFLOP/s (42 % MFU)** on
