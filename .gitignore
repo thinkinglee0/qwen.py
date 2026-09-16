@@ -8,3 +8,4 @@ playgrounds/
 test_playground.py
 data/
 benchmark/data
+docs/dataclass_class_attribute_pitfall.md
