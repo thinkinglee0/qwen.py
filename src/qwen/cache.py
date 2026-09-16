@@ -95,12 +95,12 @@ class KVCache:
 
         # verification
         self.cache_verification_interval = config.cache_verification_interval
-        self._last_req_metrics_time = time.perf_counter()  # starting time
+        self._last_verify_time = time.perf_counter()  # starting time
 
         # exhausted report
         self.exhausted_report_interval = 60
         self.exhausted_report_cnt = 0
-        self._last_report_exhausted_time = time.perf_counter()  # starting time
+        self._last_report_exhausted_time = 0.   # ensure the first report surfaces.
 
     def teardown(self):
         self.data.teardown()
@@ -121,16 +121,16 @@ class KVCache:
             logger.debug(f"cache invariant vierifciation succeeded, interval: {self.cache_verification_interval}")
 
     def verify_invariant_periodical(self, now: float=time.perf_counter()):
-        if now - self._last_req_metrics_time > self.cache_verification_interval:
+        if now - self._last_verify_time > self.cache_verification_interval:
             self.verify_invariant()
-        self._last_req_metrics_time = now
+            self._last_verify_time = now
 
     def report_pool_exhausted(self, now: float=time.perf_counter()):
         self.exhausted_report_cnt += 1
         if now - self._last_report_exhausted_time > self.exhausted_report_interval:
-            logger.warning(f"no new block {self.exhausted_report_cnt} times")
+            logger.warning(f"report cache pool exhausted {self.exhausted_report_cnt} times")
             self.exhausted_report_cnt = 0
-        self._last_report_exhausted_time = now
+            self._last_report_exhausted_time = now
 
     def new_blocks_needed(self, request, num_new_tokens: int):
         total = cdiv(request.num_computed_tokens + num_new_tokens, self.block_size)
