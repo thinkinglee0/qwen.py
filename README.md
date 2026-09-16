@@ -5,6 +5,8 @@ understand LLM inference at the mechanism level. The model code (attention, RoPE
 
 Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-7B on an NVIDIA RTX 4090**.
 
+> *Special contributor: **Claude** maintaining `docs` and the profiling/visualizing tools (`tests/test_profile.py`, `benchmark/tool/bench_viz.py`)*
+
 ---
 
 ## Status
