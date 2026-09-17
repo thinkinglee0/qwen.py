@@ -26,7 +26,7 @@ class SlotIndexBuffer:
     def __init__(self, capacity: int, device: torch.device):
         self.capacity = capacity
         self.idx = torch.empty(capacity, dtype=torch.int64, device=device)
-        self.stage = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.stage = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
         self.n = 0     # effective number of reqs
 
     def set(self, reqs: list) -> torch.Tensor:

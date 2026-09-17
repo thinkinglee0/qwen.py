@@ -17,7 +17,7 @@ class StepEvents:
     """CUDA events for one step. record() is async; read() must run after a sync (e.g.: next_tokens.tolist())."""
 
     # shared across all instances
-    SEGMENTS = ("fwd", "logits", "sample", "rope")
+    SEGMENTS = ("fwd", "logits", "sample", "rope", "sched_ret")
 
     def __init__(self):
         if not torch.cuda.is_available():
@@ -79,6 +79,7 @@ class SchedulerStepMetrics:
     sched_run: float = 0.
     sched_wait: float = 0.
     sched_ret: float = 0.
+    sched_ret_gpu: float = 0.
     bld_meta: float = 0.
     fwd: float = 0.
     fwd_gpu: float = 0.
