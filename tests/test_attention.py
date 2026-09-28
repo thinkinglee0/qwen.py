@@ -2,7 +2,8 @@ import torch
 import logging
 
 from qwen.utils import resolve_device, default_dtype
-from qwen.attention import _bottom_right_causal_bias, build_attn_metadata
+from qwen.attention import _bottom_right_causal_bias
+from qwen.attention import build_attn_metadata
 from qwen.scheduler import SchedulerOutput, ModelRequest, ScheduledInfo
 from qwen.cache import KVCacheData, cdiv
 from qwen.sampling import SamplingParams, SamplingTensors
@@ -68,7 +69,7 @@ def test_build_attn_metadata(tmp_target_config):
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 100))[0].tolist()    # rectangular tensor
     req1 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
     req1.num_computed_tokens = 10
-    assert req1.is_decoding == False
+    assert req1.projected_is_decoding == False
 
     input_ids = torch.randint(0, tmp_target_config.vocab_size, (1, 200))[0].tolist()    # rectangular tensor
     req2 = ModelRequest(tmp_target_config, loop=None, input_ids=input_ids, sampling=sampling)
@@ -93,12 +94,9 @@ def test_build_attn_metadata(tmp_target_config):
 
     block_tables: list[list[int]] = [[100], [200, 400], [300]]
 
-    sch_out = SchedulerOutput(step_id=0, reqs=[req1, req2, req3], slot_idx=None, scheduled=scheduled,
+    sch_out = SchedulerOutput(step_id=0, reqs=[req1, req2, req3], scheduled=scheduled,
                               block_tables=block_tables, config=tmp_target_config, scheduler=None)
-    assert sch_out.sampling_tensors.temperature is not None and sch_out.sampling_tensors.temperature.tolist() == [1.0]*3
-    assert sch_out.sampling_tensors.top_k is not None and sch_out.sampling_tensors.top_k.tolist() == [3]*3
-
-    packed_ids, md = build_attn_metadata(sch_out, cache_data=None, config=tmp_target_config, rope=None)
+    packed_ids, md = build_attn_metadata(sch_out, tmp_target_config, cache_data=None, rope=None)
 
     assert len(packed_ids) == 6
     assert packed_ids.tolist() == req1.input_ids[req1.num_computed_tokens:req1.num_computed_tokens+s_info_1.want] \

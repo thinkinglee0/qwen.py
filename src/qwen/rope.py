@@ -64,8 +64,8 @@ class BaseRoPE(nn.Module):
     def forward2(self, q, k, cos, sin):
         # q,k [T, H, D]
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"pre-gathered cos/sin, q.shape: {q.shape}, k.shape: {k.shape}, cos.shape: {cos.shape}, sin.shape: {sin.shape}")
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     logger.debug(f"pre-gathered cos/sin, q.shape: {q.shape}, k.shape: {k.shape}, cos.shape: {cos.shape}, sin.shape: {sin.shape}")
 
         return self._apply_rotary(q, cos, sin), self._apply_rotary(k, cos, sin)
 

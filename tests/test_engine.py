@@ -107,7 +107,7 @@ async def test_generation_under_kv_pressure(tmp_target_config, batch_for_regular
     sch = engine.scheduler
 
     logger.info("start benchmarking under pressure")
-    out_no_pressure, _ = benchmark(engine, batch_for_regular_benchmarking, max_new_tokens=MAX_NEW_TOKENS_FOR_TEST)
+    out_no_pressure, _ = benchmark(engine, batch_for_regular_benchmarking, max_new_tokens=MAX_NEW_TOKENS_FOR_TEST, specify_request_id=True)
 
     out_pressure = []
     for i, o in zip(batch_for_regular_benchmarking, out_no_pressure):
@@ -134,6 +134,6 @@ async def test_generation_under_kv_pressure(tmp_target_config, batch_for_regular
                     assert False
                 else:
                     mismatch_cnt += 1
-                    logger.warning(f"idx: {idx}, outputs under pressure and no pressure mismatch")
+                    logger.warning(f"idx: {idx}, mismatch")
 
     logger.info(f"mismatch / total: {mismatch_cnt} / {req_cnt}")

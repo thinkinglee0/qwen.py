@@ -99,11 +99,11 @@ excluded from execution from file, only allowed from specified execution.
 Usage:
 baseline:
 for bz in 1 8 32 128 512; do
-SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --use-sampling-param-table=false --pre-gather-cos-sin=false;
+SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --pre-gather-cos-sin=false;
 done
 
 # in one line:
-for bz in 1 8 32 128 512; do SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --use-sampling-param-table=false --pre-gather-cos-sin=false; done
+for bz in 1 8 32 128 512; do SWEEP_PROFILE_BATCH_SIZES=$bz pytest -x -s tests/test_profile.py::test_profile_decode_idle_fraction --compile-rope=False --pre-gather-cos-sin=false; done
 '''
 _DEFAULT_PROFILE_BATCH_SIZES = [512]
 @pytest.mark.parametrize("batch_size", parse_env_list_value(env_name="SWEEP_PROFILE_BATCH_SIZES", default_value=_DEFAULT_PROFILE_BATCH_SIZES))
@@ -173,7 +173,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
             engine.step()
         assert engine.scheduler.running, "no requests admitted -- check num_blocks / max_num_seqs"
         assert len(engine.scheduler.running) == batch_size, "sequences finished mid-measurement -- raise cfg.max_model_len"
-        assert all(r.is_decoding for r in engine.scheduler.running), "still prefilling after warmup_steps -- increase warmup_steps"
+        assert all(r.projected_is_decoding for r in engine.scheduler.running), "still prefilling after warmup_steps -- increase warmup_steps"
 
         # run A: do not profile, only record wall time
         torch.cuda.set_sync_debug_mode("warn") # or error
@@ -267,7 +267,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
         logger.info(f"for per step, wall_clean_us={wall_clean_per_step_us:.1f} us/step, "
                     f"gpu_busy_from_trace_us={gpu_busy_per_step_us:.1f} us/step, "
                     f"gpu_sum_from_trace_us={gpu_sum_per_step_us:.1f} us/step, "
-                    f"gpu_idle_fraction={1 - gpu_utilization:.1%}")
+                    f"gpu_idle_fraction={1 - gpu_utilization:.1%}, batch_size: {batch_size}")
         logger.info(f"key_averages len: {len(ka)} distinct rows")
         logger.info(ka.table(sort_by=_ATTR, row_limit=-1))
         # logger.info(ka.table(sort_by="self_cpu_time_total", row_limit=-1))

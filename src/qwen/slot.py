@@ -10,6 +10,6 @@ class RequestSlotPool:
         return self._free.pop()          # IndexError if exhausted: capacity == max_num_seqs
 
     def free(self, req) -> None:
-        if req.slot is not None:
-            self._free.append(req.slot)
-            req.slot = None
+        assert req.slot is not None
+        self._free.append(req.slot)
+        req.slot = None     # reset

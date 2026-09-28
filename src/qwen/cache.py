@@ -133,7 +133,7 @@ class KVCache:
             self._last_report_exhausted_time = now
 
     def new_blocks_needed(self, request, num_new_tokens: int):
-        total = cdiv(request.num_computed_tokens + num_new_tokens, self.block_size)
+        total = cdiv(request.num_scheduled_tokens + num_new_tokens, self.block_size)
         cur = len(self.block_tables.get(request.request_id, []))
         return total-cur
 
@@ -154,14 +154,14 @@ class KVCache:
             table.append(self.pool.alloc())
 
         # compute-bound
-        # start = request.num_computed_tokens
+        # start = request.num_scheduled_tokens
         # slots = [       # physical id
         #     table[pos // self.block_size]*self.block_size + pos % self.block_size   # table {logic block id -> physical block id}
-        #     for pos in range(start, start+num_new_tokens)
+        #     for pos in range(start, start+want)
         # ]
 
         # optimized by vector
-        start = request.num_computed_tokens
+        start = request.num_scheduled_tokens
         if want == 1:
             slots = [table[start // self.block_size] * self.block_size + start % self.block_size]
         else:
@@ -177,7 +177,7 @@ class KVCache:
         table = self.block_tables.get(request.request_id)
         assert table
 
-        start = request.num_computed_tokens
+        start = request.num_scheduled_tokens
         end = start + want
         num_pop = cdiv(end, self.block_size) - cdiv(start, self.block_size)
         if logger.isEnabledFor(logging.DEBUG):
@@ -192,7 +192,10 @@ class KVCache:
         self.verify_invariant_periodical()
 
     def free(self, request):
-        table = self.block_tables.pop(request.request_id, [])
+        # table = self.block_tables.pop(request.request_id, [])
+        table = self.block_tables.pop(request.request_id, None)
+        assert table is not None
+        
         for block_id in table:
             self.pool.decref(block_id)
 

@@ -17,7 +17,7 @@ class StepEvents:
     """CUDA events for one step. record() is async; read() must run after a sync (e.g.: next_tokens.tolist())."""
 
     # shared across all instances
-    SEGMENTS = ("fwd", "logits", "sample", "rope", "sched_ret")
+    SEGMENTS = ("fwd", "logits", "sample", "rope", "bld_meta", "dth")
 
     def __init__(self):
         if not torch.cuda.is_available():
@@ -45,6 +45,16 @@ class StepEvents:
 
         self._ev[seg][1].record()  # type: ignore[call-arg]
 
+    # wait until the second event gets ready.
+    def synchronize(self, seg: str):
+        if not torch.cuda.is_available():
+            return
+
+        if seg not in self.SEGMENTS:
+            return
+
+        self._ev[seg][1].synchronize()  # type: ignore[call-arg]
+
     def read(self) -> dict[str, float]:
         if not torch.cuda.is_available():
             return {}
@@ -70,16 +80,17 @@ class SchedulerStepMetrics:
     n_d: int = 0        # number_decode_tokens = number_decode currently
     run: int = 0        # num_running
     wait: int = 0       # num_waiting
+    pend: int = 0       # pending sch_out
     fin: int = 0        # number of finished requests after this step will be set at the end of the step commit_step
     blk_used: int = 0   # kv_blocks_used
 
-    step: float = 0.
+    step_0: float = 0.
+    step_1: float = 0.
     sched: float = 0.
     sched_pre: float = 0.
     sched_run: float = 0.
     sched_wait: float = 0.
     sched_ret: float = 0.
-    sched_ret_gpu: float = 0.
     bld_meta: float = 0.
     fwd: float = 0.
     fwd_gpu: float = 0.
@@ -89,15 +100,15 @@ class SchedulerStepMetrics:
     logits_gpu: float = 0.
     sample: float = 0.
     sample_gpu: float = 0.
-    n_sample: int = 0
     dth: float = 0.
+    dth_gpu: float = 0.
     ci: float = 0.
 
     def start(self, ev: str):
         self.pending_evs.append((ev, time.perf_counter()))
         self.events.start(ev)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"step_metrics.start({ev}), len: {len(self.pending_evs)}")
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     logger.debug(f"step_metrics.start({ev}), len: {len(self.pending_evs)}")
 
     def stop(self, ev: str):
         cur_ev, start_time = self.pending_evs.pop()
@@ -105,8 +116,8 @@ class SchedulerStepMetrics:
         self.events.stop(cur_ev)
         finish_time = time.perf_counter()
         setattr(self, cur_ev, (finish_time - start_time) * 1000)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"step_metrics.stop({ev}), len: {len(self.pending_evs)}, elapsed: {getattr(self, cur_ev)} ms")
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     logger.debug(f"step_metrics.stop({ev}), len: {len(self.pending_evs)}, elapsed: {getattr(self, cur_ev)} ms")
 
     def is_stopped(self) -> bool:
         return len(self.pending_evs) == 0
@@ -162,7 +173,7 @@ class SchedulerMetrics:
         self.num_scheduled += len(scheduled_reqs)
 
         for req in scheduled_reqs:
-            if req.metrics.first_schedule_time is not None and req.num_computed_tokens == 0:
+            if req.metrics.first_schedule_time is not None and req.num_scheduled_tokens == 0:
                 self.num_rescheduled += 1
 
     def report_on_cache_exhausted(self):
@@ -275,9 +286,9 @@ def analyze_metrics(req_metrics_list: list[RequestMetrics], sch_metrics: Schedul
         
         # default scale=1e3, unit changes from s to ms.
         "queueing": summarize(queueing),
-        "prefill": summarize(prefill),
         "prefill_chunk": summarize(prefill_chunk, scale=1),
         "ttft": summarize(ttft),
+        "prefill": summarize(prefill),
         "tpot": summarize(tpot),
         "itls": summarize(itls),
     }

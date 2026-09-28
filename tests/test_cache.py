@@ -1,4 +1,5 @@
 import logging
+import pytest
 import torch
 import copy
 import random
@@ -17,7 +18,7 @@ def verify_slots_continuity(want: int, slots: list[int] | None, req: ModelReques
 
     '''inner-block continuity'''
     block_size = cache.block_size
-    start = req.num_computed_tokens
+    start = req.num_scheduled_tokens
     end = start + want
     table = cache.get_block_table(req)
     assert table is not None
@@ -58,8 +59,8 @@ def test_cache(tmp_target_config: ModelConfig, seed=0):
     assert len(table) == cdiv(want, cache.block_size)
 
     # step 2: advance
-    assert req1.num_computed_tokens == 0
-    req1.num_computed_tokens += want
+    assert req1.num_scheduled_tokens == 0
+    req1.num_scheduled_tokens += want
 
     # step 3-1: alloc 8, total=20+8, less than 32, two times of block_size
     cache_snapshot = copy.deepcopy(cache)   # deep copy
@@ -67,7 +68,7 @@ def test_cache(tmp_target_config: ModelConfig, seed=0):
     slots = cache_snapshot.allocate_slots(req1, want)
     verify_slots_continuity(want, slots, req1, cache_snapshot)
     table = cache_snapshot.block_tables[req1.request_id]
-    assert cdiv(want+req1.num_computed_tokens, cache_snapshot.block_size) == 2
+    assert cdiv(want+req1.num_scheduled_tokens, cache_snapshot.block_size) == 2
     assert len(table) == 2
 
     # step 3-2: alloc 12, total=20+12, divisible without remainder to block_size
@@ -76,7 +77,7 @@ def test_cache(tmp_target_config: ModelConfig, seed=0):
     slots = cache_snapshot.allocate_slots(req1, want)
     verify_slots_continuity(want, slots, req1, cache_snapshot)
     table = cache_snapshot.block_tables[req1.request_id]
-    assert cdiv(want+req1.num_computed_tokens, cache_snapshot.block_size) == 2
+    assert cdiv(want+req1.num_scheduled_tokens, cache_snapshot.block_size) == 2
     assert len(table) == 2
 
     # step 3-3: alloc 13, total=20+13, divisible with remainder to block_size
@@ -85,7 +86,7 @@ def test_cache(tmp_target_config: ModelConfig, seed=0):
     slots = cache_snapshot.allocate_slots(req1, want)
     verify_slots_continuity(want, slots, req1, cache_snapshot)
     table = cache_snapshot.block_tables[req1.request_id]
-    assert cdiv(want+req1.num_computed_tokens, cache_snapshot.block_size) == 3
+    assert cdiv(want+req1.num_scheduled_tokens, cache_snapshot.block_size) == 3
     assert len(table) == 3
 
     # step 4: pop slots just allocated
@@ -94,11 +95,11 @@ def test_cache(tmp_target_config: ModelConfig, seed=0):
     verify_slots_continuity(want, slots, req1, cache)
     cache.pop_slots(req1, want)
     table = cache.block_tables[req1.request_id]
-    assert len(table) == cdiv(req1.num_computed_tokens, cache.block_size)
+    assert len(table) == cdiv(req1.num_scheduled_tokens, cache.block_size)
 
     # step 5: pop all
-    want = req1.num_computed_tokens
-    req1.num_computed_tokens = 0    # reset
+    want = req1.num_scheduled_tokens
+    req1.num_scheduled_tokens = 0    # reset
     cache.pop_slots(req1, want)
     table = cache.block_tables.get(req1.request_id, None)
     assert table is None
@@ -170,16 +171,15 @@ def test_watermark(tmp_target_config: ModelConfig):
     cache.free(req1)
 
     assert cache.allocate_slots(req1, 991, respect_watermark=True) is None
-    cache.free(req1)
+    with pytest.raises(AssertionError):     # negative case
+        cache.free(req1)
 
     assert cache.allocate_slots(req1, 1000) is not None
     cache.free(req1)
 
     assert cache.allocate_slots(req1, 1001) is None
-    cache.free(req1)
 
     assert cache.allocate_slots(req1, 1001, respect_watermark=True) is None
-    cache.free(req1)
 
 
 

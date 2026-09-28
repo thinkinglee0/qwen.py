@@ -5,10 +5,10 @@ import time
 import torch
 import asyncio
 from typing import AsyncIterator
+from collections import deque
 
 from qwen.metrics import SchedulerStepMetrics, timed
 from qwen.model import QwenForCausalLM
-from qwen.attention import build_attn_metadata
 from qwen.sampling import SamplingParams
 from qwen.scheduler import Scheduler, SchedulerOutput, ModelRequest
 from qwen.constants import DEFAULT_MAX_NEW_TOKEN
@@ -19,39 +19,50 @@ logger = logging.getLogger(__name__)
 
 class LLMEngine:
     def __init__(self, config: ModelConfig):
-        # Warning: do not change the construction order of QwenForCausalLM and Scheduler
+        # WARNING: do not change the construction order of QwenForCausalLM and Scheduler
         # load weights. its construction must be before kv cache' because of kv cache's available memory check. 
         self.model = QwenForCausalLM(config=config)
 
         # allocate kv cache in its constructor, and check whether available gpu memory is enough for the specified num_blocks.
         # see KVCacheData for details.
-        # Warning: must use model's config snapshot to initialize Scheduler, ensure that they share the same config.
+        # WARNING: must use model's config snapshot to initialize Scheduler, ensure that they share the same config.
         self.scheduler = Scheduler(config=self.model.config)
+
+        # steps that has been launched, but not land.
+        self.in_flight_steps: deque[SchedulerOutput | None] = deque([None])
 
     def step(self) -> bool:
         step_metrics = SchedulerStepMetrics()
-        step_metrics.start("step")
-        sch_out = self.scheduler.schedule(step_metrics=step_metrics)
-        if sch_out is None:
-            logger.info("Scheduler: no work, next loop iteration")
-            return False
+        with timed(step_metrics, "step_0"):
+            sch_out = self.scheduler.schedule(step_metrics=step_metrics)
+            bsz = self.forward(sch_out=sch_out)
 
-        self.forward(sch_out=sch_out)
-        return True
-
+        s_p = self.sample_in_flight_step()
+        if not bsz and not s_p:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"number of reqs, forward: {bsz}, sample_pending: {s_p}")
+        
+        return bool(self.scheduler.running) or bool(self.scheduler.waiting) or bool(self.in_flight_steps)
 
     @torch.inference_mode()
-    def forward(self, sch_out: SchedulerOutput):
+    def forward(self, sch_out: SchedulerOutput | None) -> int:
+        if sch_out is None:
+            logger.info("Scheduler: no available request")
+            return 0
+                
         assert sch_out.step_metrics is not None
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"batch size: {len(sch_out.reqs)}")
 
         with timed(sch_out.step_metrics, "bld_meta"):
-            packed_input_ids, md = build_attn_metadata(
-                sch_out,
+            # packed_input_ids, md = build_attn_metadata(
+            #     sch_out,
+            #     cache_data=self.scheduler.cache.data,
+            #     config=self.model.config,
+            #     rope=self.model.model.rope)
+            packed_input_ids, md = sch_out.build_attn_metadata(
                 cache_data=self.scheduler.cache.data,
-                config=self.model.config,
                 rope=self.model.model.rope)
 
         with timed(sch_out.step_metrics, "fwd"):
@@ -65,30 +76,59 @@ class LLMEngine:
             logits = self.model.compute_logits(hidden[last_idx])   # [B, vocab]
 
         with timed(sch_out.step_metrics, "sample"):
-            next_tokens = self.model.sampler(logits, sch_out)          # [B]
+            sampling_tensors = sch_out.build_sampling_tensors()
+            next_tokens = self.model.sampler(logits, sampling_tensors)          # [B]
+            assert sch_out.slot_idx is not None and sch_out.want is not None and sch_out.needs_sample_device is not None
+            sch_out.dth_buf = self.scheduler.tok_id_tab.add_sampled_tokens_on_device(
+                slot_idx=sch_out.slot_idx, needs_sample=sch_out.needs_sample_device,
+                next_tokens=next_tokens, want=sch_out.want,
+                step_metrics=sch_out.step_metrics)
 
-        with timed(sch_out.step_metrics, "dth"):
-            next_tokens_cpu = next_tokens.tolist()
+        sch_out.update_projected_state_in_advance()
+        self.in_flight_steps.append(sch_out)
+        sch_out.incr_num_in_flight()
+        return sch_out.batch_size
 
-        sch_out.step_metrics.n_sample = len(next_tokens_cpu)
+    def sample_in_flight_step(self) -> int:
+        if not self.in_flight_steps:
+            logger.info("Scheduler: no in-flight request")
+            return 0
+        
+        pre_sch_out: SchedulerOutput | None = self.in_flight_steps.popleft()
+        if pre_sch_out is None:     # pre_sch_out is in the first step, so pre is None, do nothing
+            return 0
 
-        # merge md.step_metrics_lst to sch_out.step_metrics
+        assert pre_sch_out.step_metrics is not None
+        with timed(pre_sch_out.step_metrics, "step_1"):
+            return self.sample_in_flight_step_imp(pre_sch_out=pre_sch_out)
+
+    def sample_in_flight_step_imp(self, pre_sch_out: SchedulerOutput) -> int:
+        assert pre_sch_out.step_metrics is not None
+        pre_sch_out.step_metrics.pend = len(self.in_flight_steps)     # a value after this step
+        pre_sch_out.step_metrics.events.synchronize("dth")  # wait for data from device.
+
+        # merge md.step_metrics_lst to pre_sch_out.step_metrics
         # must be placed after next_tokens.tolist(), a synchronous operation, otherwise all events would be not ready.
+        md = pre_sch_out.attn_meta
+        assert md is not None
         if md.step_metrics_lst:
             for layer_metrics in md.step_metrics_lst:
-                sch_out.step_metrics.merge(layer_metrics)
+                pre_sch_out.step_metrics.merge(layer_metrics)
 
-        sch_out.step_metrics.start("ci")
-        num_truncated = sch_out.add_sampled_tokens(next_tokens_cpu, self.model.config.eos_token_id_set)
+        pre_sch_out.step_metrics.start("ci")
+        num_truncated = pre_sch_out.add_sampled_tokens_on_host()
 
-        self.scheduler.commit_step(sch_out=sch_out, num_truncated=num_truncated)
+        self.scheduler.commit_step(sch_out=pre_sch_out, num_truncated=num_truncated)
 
+        pre_sch_out.desc_num_in_flight()
+
+        return pre_sch_out.batch_size
 
     def run_to_completion(self):
         while self.scheduler.has_unfinished():
             try:
                 if not self.step():
-                    continue
+                    break
             except Exception as e:
                 logger.exception(f"Error occurred while generating")
                 break
@@ -98,15 +138,18 @@ class LLMEngine:
         del self.scheduler
 
 def benchmark(engine: LLMEngine, batch_input_ids: list[list[int]],
-              sampling: SamplingParams | None = None, max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN) -> tuple[list[list[int]], float]:
+              sampling: SamplingParams | None = None, max_new_tokens: int = DEFAULT_MAX_NEW_TOKEN,
+              specify_request_id: bool = False,
+              ) -> tuple[list[list[int]], float]:
     """Run all requests to completion without blocking, for benchmarking."""
     assert len(batch_input_ids) > 0 and len(batch_input_ids) <= engine.scheduler.max_waiting, "batch_input_ids must not be empty or longer than max_waiting queue"
     logger.info(f"request count: {len(batch_input_ids)}")
 
     reqs: list[ModelRequest] = []
-    for input_ids in batch_input_ids:
+    for i, input_ids in enumerate(batch_input_ids):
         loop = None
-        req = ModelRequest(engine.model.config, loop, input_ids=input_ids, sampling=sampling, max_new_tokens=max_new_tokens)
+        request_id = f"req_{i}" if specify_request_id else None
+        req = ModelRequest(engine.model.config, loop, input_ids=input_ids, sampling=sampling, max_new_tokens=max_new_tokens, request_id=request_id)
         if engine.scheduler.add_request(req):       # very unlikely to reject in this test scenario
             reqs.append(req)
         else:
@@ -154,7 +197,7 @@ class ServingDriver:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-    def submit(self, input_ids, request_id: str | None, sampling, max_new_tokens: int)  -> asyncio.Queue[int | None | Exception] | None:
+    def submit(self, input_ids: list[int], request_id: str | None, sampling, max_new_tokens: int)  -> asyncio.Queue[int | None | Exception] | None:
         with self.cond:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"submit: input_ids: {input_ids}, sampling: {sampling}")
@@ -175,6 +218,7 @@ class ServingDriver:
         while not self._shutdown:
             scheduler_output = None     # avoid UnboundLocalError if schedule() raised
             try:
+                step_metrics = SchedulerStepMetrics()
                 with self.cond:
                     while not self.engine.scheduler.has_unfinished() and not self._shutdown:
                         self.cond.wait()
@@ -183,16 +227,13 @@ class ServingDriver:
                         break
 
                     # may return None when the waiting is not empty due to backoff
-                    step_metrics = SchedulerStepMetrics()
-                    step_metrics.start("step")
+                    step_metrics.start("step_0")
                     scheduler_output = self.engine.scheduler.schedule(step_metrics=step_metrics)
 
-                if not scheduler_output:
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug("Scheduler: no work due to backoff or empty waiting, next loop iteration")
-                    continue
-
                 self.engine.forward(sch_out=scheduler_output)
+                step_metrics.stop("step_0")
+
+                self.engine.sample_in_flight_step()
             except Exception as e:
                 logger.exception("Error occurred in schedule or forward")
                 self._cleanup_on_error(scheduler_output, e)

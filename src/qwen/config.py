@@ -69,7 +69,7 @@ class ModelConfig():
     top_k: int = 0
     top_p: float = 1.
     do_penalities: bool = True
-    rep_pen: float = 1.
+    repetition_penalty: float = 1.
     freq_pen: float = 0.
     pres_pen: float = 0.
 
@@ -108,10 +108,9 @@ class ModelConfig():
     log_dir: str = LOG_DIR
 
     # optimization switches
-    use_d_first_schedule: bool=True         # D_first_preemptive_schedule if True else preemptive_schedule
-    compile_rope: bool | None = None        # rope compilation. None = automatically: CUDA on, CPU/mac off
+    use_d_first_schedule: bool = False       # D_first_preemptive_schedule if True else preemptive_schedule
+    compile_rope: bool | None = False        # rope compilation. None = automatically: CUDA on, CPU/mac off
     # stage_sampling_params: bool = True      # deprecated
-    use_sampling_param_table: bool | None = None # None: automatically
     pre_gather_cos_sin: bool = True
 
     def __post_init__(self):
@@ -139,9 +138,6 @@ class ModelConfig():
 
         if self.compile_rope is None:
             self.set_default_compile_rope()
-
-        if self.use_sampling_param_table is None:
-            self.use_sampling_param_table = self.device.type == "cuda"  # enable on CUDA
 
     def set_default_compile_rope(self):
         assert self.device is not None, "device is not set"

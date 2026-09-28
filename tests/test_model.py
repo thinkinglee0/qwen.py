@@ -5,12 +5,14 @@ import torch
 import logging
 from typing import Any
 import copy
+import time
 
 import transformers.models.qwen2.modeling_qwen2 as qwen2_modeling
 
 import qwen.attention
 from qwen.cache import KVCache
-from qwen.attention import AttentionMetadata, build_attn_metadata
+from qwen.attention_metadata import AttentionMetadata
+from qwen.attention import build_attn_metadata
 from qwen.rope import DefaultRoPE
 from qwen.config import ModelConfig
 from qwen.scheduler import SchedulerOutput, ModelRequest, ScheduledInfo
@@ -60,7 +62,7 @@ def build_scheduler_output_on_prefill(model, cache, input_ids_lst) -> SchedulerO
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step_id=0, reqs=reqs, slot_idx=None, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
 
 def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
     scheduled: dict[str, ScheduledInfo] = {}
@@ -73,7 +75,16 @@ def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step_id=0, reqs=reqs, slot_idx=None, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
+
+def add_sampled_tokens(sch_out: SchedulerOutput, decode_ids: list[int], eos_token_id_set):
+    assert sch_out.batch_size == len(decode_ids)
+    now = time.perf_counter()
+    for i, (req, tok) in enumerate(zip(sch_out.reqs, decode_ids)):
+        req.add_sampled_token(tok, eos_token_id_set, now=now)
+        s_info = sch_out.s_infos[i]
+        req.num_scheduled_tokens += s_info.want
+        req.num_computed_tokens += s_info.want
 
 class HookManager:
     hooks: dict[str, Any]   # save_i/save_o store a Tensor directly; patch_rope's hooks store list[Tensor]
@@ -736,10 +747,9 @@ def test_kv_cache_correctness(target_model, tmp_cache, B:int):
 
         for t in range(P, L):                       # decode the rest 1-by-1
             decode_ids = ids[:, t].tolist()
-            sch_out.add_sampled_tokens(decode_ids, target_model.config.eos_token_id_set)
+            add_sampled_tokens(sch_out, decode_ids, eos_token_id_set=target_model.config.eos_token_id_set)
             for idx, req in enumerate(sch_out.reqs):
                 assert req.output_ids[-1] == decode_ids[idx]    # just added token
-                assert req.is_decoding
 
             sch_out = build_scheduler_output_on_decoding(target_model, cache2, sch_out.reqs)
             packed_ids, meta_decode = build_attn_metadata(sch_out, cache_data=cache2.data, config=target_model.config, rope=target_model.model.rope)
@@ -855,7 +865,7 @@ def test_decode_matches_reference(target_model, ref_model, request, encoding_fix
 
         target_next_id_lst = target_next_ids.tolist()
         assert len(input_list) == len(target_next_id_lst)
-        sch_out.add_sampled_tokens(target_next_id_lst, target_model.config.eos_token_id_set)
+        add_sampled_tokens(sch_out, target_next_id_lst, eos_token_id_set=target_model.config.eos_token_id_set)
 
         # reference's prefill
         ref_output = ref_model.forward(encoding.input_ids.to(ref_model.device),

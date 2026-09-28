@@ -1,15 +1,13 @@
 import dataclasses
 import torch
 from torch import nn
-from transformers.modeling_outputs import CausalLMOutputWithPast
 import logging
 
 from qwen.config import ModelConfig
 from qwen.decode_layer import DecoderLayer
 from qwen.attention import AttentionMetadata
 from qwen.utils import RMSNorm
-from qwen.sampling import apply_penalties2, sample2, SamplingTensors
-from qwen.scheduler import SchedulerOutput
+from qwen.sampling import apply_penalties, sample2, SamplingTensors
 from qwen.rope import init_rope
 
 logger = logging.getLogger(__name__)
@@ -70,21 +68,17 @@ class QwenForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor):
         return self.lm_head(hidden_states)  # shape [T, vocab_size]
 
-    def sampler(self, logits: torch.Tensor, sch_out: SchedulerOutput) -> torch.Tensor:
+    def sampler(self, logits: torch.Tensor, sampling_tensors: SamplingTensors) -> torch.Tensor:
         if not self.config.do_penalities and not self.config.do_sample:     # shortcut for greedy decoding without penalties
             return logits.argmax(dim=-1)
 
-        prompt_tokens = []
-        output_tokens = []
-        for req in sch_out.reqs:
-            prompt_tokens.append(req.input_ids)
-            output_tokens.append(req.output_ids)
-
         if self.config.do_penalities:
-            logits = apply_penalties2(logits, prompt_tokens, output_tokens, sch_out.sampling_tensors, self.config.vocab_size)
+            assert sampling_tensors is not None
+            logits = apply_penalties(logits, sampling_tensors, self.config.vocab_size)
 
         if self.config.do_sample:
-            next_tokens = sample2(logits, sch_out.sampling_tensors)
+            assert sampling_tensors is not None
+            next_tokens = sample2(logits, sampling_tensors)
         else:
             next_tokens = logits.argmax(dim=-1)
 

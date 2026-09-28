@@ -2,7 +2,6 @@ import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 import logging
 import itertools
 import numpy as np
@@ -12,7 +11,7 @@ from qwen.cache import KVCacheData
 from qwen.scheduler import SchedulerOutput
 from qwen.rope import BaseRoPE
 from qwen.metrics import SchedulerStepMetrics, timed
-
+from qwen.attention_metadata import AttentionMetadata
 
 # attention backend selection — resolved once at import
 try:
@@ -42,41 +41,6 @@ def _bottom_right_causal_bias(q_len: int, k_len: int, device: torch.device, dtyp
     mask = torch.triu(mask, diagonal=k_len - q_len + 1)
     return mask[None, None]  # (1, 1, q_len, k_len)
 
-
-@dataclass
-class AttentionMetadata:
-
-    # query side
-    cu_seqlens_q: Tensor   # (num_seqs + 1,) prefix-sum of query lengths
-    max_seqlen_q: int
-
-    # lens of kv cache
-    cu_seqlens_k: Tensor
-    max_seqlen_k: int
-    cache_seqlens: Tensor
-    block_table:  Tensor    # [num_seqs, max_blocks]
-    # kv for SDPA
-    # block_tables: list[list[int]]   # [num_seqs, num_blocks]
-    # k_lens:       list[int]         # 
-
-    slot_mapping: Tensor    # scatter q/v projections to kv cache
-    position_ids: Tensor    # rope
-    rope: BaseRoPE | None = None
-    cos_sin: tuple[Tensor, Tensor] | None = None   # optional pre-gathered cos/sin for rope
-
-    # metrics
-    step_metrics_lst: list[SchedulerStepMetrics] | None = None
-
-    cache: KVCacheData | None = None
-
-    # debug cache issue
-    debug_k_list: list[Tensor] | None = None
-    debug_v_list: list[Tensor] | None = None
-
-    def layer_metrics(self, layer_index: int) -> SchedulerStepMetrics | None:
-        """Per-layer metrics slot, or None when metrics collection is off."""
-        return self.step_metrics_lst[layer_index] if self.step_metrics_lst is not None else None
-
 def build_block_table(tables, device):
     max_blocks = max(len(t) for t in tables)
     bt_np = np.zeros((len(tables), max_blocks), dtype=np.int32)
@@ -91,6 +55,8 @@ def build_block_table(tables, device):
 
     return bt   # [num_seqs, max_blocks];  padding entries never read, truncated by seqused_k
 
+# oracle for SchedulerOutput.build_attn_metadata
+# deprecated, remains only for tests/test_{model,attention}.py
 def build_attn_metadata(sch_out: SchedulerOutput, config: ModelConfig, cache_data: KVCacheData | None = None, rope: BaseRoPE | None = None) -> tuple[Tensor, AttentionMetadata]:
     # packing
     packed_id_list: list[int] = []
@@ -98,8 +64,8 @@ def build_attn_metadata(sch_out: SchedulerOutput, config: ModelConfig, cache_dat
     cache_lens: list[int] = []
     position_id_lst: list[int] = []
     cache_slots: list[int] = []
-    for req in sch_out.reqs:
-        s_info = sch_out.scheduled[req.request_id]
+    for i, req in enumerate(sch_out.reqs):
+        s_info = sch_out.s_infos[i]
         lens.append(s_info.want)
         cache_slots.extend(s_info.cache_slots)
         packed_id_list.extend(req.get_existing_ids(s_info.want))    # compatible for recompute
