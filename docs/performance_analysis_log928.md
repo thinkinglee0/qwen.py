@@ -1,6 +1,6 @@
-# Performance Analysis — `slot` vs `main` on RTX 4090 (log928)
+# Performance Analysis — `async_scheduling` vs `main` on RTX 4090 (log928)
 
-**First A/B of the `slot` branch against `main`.** Everything in
+**First A/B of the `async_scheduling` branch against `main`.** Everything in
 [`performance_analysis_log924.md`](./performance_analysis_log924.md) measured `main`-lineage code on a
 *different* vast instance; this report measures both branches back-to-back on **one** box, so the
 branch deltas here are the trustworthy part and any comparison to log924 is not (§8).
@@ -9,12 +9,12 @@ branch deltas here are the trustworthy part and any comparison to log924 is not 
 
 | Artifact | Path |
 | --- | --- |
-| Concurrency sweep, `slot`, runs 1–2 | `log_vast/log928/benchmark_slot{,2}/` |
+| Concurrency sweep, `async_scheduling`, runs 1–2 | `log_vast/log928/benchmark_slot{,2}/` |
 | Concurrency sweep, `main`, runs 1–2 | `log_vast/log928/benchmark_baseline{,2}/` |
-| Pure-decode idle profile, `slot`, runs 1–2 | `log_vast/log928/profile_slot{,2}/` |
+| Pure-decode idle profile, `async_scheduling`, runs 1–2 | `log_vast/log928/profile_slot{,2}/` |
 | Pure-decode idle profile, `main`, runs 1–2 | `log_vast/log928/profile_baseline{,2}/` |
 | Run-to-run noise floor, `main` | `log_vast/log928/baseline_against_baseline2/mean_step_metrics.*.log` |
-| Run-to-run noise floor, `slot` | `log_vast/log928/slot_against_slot2/mean_step_metrics.*.log` |
+| Run-to-run noise floor, `async_scheduling` | `log_vast/log928/slot_against_slot2/mean_step_metrics.*.log` |
 | Cross-branch step metrics, batch 1 | `log_vast/log928/mean_step_metrics.1.log` |
 | GPU static inventory / host | `log_vast/log928/gpu.static.csv`, `host_info` |
 
@@ -23,14 +23,30 @@ they were regenerated for this report from the same dumps with the same tool
 (`test_profile.py::test_mean_step_metrics`, `STEP_METRICS_LINES=65:84,65:84`), writing into a scratch
 copy so nothing in `log_vast/` was touched.
 
-**Code under test** — `main` at `0603ceb` (also the merge-base) vs `slot` at `f879a01` (6 WIP commits,
-+1 610 / −825 lines across 21 files; the substance is `scheduler.py` +684, `sampling.py`, `engine.py`,
-`attention_metadata.py`). Switches on both sides: `compile_rope = false`, `pre_gather_cos_sin = true`,
-`use_d_first_schedule = false`.
+**Code under test** — baseline `main` at `0603ceb`; candidate `async_scheduling` at `a6c6927`
+(+1 610 / −825 lines across 21 files; the substance is `scheduler.py` +684, `sampling.py`,
+`engine.py`, `attention_metadata.py`). Switches on both sides: `compile_rope = false`,
+`pre_gather_cos_sin = true`, `use_d_first_schedule = false`.
 
-**Run order** (same instance, ~65 min, no reboot): `slot` sweep 05:18 → `slot2` 05:28 → `main` sweep
-05:42 → `main2` 05:58 → profiles 06:10–06:18. `slot` ran *first*, so it did not benefit from a warmed
-box.
+`main` has since fast-forwarded onto `a6c6927` too, so **`main` in this report always means
+`0603ceb`** — now `a6c6927`'s parent, not its tip.
+
+> **`a6c6927` is not byte-identical to the tree these numbers came from.** The runs were taken from the
+> working tree as it stood before the history was rewritten (six WIP commits, tip `f879a01`).
+> `a6c6927` differs from that tree in three **instrumentation-only** respects — no kernel, scheduler or
+> sampler behaviour changed, so every timing below still holds:
+>
+> 1. **`step_1` no longer double-counts `step_0`.** `sample_in_flight_step()` now wraps the drain in
+>    `timed(pre_sch_out.step_metrics, "step_1")`, starting and stopping on the same object within one
+>    iteration, so it measures the drain alone. §2.2 trap 1 and §5.5 describe the log928 dumps — which
+>    is what you will open if you go back to them — and **§7.4 is done**.
+> 2. **`sched_ret_gpu` is gone** from `SchedulerStepMetrics`, dropped precisely because it measured
+>    identically 0.000 ms on this branch (§3.4). Dumps from `a6c6927` will not carry the field.
+> 3. `test_profile.py` adds `batch_size` to the `gpu_idle_fraction` log line.
+
+**Run order** (same instance, ~65 min, no reboot): `async_scheduling` sweep 05:18 → its second run 05:28 → `main`
+sweep 05:42 → its second run 05:58 → profiles 06:10–06:18. `async_scheduling` ran *first*, so it did not benefit
+from a warmed box.
 
 ---
 
@@ -44,7 +60,7 @@ box.
    51.9 % → 28.9 % at 64. The host no longer blocks anywhere in the step: `dth` 2.91 → 0.04 ms,
    host-side `sample` 56.05 → 1.09 ms, `sched_ret_gpu` 0.83 → **0.00** ms.
 3. **Iso-throughput latency improved 4.7×.** `main` needs batch 512 and 83.3 ms TPOT to reach
-   6 015 tok/s; `slot` beats that at batch 128 with **17.8 ms TPOT** — 13 % more throughput at a
+   6 015 tok/s; `async_scheduling` beats that at batch 128 with **17.8 ms TPOT** — 13 % more throughput at a
    quarter of the per-token latency.
 4. **Batch ≤ 16 is unchanged to slightly worse** (batch 1: −1.9 % throughput, +1.9 % TPOT). `bld_meta`
    nearly doubled at batch 1 (0.163 → 0.314 ms) — the resident-table metadata build has a fixed cost
@@ -62,8 +78,8 @@ box.
    candidates to **20**. §6 and §7.1: sorting inside the top-k window instead would cut the width
    ~150× and simultaneously fix the batch-1024 OOM.
 8. **Reproducibility.** Run-to-run throughput agrees within **1.26 %** on `main` and **3.22 %** on
-   `slot` (worst case batch 1; median 1.11 %); device-side GPU-busy time agrees within **0.02 %**.
-   The 17–46 % gains are 6–40× the noise floor. `slot` is the noisier branch (§5.3).
+   `async_scheduling` (worst case batch 1; median 1.11 %); device-side GPU-busy time agrees within **0.02 %**.
+   The 17–46 % gains are 6–40× the noise floor. `async_scheduling` is the noisier branch (§5.3).
 
 ---
 
@@ -82,10 +98,10 @@ box.
 Two differences matter:
 
 * **No power cap this time.** `clocks_event_reasons.sw_power_cap` is Active for **0.1 %** of samples
-  on `main` and **0.3 %** on `slot`; SM clocks hold 2 588 / 2 494 MHz mean, power averages
+  on `main` and **0.3 %** on `async_scheduling`; SM clocks hold 2 588 / 2 494 MHz mean, power averages
   250 / 229 W against a 450 W ceiling, temperature peaks at 61 °C. log924's finding that large-batch
   numbers were clock-limited **does not apply here** — these are clean, uncapped numbers.
-* **The PCIe link negotiated gen 1.** Host↔device transfers are on a ~4 GB/s link. The `slot` branch's
+* **The PCIe link negotiated gen 1.** Host↔device transfers are on a ~4 GB/s link. The `async_scheduling` branch's
   central win is deleting host↔device round-trips, so a degraded link flatters it. The removed costs
   are small-transfer *latency* (a 4 KB `dth`, an event sync) rather than bandwidth, so the effect is
   probably second-order — but the +20…46 % figures should be re-measured on a gen-4 box before being
@@ -103,7 +119,7 @@ the profile runs 7 batch sizes over 20 measured + 5 profiled steady-state decode
 
 ### 1.3 One parity gap worth knowing
 
-`main` ran with `rep_pen = 1.0`; `slot` ran with `repetition_penalty = 1.1` (the field was renamed and
+`main` ran with `rep_pen = 1.0`; `async_scheduling` ran with `repetition_penalty = 1.1` (the field was renamed and
 the fixture's value differs). Neither branch branches on the value — `apply_penalties` launches the
 same kernels for 1.0 as for 1.1 — so **this does not affect any timing in this report**, but the two
 branches did not generate identical text, and a correctness A/B cannot be read off these runs.
@@ -123,7 +139,8 @@ branches did not generate identical text, and a correctness A/B cannot be read o
 
 ### 2.2 Three traps in these logs
 
-1. **`step_0 + step_1` is not the step time — it double-counts `step_0`.** `step_1` is started on
+1. **`step_0 + step_1` is not the step time — it double-counts `step_0`.** (True of these dumps;
+   fixed in `a6c6927` — see §5.5.) `step_1` is started on
    iteration *N*'s metrics object but stopped inside iteration *N+1*'s
    `sample_in_flight_step()` ([`engine.py:38`](../src/qwen/engine.py#L38),
    [`scheduler.py:706`](../src/qwen/scheduler.py#L706)), so it spans the tail of *N* plus the whole
@@ -139,8 +156,8 @@ branches did not generate identical text, and a correctness A/B cannot be read o
    | 512 | 51.70 | 52.66 | 104.36 | 52.33 |
 
    **Use `step_1` as the step wall time.** As a side effect `step_1` inherits any spike from the
-   *next* iteration, which is why it is the field the anomaly detector flags most often on `slot`.
-2. **On `slot`, host-side `fwd` and `rope` are wait time, not work.** At batch 512, `fwd` = 46.8 ms
+   *next* iteration, which is why it is the field the anomaly detector flags most often on `async_scheduling`.
+2. **On `async_scheduling`, host-side `fwd` and `rope` are wait time, not work.** At batch 512, `fwd` = 46.8 ms
    CPU against `fwd_gpu` = 10.7 ms, and `rope` = 21.2 ms CPU against `rope_gpu` = 0.82 ms. The launch
    thread is blocking on a full CUDA launch queue — the signature of a *saturated GPU*, which is the
    goal. Reading these as regressions (`fwd` +377 %, `rope` +868 %) inverts the meaning.
@@ -151,13 +168,13 @@ branches did not generate identical text, and a correctness A/B cannot be read o
 
 ### 2.3 Noise floor
 
-| Quantity | `main` | `slot` |
+| Quantity | `main` | `async_scheduling` |
 | --- | --- | --- |
 | Sweep throughput, run-to-run | ≤ 1.26 % (median 0.69 %) | ≤ 3.22 % (median 1.11 %) |
 | `gpu_busy_from_trace`/step, run-to-run | ≤ 0.03 % | ≤ 0.02 % |
 | Step-metric fields beyond 2σ | 0–8 of 18 per batch, all \|Δ\| < 3 % except batch 512 `step`/`sample` (−2.7 / −2.8 %) | 1–8 of 20 per batch, all \|Δ\| < 11 % |
 
-Anomalous steps per 20-step window: **0/20 on `main` at every batch size**; **1–4/20 on `slot`**. The
+Anomalous steps per 20-step window: **0/20 on `main` at every batch size**; **1–4/20 on `async_scheduling`**. The
 branch is measurably less steady (§5.3).
 
 ---
@@ -166,7 +183,7 @@ branch is measurably less steady (§5.3).
 
 ### 3.1 Concurrency sweep — mean of two runs each
 
-| batch | `main` tok/s | `slot` tok/s | Δ tok/s | `main` TPOT ms | `slot` TPOT ms | Δ TPOT | `main` TTFT ms | `slot` TTFT ms | Δ TTFT |
+| batch | `main` tok/s | `async_scheduling` tok/s | Δ tok/s | `main` TPOT ms | `async_scheduling` TPOT ms | Δ TPOT | `main` TTFT ms | `async_scheduling` TTFT ms | Δ TTFT |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 102 | 100 | **−1.9 %** | 9.83 | 10.01 | **+1.9 %** | 10.2 | 10.4 | +2.5 % |
 | 2 | 187 | 186 | −0.2 % | 10.71 | 10.71 | +0.0 % | 11.6 | 11.6 | +0.1 % |
@@ -181,12 +198,12 @@ branch is measurably less steady (§5.3).
 | 1024 | 5 861 | **OOM** | — | 169.68 | — | — | 199.6 | — | — |
 
 Scaling efficiency (`tok/s/req` relative to batch 1) holds far longer: at batch 64 it is **0.76–0.78 on
-`slot` vs 0.54–0.55 on `main`**, and the profitable-doubling marker sits at batch 64 for both but with
+`async_scheduling` vs 0.54–0.55 on `main`**, and the profitable-doubling marker sits at batch 64 for both but with
 gain/cost **1.77 vs 1.22**.
 
 ### 3.2 Iso-throughput: the headline
 
-| | `main` | `slot` |
+| | `main` | `async_scheduling` |
 | --- | --- | --- |
 | Concurrency needed for ~6 000 tok/s | 512 | 128 |
 | Throughput delivered | 6 015 | 6 791 (+13 %) |
@@ -194,13 +211,13 @@ gain/cost **1.77 vs 1.22**.
 | ITL p50 / p90 | 70.3 / 125.4 ms | 15.1 / 15.2 ms |
 | Prefill latency | 121.6 ms | 118.1 ms |
 
-At equal delivered throughput the `slot` branch is better on **every** axis including TTFT. The TTFT
-regression in §3.1 only appears when you compare at equal *concurrency*, where `slot` is doing far
+At equal delivered throughput the `async_scheduling` branch is better on **every** axis including TTFT. The TTFT
+regression in §3.1 only appears when you compare at equal *concurrency*, where `async_scheduling` is doing far
 more work per second.
 
 ### 3.3 GPU idle fraction and GPU busy — pure decode
 
-| batch | `main` idle (r1/r2) | `slot` idle (r1/r2) | `main` busy µs/step | `slot` busy µs/step | Δ busy |
+| batch | `main` idle (r1/r2) | `async_scheduling` idle (r1/r2) | `main` busy µs/step | `async_scheduling` busy µs/step | Δ busy |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 68.2 / 68.0 % | 76.0 / 66.7 % | 3 203 | 3 255 | +1.6 % |
 | 8 | 62.4 / 62.1 % | 59.8 / 59.4 % | 4 219 | 4 277 | +1.4 % |
@@ -218,9 +235,11 @@ batch 512 **70.5 → 52.3 ms (−25.8 %)**, batch 128 **24.3 → 15.3 ms (−37.
 At batch 512 the residual idle is 0.8 ms of 52.3 — the host has essentially nothing left to hide.
 Batch 256 is the exception (12.6 % idle, worse than batch 128's 7.1 %): see §5.3.
 
-### 3.4 Host-side per-step breakdown, pure decode (ms, run 1 vs run 1)
+### 3.4 Host-side per-step breakdown, pure decode (ms)
 
-| field | b=1 main → slot | b=64 main → slot | b=512 main → slot | what it is |
+Each cell is `main` → `async_scheduling`, run 1 against run 1.
+
+| field | batch 1 | batch 64 | batch 512 | what it is |
 | --- | --- | --- | --- | --- |
 | `sched` | 0.092 → **0.020** (−78 %) | 0.239 → **0.077** (−68 %) | 1.274 → **0.494** (−61 %) | schedule() total |
 | `sched_ret` | 0.077 → **0.006** (−92 %) | 0.176 → **0.015** (−91 %) | 0.847 → **0.082** (−90 %) | building the SchedulerOutput |
@@ -234,9 +253,11 @@ Batch 256 is the exception (12.6 % idle, worse than batch 128's 7.1 %): see §5.
 Three things stand out:
 
 * **`sample` host time went flat.** On `main` it tracks `sample_gpu` almost 1:1 (56.05 vs 56.91 ms at
-  batch 512) — the host was *waiting inside the sampler*. On `slot` it is ~0.7–1.1 ms at every batch
+  batch 512) — the host was *waiting inside the sampler*. On `async_scheduling` it is ~0.7–1.1 ms at every batch
   size: purely launch cost.
 * **`sched_ret_gpu` is exactly zero at every batch size.** Scheduling no longer touches the device.
+  The field was therefore deleted in `a6c6927`: a metric that can only read zero is not worth a
+  CUDA-event pair.
 * **`bld_meta` crosses over.** It is ~2× more expensive at batch 1–64 and ~22 % cheaper at batch 512:
   the resident slot-indexed tables have a fixed per-step cost that amortises only with width. That
   fixed cost, plus the extra `dth`/`ci` bookkeeping, is exactly the −1.9 % at batch 1.
@@ -244,9 +265,9 @@ Three things stand out:
 Summing the non-forward segments at batch 512 gives **61.2 → 2.5 ms**, though on `main` most of that
 61.2 ms is the host *waiting* inside `sample` rather than working. The clean statement is the one the
 trace gives independently: **`main` left 19.4 ms/step of step wall time the GPU could not overlap
-(70.5 wall − 51.1 busy); `slot` leaves 0.8 ms** (52.3 − 51.5).
+(70.5 wall − 51.1 busy); `async_scheduling` leaves 0.8 ms** (52.3 − 51.5).
 
-### 3.5 Device-side op breakdown at batch 512 (`slot`, ms/step, from `key_averages`)
+### 3.5 Device-side op breakdown at batch 512 (`async_scheduling`, ms/step, from `key_averages`)
 
 Total GPU busy **51.5 ms/step**. Sampler total (`sample_gpu`) **40.6 ms = 79 %**; model forward
 **10.7 ms = 21 %**; logits 0.89 ms.
@@ -312,8 +333,8 @@ GPU 0 has a total capacity of 23.64 GiB of which 1.72 GiB is free.
 ```
 
 `1024 × 151936 × 4 B = 622 MB` per fp32 temporary, and `sort` needs values **and** int64 indices plus
-workspace — 1.73 GiB in one allocation. Peak `memory.used` is **24 200 MiB of 24 564** on `slot`
-against 23 972 on `main`: the pipeline holds one extra step's tensors alive, so `slot` runs ~228 MiB
+workspace — 1.73 GiB in one allocation. Peak `memory.used` is **24 200 MiB of 24 564** on `async_scheduling`
+against 23 972 on `main`: the pipeline holds one extra step's tensors alive, so `async_scheduling` runs ~228 MiB
 closer to the edge and tips over. `main` completed batch 1024 at 5 861 tok/s (below its own 512 peak,
 so nothing valuable is lost in throughput terms — but the engine now *fails* instead of degrading).
 §7.1 fixes the cause rather than the symptom.
@@ -333,16 +354,16 @@ like a regression and it is worth a deliberate decision, not a surprise: if firs
 product requirement, the drain of a step that produced a *first* token could be prioritised, or
 prefill chunks kept out of the iteration immediately after an admission.
 
-### 5.3 `slot` is less steady, and batch 256 is a visible outlier
+### 5.3 `async_scheduling` is less steady, and batch 256 is a visible outlier
 
-* Anomalous steps per 20-step window: **0/20 on `main` at every batch size**; on `slot` 1–4/20.
+* Anomalous steps per 20-step window: **0/20 on `main` at every batch size**; on `async_scheduling` 1–4/20.
 * Batch 256 idle fraction **12.6 %**, worse than batch 128's **7.1 %** — non-monotonic.
 * The batch-256 dump shows the mechanism: two of twenty steps take ~90 ms against a 27–28 ms norm,
   and at line 79 the spike is **device-side** — `fwd_gpu` 64.1 ms against a 7.1 ms local median (9.1×)
   — not a host stall.
-* `profiler overhead` goes **negative** for `slot` at batch 256 and 512 (−16.7 %, −15.2 %): the
+* `profiler overhead` goes **negative** for `async_scheduling` at batch 256 and 512 (−16.7 %, −15.2 %): the
   *profiled* run was faster than the "clean" one, which only happens when the clean window caught
-  these stalls. Treat `slot`'s batch-256 idle fraction as an upper bound.
+  these stalls. Treat `async_scheduling`'s batch-256 idle fraction as an upper bound.
 
 A device-side stall of 9× in a step whose kernels are unchanged, on a branch whose peak memory sits
 364 MiB from the ceiling, points at allocator pressure: at batch 256 each full-vocab fp32 temporary is
@@ -355,16 +376,22 @@ synchronize and can force `cudaFree`. Same root cause as §5.1. Worth confirming
 
 Throughput 102 → 100 tok/s, TPOT 9.83 → 10.01 ms. `bld_meta` +0.150 ms and `dth` +0.013 ms and
 `ci` +0.006 ms outweigh `sched` −0.072 ms. Small, real, and the expected shape of a change that trades
-fixed per-step setup for per-item scaling. Note batch 1 is also `slot`'s noisiest point (3.22 %
+fixed per-step setup for per-item scaling. Note batch 1 is also `async_scheduling`'s noisiest point (3.22 %
 run-to-run, and `profile_slot` run 1 shows a 76 % idle fraction against run 2's 66.7 %), so the true
 figure is somewhere in −1 % … −3 %.
 
-### 5.5 `step_0`/`step_1` instrumentation double-counts
+### 5.5 `step_0`/`step_1` instrumentation double-counts — fixed in `a6c6927`
 
 See §2.2 trap 1. `step_0 + step_1` reads as 104 ms/step at batch 512 when the step is 52 ms. This
-misleads the anomaly detector (`step_1` is its most-flagged field, inheriting the *next* step's
-spikes) and will mislead anyone reading a dump. Cheap fix: stop `step_1` where it starts — or rename
-the pair to make the overlap explicit and add a derived `step` = `step_1`.
+misled the anomaly detector (`step_1` is its most-flagged field, inheriting the *next* step's spikes)
+and would mislead anyone reading one of these dumps.
+
+**Resolved after measurement.** `a6c6927` wraps the drain in
+`timed(pre_sch_out.step_metrics, "step_1")` inside `sample_in_flight_step()` and drops the
+`start("step_1")` calls from `LLMEngine.step()` and `ServingDriver.run()`, so the pair no longer
+overlaps. Note the consequence for future dumps: `step_1` now measures the **drain only**, so it is no
+longer a stand-in for the step wall time either — `step_0 + step_1` is, and the field this report told
+you to read is not the field `a6c6927` gives you.
 
 ---
 
@@ -427,14 +454,16 @@ host-side from the resident tables without a sync), skip the pass entirely.
 
 ### 7.3 Confirm and fix the allocator pressure
 
-Run `slot` at batches 256/512/1024 with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and log
+Run `async_scheduling` at batches 256/512/1024 with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and log
 `torch.cuda.memory_stats()['num_alloc_retries']` per step. If retries correlate with the 9× `fwd_gpu`
 spikes, §5.3's non-monotonic batch-256 idle fraction and the batch-1024 OOM are the same bug and 7.1
 mostly dissolves both. Low effort, high information.
 
-### 7.4 Fix the `step_1` overlap before the next A/B
+### 7.4 Fix the `step_1` overlap before the next A/B — ✅ done in `a6c6927`
 
-§5.5. Two lines, and it stops every future dump from over-reporting step time 2×.
+§5.5. Two lines, and it stops every future dump from over-reporting step time 2×. Landed with the
+re-commit, after these measurements were taken; the dumps in `log_vast/log928/` still show the old
+behaviour.
 
 ### 7.5 Then, and only then, look at batch ≤ 16
 
@@ -455,13 +484,13 @@ point is fewer host↔device round-trips. Expect the gains to hold directionally
 
 1. **Different instance from log924** — 450 W vs 250 W cap, driver 550 vs 580, PCIe gen 1 vs gen 4. No
    number here is comparable to log924. Within log928 both branches ran on the same box within 25
-   minutes of each other, with `slot` first (no warm-box advantage).
-2. **`repetition_penalty` 1.1 (`slot`) vs `rep_pen` 1.0 (`main`)** — same kernels, same timings,
+   minutes of each other, with `async_scheduling` first (no warm-box advantage).
+2. **`repetition_penalty` 1.1 (`async_scheduling`) vs `rep_pen` 1.0 (`main`)** — same kernels, same timings,
    different generated text. §1.3.
 3. **Cross-branch step-metric tables for batches 8–512 were regenerated locally**, not taken from the
    log directory (which held only batch 1). Same tool, same line range, same dumps; the scratch copy
    means `log_vast/` is unmodified.
-4. **`slot`'s batch-256 and batch-1 profile numbers are contaminated** by the stalls of §5.3 — the
+4. **`async_scheduling`'s batch-256 and batch-1 profile numbers are contaminated** by the stalls of §5.3 — the
    negative "profiler overhead" is the tell. Batch 128 and 512 are clean in both runs and carry the
    argument.
 5. **Sampler share is read from `key_averages`, where `aten::` rows and their kernel rows are both
@@ -470,7 +499,7 @@ point is fewer host↔device round-trips. Expect the gains to hold directionally
    fields (`fwd_gpu` + `logits_gpu` + `sample_gpu` = 52.2 ms).
 6. **The `torch.cuda.set_sync_debug_mode("warn")` output is not in the log directory** — no `warning`
    file was present and neither `pytest.log` contains a synchronisation warning, so the claim that
-   `slot`'s decode path is sync-free rests on `sched_ret_gpu → 0`, host-side `sample` → ~1 ms, and the
+   `async_scheduling`'s decode path is sync-free rests on `sched_ret_gpu → 0`, host-side `sample` → ~1 ms, and the
    1.5 % idle fraction rather than on the debug-mode evidence. Capturing that output would make the
    case airtight.
 7. **20 decode steps per profile point** (lines 65–84), AR(1)-deflated `n_eff` typically 5–20. Fine for

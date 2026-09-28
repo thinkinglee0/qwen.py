@@ -20,6 +20,7 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M5**    | static batching                                                 | ✅done. pack a list of **variable-length** id sequences into a 1-dim id list, opt for SDPA attention in my local macbook for quick functional verifications; add request to `StaticScheduler`, and then scheduler in a fixed batch.                                       |
 | **M6**    | continuous batching                                             | ✅done. continuous batching with paged kv cache; two interchangable scheduling strategies (preemptive_schedule and D_first_preemptive_schedule); watermark block reservation; expential backoff; KVCache.verify_invariant periodically checks; metrics (schedule metrics, step metrics, and request metrics).|
 | **M7**    | performance profiling     | ✅ done for the 0.5B baseline. Three rounds on an RTX 4090 — concurrency sweeps (batch 1 → 1 024) and a decode-step profiler reporting GPU idle fraction from the chrome trace, every configuration run **twice** for a measured noise floor. Reports: [log910](./docs/performance_analysis_log910.md), [log914](./docs/performance_analysis_log914.md), [log915](./docs/performance_analysis_log915.md) ([中文](./docs/performance_analysis_log915.zh.md)) and the switch matrix [log915](./docs/performance_switches_log915.md) ([中文](./docs/performance_switches_log915.zh.md)). |
+| **M8**    | async scheduling (one decode step of lookahead)            | ✅ done. `step_0` launches a step with no sync; `step_1` drains the previous one. Request state splits into projected/actual so the next batch is planned before the current lands; token ids and penalty masks stay resident on device. **+20.2 % peak throughput, +46.4 % at batch 128, GPU idle in a pure-decode step 27.5 % → 1.5 % with kernel time unchanged (+0.8 %)**. Report: [log928](./docs/performance_analysis_log928.md). |
 | later     | Fused kernels in Trition | planed  |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
@@ -36,6 +37,9 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 - **Watermark block reservation** — a reserved slice of the KV pool (`respect_watermark`) so already-running requests can't be starved by new admissions.
 - **Recompute on preemption** — a preempted request drops its KV cache and returns to the waiting queue, keeping its already-generated output tokens; those tokens are replayed as input when it's rescheduled.
 - **Truncation tracking** — requests that hit `max_new_tokens` before EOS are counted separately (`num_truncated`) from normal completions.
+- **Async scheduling — one step of lookahead** — `step_0` schedules and launches forward + sample without a single device sync; `step_1` drains the *previous* step (event sync, commit, release). The host never waits on the step it just issued, which is what takes GPU idle in a pure-decode step from 27.5 % to 1.5 % at batch 512. `in_flight_steps` is a deque and `ModelRequest.num_in_flight` is a count, so nothing assumes a pipeline depth of one.
+- **Projected vs actual request state** — with a step in flight, "what this request has computed" and "what the scheduler has committed it to" are different numbers. `num_scheduled_tokens` / `projected_is_decoding` / `projected_finished` drive scheduling and KV-block accounting; `num_computed_tokens` / `output_ids` / `finished` advance only when the step lands. Preemption splits the same way, and `_settle_and_check` re-admits a waiting request only once no in-flight batch can still mutate its actual state.
+- **Resident per-step buffers** — `RequestBuffer` holds one pinned host tensor and one device tensor per per-step quantity (slot index, `want`, `needs_sample`, cache slots, block table), allocated once at capacity and refilled through numpy views, so a step costs one async H2D per row instead of fresh tensor construction. `SchedulerOutput.s_infos` is a list positionally aligned with `reqs`, replacing a dict keyed by `request_id`.
 
 **Paged KV cache**
 - **Block-based, ref-counted paged cache** (`cache.py`) — fixed-size blocks (`block_size=256`, required to be a multiple of 256 by flash-attn's paged-KV kernel) allocated from a `BlockPool`; `verify_invariant` runs periodically to catch block-table/ref-count drift (cache leaks) early.
@@ -53,6 +57,9 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 
 **Sampling**
 - **Sampling** — parses `generation_config.json`; applies repetition/frequency/presence penalties right after `forward`, then samples (temperature, top_k, top_p, multinomial) when `do_sample` is on.
+- **Device-resident penalty masks** — `TokenIdTable` keeps the full token-id history on device, one row per request slot, and derives `output_counts` plus the prompt/output presence masks there (`bin_count_and_mask`): both masks share one `[B, 2V+16]` buffer, so it is a single memset and a single scatter. The sampler needs nothing from the host, which is the precondition for launching a step without a sync.
+- **Sync-free sampler setup** — `apply_top_k` reads `max_k` from a pinned host mirror of the top-k column instead of `top_k.max().item()`; `MAX_EFFECTIVE_TOP_K = 1024` rounds a larger top-k up to a no-op rather than paying a wider `topk()` for something statistically indistinguishable from none. `SamplingParams.validate()` rejects out-of-range parameters at submission.
+- **Known cost** — `apply_top_p` still sorts the full 151 936-wide vocabulary, which is now **30 % of a batch-512 decode step** and the cause of the batch-1024 OOM. See [§2.3](#23-async-scheduling--the-async_scheduling-ab-log928) and roadmap item 1.
 
 **Serving & observability**
 - **Streaming HTTP service** — FastAPI `/generate_stream` and `/health`; `async_generate` interleaves `_decode_step` into the running event loop so one worker serves multiple concurrent streams; `@asynccontextmanager`/`@pytest_asyncio.fixture`/`@pytest.fixture` ensure model weights load only once across sync, async, and endpoint tests.
@@ -155,6 +162,11 @@ hold across all three.
    orchestration, not arithmetic. Zero preemptions and zero cache exhaustions across 11 batch sizes
    × 2 runs, in every round.
 
+> Conclusions 1 and 2 describe the **pre-M8** engine, and only at large batch. Async scheduling (§2.3)
+> removed that idle without touching a kernel — a pure-decode step at batch 512 is now 1.5 % idle, not
+> 27.5 % — but **batch 1 is still 68 % idle**, still launch-bound, and still needs CUDA graphs
+> (roadmap item 2). Conclusion 3 survived intact and is now the whole story: see §2.3 conclusion 4.
+
 #### 2.2 Optimisation switches
 
 Measured one at a time in log915 — [report](./docs/performance_switches_log915.md) ·
@@ -171,9 +183,10 @@ Measured one at a time in log915 — [report](./docs/performance_switches_log915
 because the host pays more to reach the fused kernel (48 guard evaluations per step). That sign
 should flip once the decode path is CUDA-graphed; until then, kernel-level tuning is premature.
 
-**Reading the metrics** — four traps, documented in
+**Reading the metrics** — five traps, documented in
 [log914 §7](./docs/performance_analysis_log914.md#7-three-traps-in-this-instrumentation) and
-[log915 switches §1.2](./docs/performance_switches_log915.md):
+[log915 switches §1.2](./docs/performance_switches_log915.md), and
+[log928 §7](./docs/performance_analysis_log928.md):
 
 * CPU-side timings are meaningless in mixed prefill/decode steps — the host is blocking on the GPU backlog there.
 * A `*_gpu` field is a CUDA-event **window**, not busy time; gaps inside it are counted.
@@ -183,6 +196,78 @@ should flip once the decode path is CUDA-graphed; until then, kernel-level tunin
   by isolation: give each batch size its own pytest process and the two harnesses agree to **0.05 %**
   at batch 512 (100.218 vs 100.17 ms), having been 5 % apart; the reported idle fraction there drops
   52.3 % → 50.2 %. The sweep harness is unaffected; where the two disagree, trust the sweep.
+* **On the async path, `step_0 + step_1` double-counts `step_0`.** `step_1` is started on iteration *N*
+  but stopped inside iteration *N+1*'s drain, so it already spans a full step: it reads as 104 ms at
+  batch 512 where the step is 52 ms. **Use `step_1` as the step wall time** — its median matches the
+  profiler's independent `wall_clean` at every batch size. For the same reason host-side `fwd` and
+  `rope` are now launch-queue back-pressure, not work (46.8 ms CPU against 10.7 ms `fwd_gpu` at batch
+  512); reading them as regressions inverts the meaning.
+
+#### 2.3 Async scheduling — the `async_scheduling` A/B (log928)
+
+**Workload**: as above · `max_model_len=1024`, `compile_rope=false`, **`pre_gather_cos_sin=true`**
+(so this round is not pessimistic the way the published baselines are)
+
+Both branches on **one** box back to back, two runs each, `async_scheduling` first —
+[report](./docs/performance_analysis_log928.md). The `main` column here *is* the pre-M8 baseline on this
+box; [log924](./docs/performance_analysis_log924.md) is the last standalone measurement of that engine,
+and log928 cites its noise floor. These numbers are **not** comparable to log910/914/915
+above: different vast instance (450 W enforced cap, driver 550, and the PCIe link negotiated **gen 1**)
+and a different config. Only the branch delta is meaningful, and the gen-1 link flatters a change whose
+point is fewer host↔device round-trips.
+
+| batch | `main` tok/s | branch tok/s | Δ | `main` TPOT | branch TPOT | Δ |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 102 | 100 | −1.9 % | 9.83 ms | 10.01 ms | +1.9 % |
+| 16 | 1 345 | 1 366 | +1.6 % | 11.49 ms | 11.21 ms | −2.5 % |
+| 64 | 3 557 | 4 919 | **+38.3 %** | 17.53 ms | 12.17 ms | **−30.6 %** |
+| 128 | 4 638 | 6 791 | **+46.4 %** | 27.00 ms | 17.77 ms | **−34.2 %** |
+| 512 | 6 015 | 7 232 | **+20.2 %** | 83.31 ms | 68.23 ms | **−18.1 %** |
+| 1 024 | 5 861 | **OOM** | — | 169.68 ms | — | — |
+
+Run-to-run throughput spread: ≤ **1.26 %** on `main`, ≤ **3.22 %** on the branch (worst case batch 1).
+Every gain above is at least 6× that noise floor.
+
+**Conclusions**:
+
+1. **The kernels never changed.** GPU busy time per step agrees within **1.6 % at every batch size**
+   (+0.8 % at batch 512). The whole gain is host stalls that stopped happening: GPU idle in a
+   pure-decode step falls **27.5 % → 1.5 %** at batch 512 and **42.0 % → 7.1 %** at batch 128. Where
+   §2.1 said "the GPU is idle 50–85 % of every decode step", the answer was not a faster kernel.
+
+2. **19.4 ms of a 70.5 ms step was host work the GPU could not overlap.** At batch 512, per step:
+   `sched` 1.274 → 0.494 ms, `sched_ret_gpu` (device work inside the scheduler) 0.831 → **0.000** ms,
+   host time in the sampler 56.054 → **1.089** ms, `dth` (the token read-back) 2.913 → **0.036** ms.
+   Residual unoverlapped host time is now 0.8 ms inside a 52.3 ms step.
+
+3. **Same throughput at a quarter of the latency.** `main` needs batch 512 and 83.3 ms TPOT to reach
+   6 015 tok/s; the branch beats that at batch 128 with **17.8 ms TPOT** — and at that operating point
+   it is better on every axis, prefill latency included. Scaling efficiency at batch 64 holds
+   **0.76–0.78** against `main`'s 0.54–0.55.
+
+4. **Sampling is now 79 % of all device work** — 40.6 of 51.5 ms/step at batch 512, against ~9 ms for
+   the model itself. A single `aten::sort` inside `apply_top_p` is **15.4 ms, 30 % of the whole step**,
+   sorting all 151 936 vocabulary columns *after* top-k has cut the live candidates to 20 — and
+   `torch.topk` already returns its values sorted. Roadmap item 1 is no longer merely the largest win
+   available; it is the only one left of that size.
+
+**Two costs, both measured**:
+
+* **Prefill latency +37 … 78 % for batch ≥ 32** (121.6 → 216.6 ms at batch 512). A request's first
+  token is produced by step *N* but committed during step *N+1*'s drain, so TTFT gains one whole
+  following iteration — which at high concurrency is often another 8 192-token prefill chunk. Decode
+  ITL improves at every percentile (p50 70.3 → 52.4 ms, p90 125.4 → 119.5 ms at batch 512), so the
+  cost is confined to the first token. This is the standard cost of async scheduling, but it is not
+  free.
+* **Batch 1 024 OOMs** where `main` degraded to 5 861 tok/s: `apply_top_p`'s full-vocabulary
+  `torch.sort` asks for **1.73 GiB in one allocation** with peak memory already at 24 200 of
+  24 564 MiB, because the pipeline keeps one extra step's tensors reachable. The engine now caps at
+  512 concurrency on a 24 GB card. Roadmap item 1 removes the allocation.
+
+The branch is also **less steady**: 1–4 anomalous steps per 20-step window against `main`'s 0, and
+batch 256's idle fraction (12.6 %) is worse than batch 128's (7.1 %). The spike is **device-side**
+(`fwd_gpu` 64 ms against a 7 ms local median), not a host stall, which makes allocator pressure the
+leading hypothesis — same root cause as the OOM. Roadmap item 3.
 
 ---
 
@@ -250,26 +335,37 @@ Other following verifications see `tests/` folder for details. The main ones `te
 
 ## Roadmap
 
-Ordered by measured cost — see [log915 §7](./docs/performance_analysis_log915.md#7-recommendations-in-order).
+Ordered by measured cost — see [log915 §7](./docs/performance_analysis_log915.md#7-recommendations-in-order)
+and [log928 §6](./docs/performance_analysis_log928.md), which supersedes it where they differ.
 
-1. **Rewrite sampling to work on the candidate set** — `topk(k)` first, then sort/softmax/multinomial
-   over *k* instead of over all 151 936 logits; penalties on gathered candidates instead of a
-   `[batch, vocab]` materialisation. The only change that moves throughput by a multiple (≈2× at
-   batch 512), and it pays twice because chunked-prefill steps sample too.
-2. **CUDA-graph the decode step** — shapes are static once the batch is fixed. The only change that
-   improves single-stream latency, it lifts small-batch throughput where `fwd` is 90 % of the step,
-   and it is the prerequisite for kernel-level tuning to have the sign one expects.
-3. **Stop sweeping with `--pre-gather-cos-sin=false`** — free, already the `config.py` default, worth
-   1.6–10.9 % of the step. The published baselines are pessimistic by that much.
-4. **Apply the verified fix for the profiler contamination** — one batch size per pytest process is
-   known to remove it entirely (log916); what remains is to make that the harness default rather than
-   a shell loop around `pytest`. Every `gpu_idle_fraction` published from a multi-batch session is
-   overstated by ~2 points for all but its first batch point.
-5. **Un-block the token read-back** — `next_tokens.tolist()` is 5.2 ms at batch 1 024 and a hard sync;
-   stage through pinned memory on a side stream once the step is short enough for 5 ms to matter.
-6. **Chase the host-path tail, not its mean** — 43 of 965 decode steps at batch 512 carry a
-   multi-millisecond spike in `ci`/`bld_meta`/`sched`; they are enumerated in the `.anomaly` files
-   the profiling harness writes.
+1. **Rewrite sampling to work on the candidate set** — `topk(k)` already returns its values sorted, so
+   run softmax → cumsum → threshold → `multinomial` over *k* and map back through the top-k indices,
+   instead of sorting all 151 936 logits; penalties on the same narrowed block instead of a
+   `[batch, vocab]` materialisation. Mathematically identical for any row where top-k is enabled.
+   Now unambiguously the top item: post-M8 the sampler is **79 % of all device work** and its
+   `aten::sort` alone is **30 % of a batch-512 step** (≈18 of 51.5 ms/step recoverable, TPOT
+   52 → ~34 ms), and the same allocation is what OOMs batch 1 024. It still pays twice, because
+   chunked-prefill steps sample every running decode row too.
+2. **CUDA-graph the decode step** — now specifically a *small-batch* item. M8 took batch ≥ 128 to under
+   8 % idle, but batch 1 is still **68 % idle**: the host needs ~10 ms to launch a step whose kernels
+   occupy 3.2 ms. Shapes are static once the batch is fixed. This is the only change that improves
+   single-stream latency, and the prerequisite for kernel-level tuning to have the sign one expects.
+3. **Settle the allocator pressure behind the batch-256 stalls and the batch-1024 OOM** — run with
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and log `num_alloc_retries` per step. If retries
+   correlate with the 9× `fwd_gpu` spikes, §2.3's non-monotonic batch-256 idle fraction and the OOM
+   are one bug, and item 1 mostly dissolves both. One env var, high information — do it before
+   chasing anything else in that area.
+4. **Reduce the pipeline's first-token cost** — §2.3 puts prefill latency up 37–78 % for batch ≥ 32,
+   because a first token is committed one iteration late. Prioritising the drain of a step that
+   produced a first token, or keeping prefill chunks out of the iteration immediately after an
+   admission, should recover most of it without giving up the decode win.
+5. **Make one-batch-per-process the harness default** — one pytest process per batch size is the
+   verified fix for the ~30 % residual profiler overhead (log916), and log928 got it only from a shell
+   loop. Every `gpu_idle_fraction` published from a multi-batch session is overstated by ~2 points for
+   all but its first batch point.
+6. **Promote `set_sync_debug_mode` from `warn` to `error`** — the decode path is sync-free as of M8 and
+   `test_profile.py` already arms the warning across the measurement window. Making it fatal turns
+   "no accidental sync" into a test rather than an observation, once the prefill path is clean too.
 7. **Fused kernels in Triton**, once the orchestration overhead above no longer hides them.
 8. **Scale to the 7B target** on the same harness.
 
