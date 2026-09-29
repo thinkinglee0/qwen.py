@@ -18,6 +18,9 @@ branch deltas here are the trustworthy part and any comparison to log924 is not 
 | Cross-branch step metrics, batch 1 | `log_vast/log928/mean_step_metrics.1.log` |
 | GPU static inventory / host | `log_vast/log928/gpu.static.csv`, `host_info` |
 
+> `slot` in those directory names is the branch's pre-rename name. **Leave them** — they are real
+> paths on disk.
+
 Cross-branch step-metric tables for batches 8–512 were **not** in the log directory (only batch 1 was);
 they were regenerated for this report from the same dumps with the same tool
 (`test_profile.py::test_mean_step_metrics`, `STEP_METRICS_LINES=65:84,65:84`), writing into a scratch
