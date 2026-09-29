@@ -284,6 +284,11 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
 
 STEP_METRICS_GLOB = "step_metrics.*.json"
 REPORT_FILE_NAME = "mean_step_metrics.{}.log"
+# A report belongs to the *pair* of runs, not to either one, so it goes into its own
+# directory named after them -- profile_slot vs profile_slot2 -> slot_against_slot2.
+# The run prefix (profile_/benchmark_) is dropped: it says how the dump was produced,
+# which is the same for both sides and carries nothing about the comparison.
+REPORT_DIR_JOINER = "_against_"
 
 
 # An anomaly is a step that COST time, judged against its own neighbourhood:
@@ -455,6 +460,19 @@ def _write_anomalies(run: RunStats) -> Path:
     return out_path
 
 
+def _report_dir_name(runs: list[str]) -> str:
+    """Where a report goes, relative to the common base: no runs (the base directory
+    is itself the run) keeps it in the base, one run writes next to its own dump, and
+    a comparison gets a directory of its own (see REPORT_DIR_JOINER)."""
+    if not runs:
+        return "."
+    if len(runs) == 1:
+        return runs[0]
+
+    # split("_", 1)[-1] leaves a name without an underscore untouched
+    return REPORT_DIR_JOINER.join(Path(r).name.split("_", 1)[-1] for r in runs)
+
+
 def test_mean_step_metrics(log_dir: str):
     '''
     Per-field stats over a step_metrics dump (JSONL, one object per step, written by
@@ -470,6 +488,12 @@ def test_mean_step_metrics(log_dir: str):
     STEP_METRICS_BATCH batch size, matched against the dump name (default: newest dump)
     STEP_METRICS_LINES 1-based inclusive line range over non-empty lines, one for both
                        runs or one each ('65:69', '65:', ':69', '65:69,33:40')
+    STEP_METRICS_OUT   where the report lands, relative to STEP_METRICS_DIR (default:
+                       'slot_against_slot2' for the two runs above, the run's own
+                       directory for a single run)
+
+    The per-step anomaly dumps are NOT part of the report: they stay next to the
+    step_metrics dump they were computed from, one per run.
     '''
     base = Path(os.environ.get("STEP_METRICS_DIR") or log_dir)
     runs = [r.strip() for r in os.environ.get("STEP_METRICS_RUNS", "").split(",") if r.strip()]
@@ -485,7 +509,9 @@ def test_mean_step_metrics(log_dir: str):
     assert len(specs) == len(run_dirs), \
         f"STEP_METRICS_LINES: give one range or {len(run_dirs)}, got {len(specs)}"
 
-    report_path = base / REPORT_FILE_NAME.format(batch or "latest")
+    out_dir = base / (os.environ.get("STEP_METRICS_OUT") or _report_dir_name(runs))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / REPORT_FILE_NAME.format(batch or "latest")
     with _tee_logs(report_path):
         logger.info(f"report -> {report_path}")
         _report_step_metrics(run_dirs, batch, specs)
