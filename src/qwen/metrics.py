@@ -102,6 +102,7 @@ class SchedulerStepMetrics:
     sample_gpu: float = 0.
     dth: float = 0.
     dth_gpu: float = 0.
+    dth_wait: float = 0.
     ci: float = 0.
 
     def start(self, ev: str):

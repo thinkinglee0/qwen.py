@@ -32,7 +32,7 @@ def pytest_collection_modifyitems(session, config, items):
                           "test_mean_step_metrics",
                           "test_parse_chrome_trace",
                           ]
-    excluded_module_names = ["test_playground"]
+    excluded_module_names = ["test_playground", "test_tensor"]
 
     explicitly_called = any(fun_name in arg for fun_name in excluded_fun_names for arg in config.args)
     explicitly_called |= any(module_name in arg for module_name in excluded_module_names for arg in config.args)

@@ -100,12 +100,22 @@ class LLMEngine:
 
         assert pre_sch_out.step_metrics is not None
         with timed(pre_sch_out.step_metrics, "step_1"):
-            return self.sample_in_flight_step_imp(pre_sch_out=pre_sch_out)
+            num_truncated = self.sample_in_flight_step_imp(pre_sch_out=pre_sch_out)
+
+            with timed(pre_sch_out.step_metrics, "ci"):
+                self.scheduler.commit_step(sch_out=pre_sch_out, num_truncated=num_truncated)
+
+        # NOTE: the cpu time of log_metrics not taken into account by 'step_1'
+        self.scheduler.log_metrics(sch_out=pre_sch_out)
+
+        return pre_sch_out.batch_size
 
     def sample_in_flight_step_imp(self, pre_sch_out: SchedulerOutput) -> int:
         assert pre_sch_out.step_metrics is not None
         pre_sch_out.step_metrics.pend = len(self.in_flight_steps)     # a value after this step
-        pre_sch_out.step_metrics.events.synchronize("dth")  # wait for data from device.
+
+        with timed(pre_sch_out.step_metrics, "dth_wait"):
+            pre_sch_out.step_metrics.events.synchronize("dth")  # wait for data from device.
 
         # merge md.step_metrics_lst to pre_sch_out.step_metrics
         # must be placed after next_tokens.tolist(), a synchronous operation, otherwise all events would be not ready.
@@ -115,14 +125,9 @@ class LLMEngine:
             for layer_metrics in md.step_metrics_lst:
                 pre_sch_out.step_metrics.merge(layer_metrics)
 
-        pre_sch_out.step_metrics.start("ci")
         num_truncated = pre_sch_out.add_sampled_tokens_on_host()
 
-        self.scheduler.commit_step(sch_out=pre_sch_out, num_truncated=num_truncated)
-
-        pre_sch_out.desc_num_in_flight()
-
-        return pre_sch_out.batch_size
+        return num_truncated
 
     def run_to_completion(self):
         while self.scheduler.has_unfinished():

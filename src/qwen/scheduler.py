@@ -700,13 +700,8 @@ class Scheduler:
 
         if sch_out.step_metrics is not None:
             sch_out.step_metrics.fin = fin      # number of finished reqs in this step
-            if not sch_out.step_metrics.is_stopped():   # pending events: [ci*, step]
-                if len(sch_out.step_metrics.pending_evs) > 1:
-                    sch_out.step_metrics.stop("ci") # "ci" set in engine.forward usually
-                sch_out.step_metrics.stop("step_1")
 
-            assert sch_out.step_metrics.is_stopped()
-        self.log_metrics(sch_out=sch_out)
+        sch_out.desc_num_in_flight()
 
     def cleanup_on_finished(self, req: ModelRequest):
         assert req.finished and req.projected_is_decoding
@@ -1131,6 +1126,8 @@ class Scheduler:
     def log_step_metrics(self, sch_out: SchedulerOutput):
         if sch_out.step_metrics is None:
             return
+
+        assert sch_out.step_metrics.is_stopped()
 
         # todo: Is it needed to roll back the committed requests due to eos in the previous step.
 

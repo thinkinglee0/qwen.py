@@ -6,6 +6,7 @@ playgrounds/
 *.egg-info/
 *.bak
 test_playground.py
+test_tensor.py
 data/
 benchmark/data
 docs/dataclass_class_attribute_pitfall.md

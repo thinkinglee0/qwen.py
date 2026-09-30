@@ -264,6 +264,11 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     assert req1.num_computed_tokens == s_info1.want
     assert req1.finished == False
 
+    # increase in-flight counter
+    assert req1.num_in_flight == 0
+    sch_out.incr_num_in_flight()
+    assert req1.num_in_flight == 1
+
     # ---------- snapshot of step 2 ----------
     ctx = LifeCycle(sch=sch, req=req1, s_info1=s_info1, s_info2=s_info, pre_sch_out=sch_out)
 
@@ -321,6 +326,7 @@ def finish_on_eos(ctx: LifeCycle):
     sch.commit_step(sch_out=pre_sch_out, num_truncated=num_truncated)
 
     # ---------- snapshot of step 3 ----------
+    sch_out.incr_num_in_flight()
     pre_sch_out = sch_out
     s_info3 = s_info
     pre_s_info = s_info
@@ -371,6 +377,7 @@ def finish_on_eos(ctx: LifeCycle):
     assert req1 not in sch.running
 
     # ---------- snapshot of step 4 ----------
+    sch_out.incr_num_in_flight()
     pre_sch_out = sch_out
     s_info4 = s_info
     pre_s_info = s_info
@@ -503,6 +510,7 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
     assert req1.finished == False
 
     # ---------- snapshot of step 3 ----------
+    sch_out.incr_num_in_flight()
     pre_sch_out = sch_out
     s_info3 = s_info
     pre_s_info = s_info
@@ -704,6 +712,11 @@ def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, su
             slot_idx=sch_out.slot_idx, needs_sample=sch_out.needs_sample_device,
             next_tokens=next_tokens, want=sch_out.want,
             step_metrics=sch_out.step_metrics)
+
+    # mock queueing the in-flight batch
+    sch_out.incr_num_in_flight()
+
+    # mock dequeing the in-flight batch
     num_truncated = sch_out.add_sampled_tokens_on_host()
     assert survival_req.projected_is_decoding and survival_req.finished
     assert survival_req.slot is not None
