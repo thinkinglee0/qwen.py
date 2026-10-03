@@ -183,7 +183,13 @@ def report(batch, ttft, tpot, throughput, model: ModelSpec):
     if len(profitable):
         knee = batch[profitable[-1] + 1]
         print(f"last profitable doubling ends at batch = {knee:.0f} (gain/cost > 1)")
-    print(f"saturated aggregate throughput  ~ {throughput[-1]:.0f} tok/s")
+    # The largest batch is not necessarily the best one: past the knee,
+    # throughput can fall (e.g. KV pressure), so report the true peak.
+    peak = int(np.argmax(throughput))
+    print(f"peak aggregate throughput       ~ {throughput[peak]:.0f} tok/s @ batch={batch[peak]:.0f}")
+    if peak != len(batch) - 1:
+        drop = 1 - throughput[-1] / throughput[peak]
+        print(f"  (batch={batch[-1]:.0f} is {drop * 100:.1f} % below peak -- past the knee, not saturated)")
 
     if PEAK_HBM_BW_BPS and PEAK_DENSE_FLOPS:
         # Roofline numbers are only as good as the two assumptions below, and a
@@ -195,9 +201,9 @@ def report(batch, ttft, tpot, throughput, model: ModelSpec):
             f"({PEAK_HBM_BW_BPS / 1e9:.0f} GB/s, {PEAK_DENSE_FLOPS / 1e12:.0f} TFLOP/s)"
         )
         mbu = model.weight_bytes / (tpot[0] * 1e-3) / PEAK_HBM_BW_BPS
-        mfu = 2 * model.flop_params * throughput[-1] / PEAK_DENSE_FLOPS
+        mfu = 2 * model.flop_params * throughput[peak] / PEAK_DENSE_FLOPS
         print(f"MBU at batch={batch[0]} (weights only)   ~ {mbu * 100:.1f} %")
-        print(f"MFU at batch={batch[-1]} (2*N*tok/s)    ~ {mfu * 100:.1f} %")
+        print(f"MFU at batch={batch[peak]:.0f} (2*N*tok/s)    ~ {mfu * 100:.1f} %")
     print("=" * 78)
 
 
@@ -238,11 +244,12 @@ def make_figure(path, batch, ttft, tpot, itl, throughput, model: ModelSpec):
         lw=1.2,
         label="linear scaling from batch=1",
     )
-    ax.axhline(throughput[-1], color=C_IDEAL, ls=":", lw=1.2)
+    peak = int(np.argmax(throughput))
+    ax.axhline(throughput[peak], color=C_IDEAL, ls=":", lw=1.2)
     ax.text(
         1.1,
-        throughput[-1] * 1.08,
-        f"saturation ~{throughput[-1]:.0f} tok/s",
+        throughput[peak] * 1.08,
+        f"peak ~{throughput[peak]:.0f} tok/s @ batch={batch[peak]:.0f}",
         fontsize=8,
         color=INK,
     )
