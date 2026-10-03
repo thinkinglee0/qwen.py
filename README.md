@@ -5,7 +5,7 @@ understand LLM inference at the mechanism level. The model code (attention, RoPE
 
 Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-7B on an NVIDIA RTX 4090**.
 
-> *Special contributor: **Claude** maintaining `docs` and the profiling/visualizing tools (`tests/test_profile.py`, `benchmark/tool/bench_viz.py`)*
+> ***Special contributor**: **Claude** maintaining `docs` and the profiling/visualizing/benchmarking tools (`tests/test_profile.py`, `benchmark/tool/bench_viz.py`, `benchmark/tool/vllm_sweep.py`)*
 
 ---
 
@@ -21,6 +21,8 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M6**    | continuous batching                                             | ✅done. continuous batching with paged kv cache; two interchangable scheduling strategies (preemptive_schedule and D_first_preemptive_schedule); watermark block reservation; expential backoff; KVCache.verify_invariant periodically checks; metrics (schedule metrics, step metrics, and request metrics).|
 | **M7**    | performance profiling     | ✅ done for the 0.5B baseline. Three rounds on an RTX 4090 — concurrency sweeps (batch 1 → 1 024) and a decode-step profiler reporting GPU idle fraction from the chrome trace, every configuration run **twice** for a measured noise floor. Reports: [log910](./docs/performance_analysis_log910.md), [log914](./docs/performance_analysis_log914.md), [log915](./docs/performance_analysis_log915.md) ([中文](./docs/performance_analysis_log915.zh.md)) and the switch matrix [log915](./docs/performance_switches_log915.md) ([中文](./docs/performance_switches_log915.zh.md)). |
 | **M8**    | async scheduling (one decode step of lookahead)            | ✅ done. `step_0` launches a step with no sync; `step_1` drains the previous one. Request state splits into projected/actual so the next batch is planned before the current lands; token ids and penalty masks stay resident on device. **+20.2 % peak throughput, +46.4 % at batch 128, GPU idle in a pure-decode step 27.5 % → 1.5 % with kernel time unchanged (+0.8 %)**. Report: [log928](./docs/performance_analysis_log928.md). |
+| **M9**    | fused top-k + top-p sampling                                | ✅ done. One `topk(max_k)` feeds a `[batch, max_k]` window that does the per-row k mask, softmax, cumsum and top-p threshold, then scatters survivors back — deleting the full-vocabulary `torch.sort` that cost **15.4 ms of a 52 ms step**. **+51.5 % peak throughput (7 245 → 10 976 tok/s), −34.8 % TPOT at batch 512, device work per decode step −47 %**, the GPU-bound knee moves batch 64 → 128, and the batch-1024 OOM is gone. Report: [log1001](./docs/performance_analysis_log1001.md) ([中文](./docs/performance_analysis_log1001.zh.md)). |
+| **M10**   | external yardstick — A/B against vLLM 0.30.0                | ✅ done. Same host, same window, same workload, one engine at a time, via `benchmark/tool/vllm_sweep.py`. At batch 512 qwen.py is at **81 %** of vLLM with compilation and CUDA graphs *disabled* and **61 %** of its peak with both on; the gap factorises as **1.23× engine design × 1.17× compile+graphs**. Report: [log1003](./docs/performance_analysis_log1003.md) ([中文](./docs/performance_analysis_log1003.zh.md)). |
 | later     | Fused kernels in Trition | planed  |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
@@ -58,8 +60,9 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 **Sampling**
 - **Sampling** — parses `generation_config.json`; applies repetition/frequency/presence penalties right after `forward`, then samples (temperature, top_k, top_p, multinomial) when `do_sample` is on.
 - **Device-resident penalty masks** — `TokenIdTable` keeps the full token-id history on device, one row per request slot, and derives `output_counts` plus the prompt/output presence masks there (`bin_count_and_mask`): both masks share one `[B, 2V+16]` buffer, so it is a single memset and a single scatter. The sampler needs nothing from the host, which is the precondition for launching a step without a sync.
-- **Sync-free sampler setup** — `apply_top_k` reads `max_k` from a pinned host mirror of the top-k column instead of `top_k.max().item()`; `MAX_EFFECTIVE_TOP_K = 1024` rounds a larger top-k up to a no-op rather than paying a wider `topk()` for something statistically indistinguishable from none. `SamplingParams.validate()` rejects out-of-range parameters at submission.
-- **Known cost** — `apply_top_p` still sorts the full 151 936-wide vocabulary, which is now **30 % of a batch-512 decode step** and the cause of the batch-1024 OOM. See [§2.3](#23-async-scheduling--the-async_scheduling-ab-log928) and roadmap item 1.
+- **Sync-free sampler setup** — `max_k` is read from a pinned host mirror of the top-k column instead of `top_k.max().item()`; `MAX_EFFECTIVE_TOP_K = 1024` clamps a larger top-k rather than paying a wider `topk()` for something statistically indistinguishable from none. `SamplingParams.validate()` rejects out-of-range parameters at submission. **Note the semantics**: with `vocab_size > 1024`, "top-k disabled" is implemented as top-1024, which is a truncation and not a no-op (`test_fused_truncates_at_cutoff_where_sequential_keeps_the_tail` documents the divergence).
+- **Fused top-k + top-p** — `apply_fused_top_k_and_p` runs one `topk(max_k, sorted=True)` and does everything else on the resulting `[batch, max_k]` window: per-row k mask → softmax → cumsum → top-p threshold → `scatter_` back to vocab order. `torch.topk` already returns descending values, so the old `apply_top_p`'s full-vocabulary `torch.sort` was re-deriving an order it had just been handed — 15.4 ms/step at batch 512, plus a 1.73 GiB workspace that OOM'd batch 1024. The per-row mask has to be applied *before* the softmax or probabilities renormalise over the batch-wide slab instead of each row's own k; `test_fused_renormalises_probs_within_each_row_k` pins that.
+- **Known cost** — the sampler is still **61 % of device work at batch 512** (16.3 of 26.9 ms/step). What remains is ~23 full-vocabulary passes for a problem 20 columns wide: temperature, penalties, the `-inf` scatter-back, the fp32 softmax, the dead-row guard, `multinomial` and `argmax` all still run over all 151 936 columns. See [§2.4](#24-fused-top-k--top-p--log1001) and roadmap item 1.
 
 **Serving & observability**
 - **Streaming HTTP service** — FastAPI `/generate_stream` and `/health`; `async_generate` interleaves `_decode_step` into the running event loop so one worker serves multiple concurrent streams; `@asynccontextmanager`/`@pytest_asyncio.fixture`/`@pytest.fixture` ensure model weights load only once across sync, async, and endpoint tests.
@@ -269,6 +272,102 @@ batch 256's idle fraction (12.6 %) is worse than batch 128's (7.1 %). The spike 
 (`fwd_gpu` 64 ms against a 7 ms local median), not a host stall, which makes allocator pressure the
 leading hypothesis — same root cause as the OOM. Roadmap item 3.
 
+#### 2.4 Fused top-k + top-p — log1001
+
+**Workload**: as above · one instance, ~45 min, two runs each arm, candidate **first** (colder box) —
+[report](./docs/performance_analysis_log1001.md) ([中文](./docs/performance_analysis_log1001.zh.md))
+
+This is §2.3's roadmap item 1, cashed in. The candidate is **exactly one commit** ahead of the
+baseline (`async_scheduling` @ `bedc00f` → `fused_top_kp` @ `49bb10d`, three files, +51/−19 in
+`sampling.py`): no scheduler change, no engine change, no kernel change outside the sampler.
+
+| batch | base tok/s | fused tok/s | Δ | base TPOT | fused TPOT | Δ | base prefill | fused prefill |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 102 | 102 | −0.4 % | 9.75 ms | 9.79 ms | +0.4 % | 10.1 ms | 10.2 ms |
+| 64 | 5 057 | 5 102 | +0.9 % | 11.82 ms | 11.74 ms | −0.7 % | 96.4 ms | 93.1 ms |
+| 128 | 6 816 | **8 707** | **+27.7 %** | 17.70 ms | **13.67 ms** | **−22.8 %** | 118.1 ms | 109.6 ms |
+| 256 | 7 166 | **10 704** | **+49.4 %** | 34.21 ms | **22.52 ms** | **−34.2 %** | 154.0 ms | 133.0 ms |
+| 512 | 7 245 | **10 976** | **+51.5 %** | 68.11 ms | **44.44 ms** | **−34.8 %** | 216.8 ms | **172.8 ms** |
+| 1 024 | **OOM** | 9 630 | — | — | 101.57 ms | — | — | 271.5 ms |
+
+Run-to-run throughput spread ≤ **1.14 %** on the baseline and ≤ **1.99 %** on the candidate, and the
+baseline reproduced log928's `async_scheduling` numbers on a *different* instance to within **0.2 %**
+(peak 7 245 vs 7 232 tok/s, device busy 51 515 vs 51 526 µs/step).
+
+**Conclusions**:
+
+1. **The whole gain is one op disappearing.** `aten::sort` was **15.43 ms of a 52.1 ms device step**
+   (29.6 %) and is now absent from the trace entirely; with the traffic it dragged along
+   (`masked_fill_`, `scatter_`, `cumsum`, one full-vocabulary `_softmax`, the DtoD copies) the step's
+   device time falls **52.1 → 27.4 ms (−47.3 %)**. `aten::mm` 3.614 → 3.608 and `flash_attn`
+   4.886 → 4.888: the model is bit-for-bit the same work.
+2. **Nothing below batch 128 moved, and that is correct.** At batch ≤ 64 the engine is host-bound
+   (GPU idle 50–67 %), so removing device work buys +0.1 … +3.4 %. The saving is real there too —
+   device busy at batch 64 is **7.91 → 5.40 ms/step** — it just has nowhere to go. Idle fraction
+   therefore *rises* everywhere (batch 128: 6.6 % → 24.8 %): that is pre-existing host overhead
+   becoming visible once the device stopped being the long pole.
+3. **The GPU-bound knee moved batch 64 → 128**, so the engine's default `max_num_seqs = 128` now sits
+   *at* the knee instead of one doubling past it. Scaling efficiency at batch 128: **0.52 → 0.67**.
+4. **Prefill latency improved too**, paying back part of §2.3's TTFT cost: −20.3 % at batch 512,
+   −13.6 % at 256. Against log928's `main` (121.6 ms at batch 512) the async-scheduling penalty is now
+   **46 % repaid**, for free.
+5. **Batch 1024 is runnable but past the peak** — 9 630 tok/s against 10 976 at batch 512, with TPOT
+   more than doubled. The OOM fix removes a hard failure mode and the 1.73 GiB allocation spike, but
+   1024 is not a useful operating point.
+6. **Sampling is still the biggest line item: 16.35 of 27.3 ms/step (61 %)** at batch 512 — ~23
+   full-vocabulary passes for a problem 20 columns wide. Roadmap item 1 is half done.
+
+#### 2.5 External yardstick — qwen.py vs vLLM 0.30.0 (log1003)
+
+**Workload**: `test_benchmark_sweep_batch_size` itself (512-in / 128-out, `ignore_eos`, batch 1 → 1 024),
+mirrored field-for-field by [`benchmark/tool/vllm_sweep.py`](./benchmark/tool/vllm_sweep.py) —
+[report](./docs/performance_analysis_log1003.md) ([中文](./docs/performance_analysis_log1003.zh.md))
+
+Every section above compares qwen.py to itself. This one puts it next to vLLM on one host, in one
+window, one engine at a time. What had to be aligned: **output-token throughput** on both sides (the
+"total token throughput" vLLM's own harnesses print is exactly 5.0× larger at this shape), the four
+sampling parameters item-for-item (the sampler is 61 % of qwen.py's device work — disabling them
+deletes the subject under test, and vLLM takes a cheaper path when *no* request needs them, so partial
+alignment is worse than none), KV capacity matched as **1 048 576 tokens** rather than by `block_size`,
+and `detokenize=False`. Both engines selected `FLASH_ATTN`, so the attention kernel is not a confound.
+
+| batch | qwen.py | vLLM, no compile/graphs | ratio | vLLM, compiled + graphed | ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 43 | 71 | 1.64× | 516 | 11.9× |
+| 64 | 2 375 | 3 773 | 1.59× | 13 518 | 5.7× |
+| 128 | 4 392 | 6 502 | 1.48× | 16 622 | 3.8× |
+| 256 | 7 672 | 10 470 | 1.36× | **18 032** (peak) | 2.4× |
+| **512** | **10 970** (peak) | **13 505** (peak) | **1.23×** | 15 848 | **1.44×** |
+| 1 024 | 9 622 | 13 038 | 1.36× | 12 841 | 1.33× |
+
+**Conclusions**:
+
+1. **At batch 512 the gap factorises: 1.44× = 1.23× engine design × 1.17× compile + CUDA graphs.**
+   The 1.23× is like-for-like — both eager, both `FLASH_ATTN`, identical KV capacity and sampling
+   parameters. **In the regime the engine was built for, it is within 23 % of vLLM's.** The 1.17× is a
+   capability gap: qwen.py has no `torch.compile` path and no graph capture, so there is nothing in it
+   to compare.
+2. **Compilation + graphs are worth 7.28× at batch 1**, decaying monotonically to 3.58× at 64, 1.72×
+   at 256, 1.17× at 512 and 0.98× at 1024. That is the first external price tag on the per-step host
+   tax — and it is roadmap item 2. Note vLLM's `enforce_eager=True` disables inductor **and** graph
+   capture, so this factor is a bundle; splitting it needs a third arm.
+3. **The host-loop ratio is flat at 1.59–1.65× for every batch ≤ 64.** Both engines are host-bound
+   there and paying the *same* interpreter, and a ratio of two host-bound loops is independent of
+   interpreter speed — so unlike the absolute numbers, **this one transfers across hosts**: qwen.py's
+   host-side step costs ~1.6× vLLM's eager one, anywhere.
+4. **Mind the host.** This instance's Python is **~2.3× slower** than log1001's (EPYC 7402 held at
+   ≈2.24 GHz by neighbour load). Same code, same branch: `gpu_busy_from_trace` agrees with log1001
+   **within ±2 % at every batch** while `wall_clean` is 2.26–2.38× higher up to batch 128, converging
+   to 1.01× at 512. **So batch 512/1024 is a measurement and transfers; batch ≤ 256 absolute
+   throughput does not** (the ratios in point 3 do). The §1b launch-overhead gate passed at 7.56 µs and
+   did not catch this — the pure-interpreter loop now in the runbook is what does.
+5. **The measured gap is a floor.** The 400 W cap was Active for **64.7–68.6 %** of vLLM's busy samples
+   against **42.3–42.6 %** of qwen.py's, because qwen.py leaves the GPU idle 5–86 % of the time and
+   cannot draw as much power. On a 450 W host vLLM gains more. vLLM also ran first, on the colder box.
+6. **Priorities invert.** Roadmap item 1's remaining half is worth ~1.8× on qwen.py's device time at
+   batch 512 — **more than the entire 1.44× gap**. Finish the sampler before renting a faster host to
+   re-measure, and before capturing graphs around a step that wastes 61 % of its device time.
+
 ---
 
 ## Quickstart
@@ -297,6 +396,40 @@ Note: The information provided here is general and may not reflect current event
 ```
 
 `pytest` results all pass as expected. The letters from the `curl` response display like a typewriter.
+
+### Benchmarking and profiling
+
+One process per batch size — a single pytest session overstates `gpu_idle_fraction` by ~2 points for
+every batch point after the first (roadmap item 5).
+
+```bash
+# concurrency sweep: 512-in / 128-out, ignore_eos, fixed batch per process
+for bz in 1 2 4 8 16 32 64 128 256 512 1024; do
+  SWEEP_BATCH_SIZES=$bz pytest --log-file-mode=a -x -s \
+    tests/test_benchmark.py::test_benchmark_sweep_batch_size
+done
+
+# pure-decode step profile: GPU idle fraction + per-op key_averages from the chrome trace
+for bz in 1 8 32 64 128 256 512; do
+  SWEEP_PROFILE_BATCH_SIZES=$bz pytest --log-file-mode=a -x -s \
+    tests/test_profile.py::test_profile_decode_idle_fraction
+done
+
+# diff two runs' step metrics field by field (Welch z-test, labels each field noise/SHIFT)
+STEP_METRICS_DIR=log_vast/log1003 STEP_METRICS_RUNS=profile_fused_top_kp,profile_fused_top_kp2 \
+  STEP_METRICS_BATCH=512 STEP_METRICS_LINES=65:84,65:84 \
+  pytest -x -s tests/test_profile.py::test_mean_step_metrics
+
+# the same sweep against vLLM, from its own isolated venv (see the runbook section 6a)
+"$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm eager     --runs 3 \
+  --out log/vllm_eager.jsonl     > log/vllm_eager.log 2>&1
+"$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm cudagraph --runs 3 \
+  --out log/vllm_cudagraph.jsonl > log/vllm_cudagraph.log 2>&1
+```
+
+Read [`vast-evn-build.md` §6](./env/vastai/vast-evn-build.md) before the vLLM arms: the comparison has
+three ways to come out meaningless (throughput definition, sampling-parameter parity, KV capacity), and
+one host-level gate that a passing launch-overhead number does **not** cover (§1b).
 
 ## Validation
 
@@ -335,34 +468,47 @@ Other following verifications see `tests/` folder for details. The main ones `te
 
 ## Roadmap
 
-Ordered by measured cost — see [log915 §7](./docs/performance_analysis_log915.md#7-recommendations-in-order)
-and [log928 §6](./docs/performance_analysis_log928.md), which supersedes it where they differ.
+Ordered by measured cost — see [log1003 §6](./docs/performance_analysis_log1003.md) and
+[log1001 §7](./docs/performance_analysis_log1001.md), which supersede
+[log928 §7](./docs/performance_analysis_log928.md) and
+[log915 §7](./docs/performance_analysis_log915.md#7-recommendations-in-order) where they differ.
 
-1. **Rewrite sampling to work on the candidate set** — `topk(k)` already returns its values sorted, so
-   run softmax → cumsum → threshold → `multinomial` over *k* and map back through the top-k indices,
-   instead of sorting all 151 936 logits; penalties on the same narrowed block instead of a
-   `[batch, vocab]` materialisation. Mathematically identical for any row where top-k is enabled.
-   Now unambiguously the top item: post-M8 the sampler is **79 % of all device work** and its
-   `aten::sort` alone is **30 % of a batch-512 step** (≈18 of 51.5 ms/step recoverable, TPOT
-   52 → ~34 ms), and the same allocation is what OOMs batch 1 024. It still pays twice, because
-   chunked-prefill steps sample every running decode row too.
-2. **CUDA-graph the decode step** — now specifically a *small-batch* item. M8 took batch ≥ 128 to under
-   8 % idle, but batch 1 is still **68 % idle**: the host needs ~10 ms to launch a step whose kernels
-   occupy 3.2 ms. Shapes are static once the batch is fixed. This is the only change that improves
-   single-stream latency, and the prerequisite for kernel-level tuning to have the sign one expects.
-3. **Settle the allocator pressure behind the batch-256 stalls and the batch-1024 OOM** — run with
-   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and log `num_alloc_retries` per step. If retries
-   correlate with the 9× `fwd_gpu` spikes, §2.3's non-monotonic batch-256 idle fraction and the OOM
-   are one bug, and item 1 mostly dissolves both. One env var, high information — do it before
-   chasing anything else in that area.
+1. **Finish moving sampling onto the candidate set** — 🟡 **half done** (M9). The full-vocabulary
+   `torch.sort` is gone and with it 15.4 ms/step and the batch-1024 OOM, but the *tail* of the sampler
+   still runs over all 151 936 columns: temperature, the `-inf` scatter-back, the fp32 softmax, the
+   dead-row guard, `multinomial` and `argmax`. That is **16.3 of 26.9 ms/step (61 % of device work)
+   at batch 512** — roughly 23 full-vocabulary passes for a problem 20 columns wide.
+   * Carry `(top_vals, indices)` out of `apply_fused_top_k_and_p` and finish inside the window:
+     temperature is rank-preserving so it is safe *after* `topk`, `argmax` is free because
+     `sorted=True` already put the max in column 0, and `multinomial` over `[batch, max_k]` maps back
+     with one `indices.gather`. ≈9 ms/step.
+   * **Penalties must stay ahead of `topk`** (they change the ranking) but they are a *sparse* update:
+     at most `prompt_len + output_len ≤ 1 024` of 151 936 columns, 0.7 %. Gather, apply, scatter back
+     instead of six full-vocabulary passes. ≈3.5 ms/step.
+   * Together: sampler → ~4 ms/step, device step **26.9 → ~15 ms (~1.8×)**. Per
+     [log1003 §6.1](./docs/performance_analysis_log1003.md) that is **larger than the entire 1.44× gap
+     to vLLM** at batch 512, which makes it the highest-value work available by a clear margin.
+2. **A compiled / graph-captured decode step** — now with an external price tag: vLLM's own A/B on the
+   same workload says compilation + CUDA graphs are worth **7.28× at batch 1**, 3.58× at 64, 1.72× at
+   256 and 1.17× at 512 ([§2.5](#25-external-yardstick--qwenpy-vs-vllm-0300-log1003)). qwen.py's decode
+   step is the easy case for capture: fixed `max_num_seqs` slots, resident parameter tables, no dynamic
+   control flow in the hot path. **Sequence it after item 1** — capturing a step that spends 61 % of its
+   device time in an avoidable sampler bakes the waste in. Still the only change that improves
+   single-stream latency.
+3. ~~**Settle the allocator pressure behind the batch-256 stalls and the batch-1024 OOM**~~ — ✅
+   **mostly resolved by M9**, as log928 §7.1 predicted it would be. The 1.73 GiB `torch.sort`
+   workspace is gone, batch 1024 completes, and the non-monotonic batch-256 idle fraction did not
+   reappear (3.1 % baseline / 5.6 % fused in log1001, against log928's 12.6 %). Remaining: item 1
+   still allocates a fresh `[batch, vocab]` tensor per step for the `-inf` scatter-back, which
+   finishing the window work removes.
 4. **Reduce the pipeline's first-token cost** — §2.3 puts prefill latency up 37–78 % for batch ≥ 32,
    because a first token is committed one iteration late. Prioritising the drain of a step that
    produced a first token, or keeping prefill chunks out of the iteration immediately after an
    admission, should recover most of it without giving up the decode win.
 5. **Make one-batch-per-process the harness default** — one pytest process per batch size is the
-   verified fix for the ~30 % residual profiler overhead (log916), and log928 got it only from a shell
-   loop. Every `gpu_idle_fraction` published from a multi-batch session is overstated by ~2 points for
-   all but its first batch point.
+   verified fix for the ~30 % residual profiler overhead (log916), and log928, log1001 and log1003 all
+   got it only from a shell loop. Every `gpu_idle_fraction` published from a multi-batch session is
+   overstated by ~2 points for all but its first batch point.
 6. **Promote `set_sync_debug_mode` from `warn` to `error`** — the decode path is sync-free as of M8 and
    `test_profile.py` already arms the warning across the measurement window. Making it fatal turns
    "no accidental sync" into a test rather than an observation, once the prefill path is clean too.

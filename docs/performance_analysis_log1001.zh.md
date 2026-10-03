@@ -348,7 +348,7 @@ diff 把 `ModelConfig.top_k` 从 `0` 翻成 `20`。走 `from_pretrained` 时这�
 核对）。但对任何直接构造 `ModelConfig()` 的路径它*是*可观察的 —— 合成配置、单测、嵌入式用法 —— 它们会
 悄悄从"无 top-k"切换到 top-20。意图无害、效果不可见，但值得在提交信息里写一行（它没写）。
 
-### 5.4 batch 1024 能跑了，但已经过峰
+### 5.4 batch 1024 能跑了，但已经过峰 —— 报告口径 ✅ 已在 `bench_viz.py` 修掉
 
 | batch | fused tok/s | TPOT ms | gain/cost |
 | --- | --- | --- | --- |
@@ -359,6 +359,12 @@ diff 把 `ModelConfig.top_k` 从 `0` 翻成 `20`。走 `from_pretrained` 时这�
 allocator 施压的 1.73 GiB 分配尖峰 —— 但 **1024 不是一个有用的工作点**，而 sweep 工具那句"saturated
 aggregate throughput ~ 9 632 tok/s"是误导的，因为它只是报了最后一行。真正的峰值是
 **batch 512 上的 10 976 tok/s**。
+
+> ✅ **这个报告口径的 bug 已修。** `benchmark/tool/bench_viz.py` 现在取 `argmax(throughput)` 而不是
+> 最后一行，打印 `peak aggregate throughput ~ N tok/s @ batch=B`，并在两者不同时补一行
+> `(batch=1024 is X % below peak -- past the knee, not saturated)`。MFU 那行本来错在同一个原因，
+> 现在也按峰值 batch 报。改动落在这批测量之后，所以 `log_vast/log1001/` 里的
+> `concurrency_sweep.txt` 仍是旧措辞，`log_vast/log1003/` 才是新的。
 
 ### 5.5 prefill 延迟仍随并发增长
 

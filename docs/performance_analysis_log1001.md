@@ -370,7 +370,7 @@ The diff flips `ModelConfig.top_k` from `0` to `20`. Under `from_pretrained` thi
 directly — synthetic configs, unit tests, embedded uses — which silently switches from "no top-k" to
 top-20. Harmless in intent, invisible in effect, worth a line in the commit message it did not get.
 
-### 5.4 Batch 1024 is runnable but past the peak
+### 5.4 Batch 1024 is runnable but past the peak — reporting ✅ fixed in `bench_viz.py`
 
 | batch | fused tok/s | TPOT ms | gain/cost |
 | --- | --- | --- | --- |
@@ -382,6 +382,13 @@ Doubling to 1024 *loses* 12 % throughput and more than doubles TPOT. The OOM fix
 but **1024 is not a useful operating point**, and the sweep tool's "saturated aggregate throughput ~
 9 632 tok/s" line is misleading because it simply reports the last row. The real peak is
 **10 976 tok/s at batch 512**.
+
+> ✅ **The reporting bug is fixed.** `benchmark/tool/bench_viz.py` now takes `argmax(throughput)`
+> instead of the last row, prints `peak aggregate throughput ~ N tok/s @ batch=B`, and adds
+> `(batch=1024 is X % below peak -- past the knee, not saturated)` when the two differ. The MFU line
+> was wrong for the same reason and now reports at the peak batch too. Landed after these
+> measurements, so the `concurrency_sweep.txt` files in `log_vast/log1001/` still carry the old
+> wording; `log_vast/log1003/` carries the new one.
 
 ### 5.5 Prefill latency still grows with concurrency
 
