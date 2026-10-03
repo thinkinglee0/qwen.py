@@ -66,12 +66,12 @@ class ModelConfig():
 
     # optional from generation_config.json
     temperature: float = 1.
-    top_k: int = 0
+    top_k: int = 20
     top_p: float = 1.
     do_penalities: bool = True
     repetition_penalty: float = 1.
-    freq_pen: float = 0.
-    pres_pen: float = 0.
+    frequency_penalty: float = 0.
+    presence_penalty: float = 0.
 
     # derived
     head_dim: int = 0

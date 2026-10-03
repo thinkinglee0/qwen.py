@@ -14,8 +14,8 @@ class SamplingParams:
     top_k: int | None = None
     top_p: float | None = None
     repetition_penalty: float | None = None
-    freq_pen: float | None = None
-    pres_pen: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
 
     def validate(self, config: ModelConfig):
         if self.temperature is not None:
@@ -34,18 +34,18 @@ class SamplingParams:
             if not (0. < self.repetition_penalty):
                 raise ValueError("repetition_penalty must be > 0.")
 
-        if self.freq_pen is not None:
-            if not (-2. <= self.freq_pen <= 2.):
-                raise ValueError(f"freq_pen must be in [-2., 2.]")
+        if self.frequency_penalty is not None:
+            if not (-2. <= self.frequency_penalty <= 2.):
+                raise ValueError(f"frequency_penalty must be in [-2., 2.]")
 
-        if self.pres_pen is not None:
-            if not (-2. <= self.pres_pen <= 2.):
-                raise ValueError(f"pres_pen must be in [-2., 2.]")
+        if self.presence_penalty is not None:
+            if not (-2. <= self.presence_penalty <= 2.):
+                raise ValueError(f"presence_penalty must be in [-2., 2.]")
 
 
 # resident sampling params on device, one column per sequence, for async H2D copy
 class SamplingParamTable:
-    FLOAT32_FIELDS = ("temperature", "top_p", "repetition_penalty", "freq_pen", "pres_pen")
+    FLOAT32_FIELDS = ("temperature", "top_p", "repetition_penalty", "frequency_penalty", "presence_penalty")
 
     def __init__(self, config: ModelConfig):
         '''Called once in the constructor of Scheduler'''
@@ -59,6 +59,8 @@ class SamplingParamTable:
         self.top_k_host = torch.empty(bsz, dtype=torch.int64, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(bsz, dtype=torch.int64)
 
+        self.top_k_cutoff = min(MAX_EFFECTIVE_TOP_K, config.vocab_size)
+
     def set_slot(self, slot: int, user_sampling: SamplingParams | None, config: ModelConfig):
         """Called once in _alloc_resources_on_admission when a request is admitted, not once per step."""
 
@@ -67,17 +69,21 @@ class SamplingParamTable:
             self.fields_host[i, slot] = v if v is not None else getattr(config, name)
         self.fields_device[:, slot].copy_(self.fields_host[:, slot], non_blocking=True)   # async H2D copy
 
-        self.top_k_host[slot] = user_sampling.top_k if user_sampling is not None and user_sampling.top_k is not None else config.top_k
+        # clamp top-k to [1, top_k_cutoff]
+        top_k_eff = user_sampling.top_k if user_sampling is not None and user_sampling.top_k is not None else config.top_k
+        if top_k_eff <= 0 or top_k_eff >= self.top_k_cutoff:
+            top_k_eff = self.top_k_cutoff
+        self.top_k_host[slot] = top_k_eff
         self.top_k_device[slot].copy_(self.top_k_host[slot], non_blocking=True)     # async H2D copy
 
     def gather(self, slot_idx: torch.Tensor, slot_idx_host: torch.Tensor):
         """Per step: one index_select on device, zero Python iteration."""
         sel = self.fields_device.index_select(1, slot_idx)
 
-        top_k = self.top_k_host.index_select(0, slot_idx_host)
-        max_k = int(top_k.max().item())
+        top_k_host = self.top_k_host.index_select(0, slot_idx_host)
+        max_k = int(top_k_host.max().item())
 
-        # (temperature, top_p, repetition_penalty, freq_pen, pres_pen), top_k, max_k
+        # (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), top_k, max_k
         return sel.unbind(0), self.top_k_device.index_select(0, slot_idx), max_k
 
 @dataclass
@@ -87,8 +93,8 @@ class SamplingTensors:
     max_k: int
     top_p: torch.Tensor
     repetition_penalty: torch.Tensor
-    freq_pen: torch.Tensor
-    pres_pen: torch.Tensor
+    frequency_penalty: torch.Tensor
+    presence_penalty: torch.Tensor
     prompt_mask: torch.Tensor
     output_counts: torch.Tensor
     output_mask: torch.Tensor
@@ -98,29 +104,26 @@ class SamplingTensors:
                    prompt_mask: torch.Tensor, output_counts: torch.Tensor, output_mask: torch.Tensor):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"from_table, {slot_idx}")
-        (temperature, top_p, repetition_penalty, freq_pen, pres_pen), top_k, max_k = sampling_param_tab.gather(slot_idx=slot_idx, slot_idx_host=slot_idx_host)
+        (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), top_k, max_k = sampling_param_tab.gather(slot_idx=slot_idx, slot_idx_host=slot_idx_host)
 
         return cls(
             temperature=temperature, top_k=top_k, max_k=max_k,
-            top_p=top_p, repetition_penalty=repetition_penalty, freq_pen=freq_pen, pres_pen=pres_pen,
+            top_p=top_p, repetition_penalty=repetition_penalty, frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
             prompt_mask=prompt_mask,
             output_counts=output_counts, output_mask=output_mask,
         )
 
 def apply_penalties(logits, sampling_tensors: SamplingTensors, vocab_size: int):
-    # logits [bsz, vocab_size]
-    bsz = logits.shape[0]
-
-    # -> shape [bsz, vocab_size]
-    rep = sampling_tensors.repetition_penalty[:, None].repeat(1, vocab_size)
+    # logits [bsz, vocab_size]    
 
     # repetition penalty based on prompt and output
-    rep[~(sampling_tensors.prompt_mask | sampling_tensors.output_mask)] = 1.0     # unseen set to 1.0
+    rep_mask = sampling_tensors.prompt_mask | sampling_tensors.output_mask
+    rep = torch.where(rep_mask, sampling_tensors.repetition_penalty[:, None], 1.0)  # unseen set to 1.0
     logits = torch.where(logits > 0, logits / rep, logits * rep)    # ensure new <= old while rep>1.0, no matter the signedness of ligits
 
     # frequency/presence based on output token
-    logits = logits - sampling_tensors.freq_pen[:, None] * sampling_tensors.output_counts
-    logits = logits - sampling_tensors.pres_pen[:, None] * sampling_tensors.output_mask
+    logits = logits - sampling_tensors.frequency_penalty[:, None] * sampling_tensors.output_counts
+    logits = logits - sampling_tensors.presence_penalty[:, None] * sampling_tensors.output_mask
     return logits
 
 def apply_top_k(logits: torch.Tensor, top_k: torch.Tensor, max_k: int):
@@ -138,7 +141,7 @@ def apply_top_k(logits: torch.Tensor, top_k: torch.Tensor, max_k: int):
 
     disabled = (top_k <= 0) | (top_k >= cutoff)              # [n] bool
 
-    top_vals, _ = torch.topk(logits, max_k, dim=-1)          # [n, max_k] descending, top-max_k of all lines
+    top_vals, indices = torch.topk(logits, max_k, dim=-1)          # [n, max_k] descending, top-max_k of all lines
     # k-th largest per row as threshold; clamp k into [1, max_k]
     idx = (top_k.clamp(min=1, max=max_k) - 1).unsqueeze(1)   # [n,1], each line's top-k index
     kth = top_vals.gather(1, idx)                            # [n,1], each line's top-k-th element
@@ -159,6 +162,31 @@ def apply_top_p(logits: torch.Tensor, top_p: torch.Tensor):
     remove.scatter_(1, sorted_idx, sorted_remove)
     return logits.masked_fill(remove, float("-inf"))
 
+def apply_fused_top_k_and_p(logits: torch.Tensor, top_k: torch.Tensor, max_k: int, top_p: torch.Tensor):
+    # logits [bsz, vocab]
+    # top_k/top_p [bsz]
+    bsz, vocab = logits.shape
+    assert 1 <= max_k <= vocab, f"max_k out of range: {max_k}"
+
+    top_vals, indices = torch.topk(logits, max_k, dim=-1, sorted=True)    # [bsz, max_k] descending, top-max_k of all lines
+
+    # mask out elements beyond top-k
+    beyond = torch.arange(max_k, device=logits.device)[None, :] >= top_k[:, None]
+    top_vals = top_vals.masked_fill(beyond, float("-inf"))
+
+    # top-p on sorted top_vals
+    probs = top_vals.softmax(dim=-1)    # [bsz, max_k]
+    cu_probs = probs.cumsum(dim=-1)     # [bsz, max_k]
+    remove = (cu_probs - probs) > top_p[:, None]     # [bsz, max_k], bool tensor
+
+    # mask out elements whose cu_probs exceeds top-p
+    top_vals = top_vals.masked_fill(remove, float("-inf"))
+
+    out = torch.full_like(logits, float("-inf"))    # full of -inf
+    out.scatter_(1, indices, top_vals)      # scatter sruvial elements back to logits
+    return out
+
+
 def sample2(logits: torch.Tensor, sampling_tensors: SamplingTensors):
     assert sampling_tensors.temperature is not None and sampling_tensors.top_k is not None and sampling_tensors.top_p is not None
     return sample(logits, sampling_tensors.temperature, sampling_tensors.top_k, max_k=sampling_tensors.max_k, top_p=sampling_tensors.top_p)
@@ -169,8 +197,7 @@ def sample(logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor,
     t = torch.where(greedy, torch.ones_like(temperature), temperature)
     logits = logits / t[:, None]                             # temperature; greedy rows unscaled
 
-    logits = apply_top_k(logits, top_k, max_k=max_k)
-    logits = apply_top_p(logits, top_p)
+    logits = apply_fused_top_k_and_p(logits=logits, top_k=top_k, max_k=max_k, top_p=top_p)
 
     # softmax in fp32 for numerical stability
     probs = logits.float().softmax(dim=-1)                   # [n, vocab]

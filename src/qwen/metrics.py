@@ -281,6 +281,8 @@ def analyze_metrics(req_metrics_list: list[RequestMetrics], sch_metrics: Schedul
             "i_tok_num": num_input_token,
             "o_tok_num": num_output_token,
             "tok_throughput": num_output_token / elapsed,
+            "o_tok_throughput": num_output_token / elapsed,
+            "io_tok_throughput": (num_input_token+num_output_token) / elapsed,
             "req_throughput": req_num / elapsed,
             "scheduler": asdict(sch_metrics),
         },
