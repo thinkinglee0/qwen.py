@@ -29,7 +29,7 @@ class LLMEngine:
         self.scheduler = Scheduler(config=self.model.config)
 
         # steps that has been launched, but not land.
-        self.in_flight_steps: deque[SchedulerOutput | None] = deque([None])
+        self.in_flight_steps: deque[SchedulerOutput] = deque()
 
     def step(self) -> bool:
         step_metrics = SchedulerStepMetrics()
@@ -37,38 +37,33 @@ class LLMEngine:
             sch_out = self.scheduler.schedule(step_metrics=step_metrics)
             bsz = self.forward(sch_out=sch_out)
 
-        s_p = self.sample_in_flight_step()
+        s_p = self.handle_in_flight_step(cur_sch_out=sch_out)
         if not bsz and not s_p:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"number of reqs, forward: {bsz}, sample_pending: {s_p}")
+            logger.info(f"no request handled, step_id: {self.scheduler.sch_metrics.step_id}")
         
-        return bool(self.scheduler.running) or bool(self.scheduler.waiting) or bool(self.in_flight_steps)
+        return self.has_unfinished()
 
+    def has_unfinished(self) -> bool:
+        return self.scheduler.has_unfinished() or bool(self.in_flight_steps)
+    
     @torch.inference_mode()
     def forward(self, sch_out: SchedulerOutput | None) -> int:
         if sch_out is None:
-            logger.info("Scheduler: no available request")
+            logger.info(f"no available request in running or waiting, step_id: {self.scheduler.sch_metrics.step_id}")
             return 0
                 
         assert sch_out.step_metrics is not None
 
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"batch size: {len(sch_out.reqs)}")
+            logger.debug(f"batch size: {sch_out.batch_size}, step_id: {self.scheduler.sch_metrics.step_id}")
 
         with timed(sch_out.step_metrics, "bld_meta"):
-            # packed_input_ids, md = build_attn_metadata(
-            #     sch_out,
-            #     cache_data=self.scheduler.cache.data,
-            #     config=self.model.config,
-            #     rope=self.model.model.rope)
             packed_input_ids, md = sch_out.build_attn_metadata(
                 cache_data=self.scheduler.cache.data,
                 rope=self.model.model.rope)
 
         with timed(sch_out.step_metrics, "fwd"):
-            # torch.cuda.set_sync_debug_mode("error")
             hidden = self.model.forward(packed_input_ids, md)       # [total_tokens, H]
-            # torch.cuda.set_sync_debug_mode("default")
 
         with timed(sch_out.step_metrics, "logits"):
             # gather each seq's LAST token -> logits -> first generated token
@@ -89,18 +84,31 @@ class LLMEngine:
         sch_out.incr_num_in_flight()
         return sch_out.batch_size
 
-    def sample_in_flight_step(self) -> int:
+    def pop_landable_step(self, cur_sch_out: SchedulerOutput | None) -> SchedulerOutput | None:
         if not self.in_flight_steps:
-            logger.info("Scheduler: no in-flight request")
-            return 0
-        
-        pre_sch_out: SchedulerOutput | None = self.in_flight_steps.popleft()
-        if pre_sch_out is None:     # pre_sch_out is in the first step, so pre is None, do nothing
-            return 0
+            logger.info(f"no in-flight request, step_id: {self.scheduler.sch_metrics.step_id}")
+            return None
 
+        if cur_sch_out is self.in_flight_steps[0]:
+            return None     # the first step is still in-flight, do nothing
+
+        pre_sch_out: SchedulerOutput = self.in_flight_steps.popleft()
+        assert pre_sch_out is not None
+
+        return pre_sch_out
+
+    def sync_dth(self, pre_sch_out: SchedulerOutput):
+        assert pre_sch_out.step_metrics is not None
+
+        with timed(pre_sch_out.step_metrics, "dth_wait"):
+            pre_sch_out.step_metrics.events.synchronize("dth")  # wait for data from device.
+
+    # NOTE: need lock in run_loop to protect running/waiting queue, 
+    # because land_step() will call scheduler.commit_step() which modifies the running/waiting queue.
+    def land_step(self, pre_sch_out: SchedulerOutput) -> int:
         assert pre_sch_out.step_metrics is not None
         with timed(pre_sch_out.step_metrics, "step_1"):
-            num_truncated = self.sample_in_flight_step_imp(pre_sch_out=pre_sch_out)
+            num_truncated = self.land_step_imp(pre_sch_out=pre_sch_out)
 
             with timed(pre_sch_out.step_metrics, "ci"):
                 self.scheduler.commit_step(sch_out=pre_sch_out, num_truncated=num_truncated)
@@ -110,15 +118,12 @@ class LLMEngine:
 
         return pre_sch_out.batch_size
 
-    def sample_in_flight_step_imp(self, pre_sch_out: SchedulerOutput) -> int:
+    def land_step_imp(self, pre_sch_out: SchedulerOutput) -> int:
         assert pre_sch_out.step_metrics is not None
         pre_sch_out.step_metrics.pend = len(self.in_flight_steps)     # a value after this step
 
-        with timed(pre_sch_out.step_metrics, "dth_wait"):
-            pre_sch_out.step_metrics.events.synchronize("dth")  # wait for data from device.
-
         # merge md.step_metrics_lst to pre_sch_out.step_metrics
-        # must be placed after next_tokens.tolist(), a synchronous operation, otherwise all events would be not ready.
+        # must be placed after sync_dth(), a synchronous operation, otherwise all events would be not ready.
         md = pre_sch_out.attn_meta
         assert md is not None
         if md.step_metrics_lst:
@@ -129,8 +134,17 @@ class LLMEngine:
 
         return num_truncated
 
+    def handle_in_flight_step(self, cur_sch_out: SchedulerOutput | None) -> int:
+        pre_sch_out = self.pop_landable_step(cur_sch_out=cur_sch_out)
+        if pre_sch_out is None:
+            return 0
+        
+        self.sync_dth(pre_sch_out=pre_sch_out)
+
+        return self.land_step(pre_sch_out=pre_sch_out)
+
     def run_to_completion(self):
-        while self.scheduler.has_unfinished():
+        while self.has_unfinished():
             try:
                 if not self.step():
                     break
@@ -216,16 +230,17 @@ class ServingDriver:
                 return None
 
     def abort(self, request_id: str):
-        with self.cond:
+        with self.cond:     # protect running/waiting queue
             self.engine.scheduler.cleanup_on_abort(request_id)
 
     def run_loop(self):
         while not self._shutdown:
-            scheduler_output = None     # avoid UnboundLocalError if schedule() raised
+            sch_out = None     # avoid UnboundLocalError if schedule() raised
+            pre_sch_out = None
             try:
                 step_metrics = SchedulerStepMetrics()
                 with self.cond:
-                    while not self.engine.scheduler.has_unfinished() and not self._shutdown:
+                    while not self.engine.has_unfinished() and not self._shutdown:
                         self.cond.wait()
 
                     if self._shutdown:  # after awaken
@@ -233,28 +248,46 @@ class ServingDriver:
 
                     # may return None when the waiting is not empty due to backoff
                     step_metrics.start("step_0")
-                    scheduler_output = self.engine.scheduler.schedule(step_metrics=step_metrics)
+                    sch_out = self.engine.scheduler.schedule(step_metrics=step_metrics)
 
-                self.engine.forward(sch_out=scheduler_output)
+                # out of the lock
+                self.engine.forward(sch_out=sch_out)
                 step_metrics.stop("step_0")
 
-                self.engine.sample_in_flight_step()
+                # NOTE: must call pop_landable_step() and land_step() in the same thread as forward(),
+                # otherwise the dth_buf may be freed before land_step() is called.
+                pre_sch_out = self.engine.pop_landable_step(cur_sch_out=sch_out)
+                if pre_sch_out is None:
+                    continue
+
+                self.engine.sync_dth(pre_sch_out=pre_sch_out)
+                with self.cond: # protect running/waiting queue
+                    self.engine.land_step(pre_sch_out=pre_sch_out)
             except Exception as e:
-                logger.exception("Error occurred in schedule or forward")
-                self._cleanup_on_error(scheduler_output, e)
+                logger.exception("Error occurred in schedule/forward/land")
+                with self.cond: # protect running/waiting queue
+                    # pre_sch_out is not None: pop_landable_step() succeeded, but land_step() failed
+                    # sch_out is not None: schedule() or forward() failed
+                    # NOTE: must check pre_sch_out first, because it's not None meaning that sch_out has been generated and handled successfully.
+                    err_sch_out = pre_sch_out if pre_sch_out is not None else sch_out
+                    if err_sch_out is not None:
+                        self._cleanup_on_error(err_sch_out, e)
+                    else:
+                        self._cleanup_all_on_error(e)
 
-    def _cleanup_on_error(self, scheduler_output: SchedulerOutput | None, e: Exception):
-        """Best-effort cleanup after a failed step: never let it raise out of run_loop."""
-        if scheduler_output is None:
-            # the error occurred in schedule(), so there is no batch to blame: drop the running queue
-            try:
-                self.engine.scheduler.cleanup_all_on_error(e=e)
-            except Exception:
-                logger.exception("error while cleaning up the running queue")
-            return
+    def _cleanup_all_on_error(self, e: Exception):
+        # the error occurred in schedule(), so there is no batch to blame: 
+        # drop the running/waiting queue
+        try:
+            self.engine.scheduler.cleanup_all_on_error(e=e)
+        except Exception:
+            logger.exception("error while cleaning up the running/waiting queue")
+        return
 
+    def _cleanup_on_error(self, sch_out: SchedulerOutput, e: Exception):
         # keep going over the whole batch even if one request fails to clean up
-        for req in scheduler_output.reqs:
+        assert sch_out is not None
+        for req in sch_out.reqs:
             try:
                 self.engine.scheduler.cleanup_on_error(req=req, e=e)
             except Exception:

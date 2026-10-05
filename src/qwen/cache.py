@@ -191,11 +191,17 @@ class KVCache:
 
         self.verify_invariant_periodical()
 
-    def free(self, request):
+    def free(self, request, use_assert: bool = True):
         # table = self.block_tables.pop(request.request_id, [])
         table = self.block_tables.pop(request.request_id, None)
-        assert table is not None
-        
+        if use_assert:
+            assert table is not None
+
+        if table is None:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"request {request.request_id} has no allocated blocks to free")
+            return
+
         for block_id in table:
             self.pool.decref(block_id)
 

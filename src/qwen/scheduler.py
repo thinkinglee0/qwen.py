@@ -564,7 +564,7 @@ class SchedulerOutput:
 
         now = time.perf_counter()
         for i, (tok, req) in enumerate(zip(next_tok_lst, self.reqs)):
-            if req.finished:    # discard due to EOS in the previous step.
+            if req.finished:    # discard due to EOS in the previous step, or due to error/abort
                 continue
 
             s_info = self.s_infos[i]
@@ -694,7 +694,7 @@ class Scheduler:
                         logger.debug(f"cleanup_on_finished, committed flips to true, {req.request_id}")
                 else:
                     if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"skip cleanup_on_finished, {req.request_id}")
+                        logger.debug(f"skip cleanup_on_finished, {req.request_id}") # due to error/abort, already cleaned up
 
         self.sch_metrics.report_on_truncated(num_truncated)
 
@@ -716,13 +716,13 @@ class Scheduler:
         self._free_resources(req)
         self.req_metrics_list.append(req.metrics)
 
-    def _do_cleanup_on_error(self, req: ModelRequest, e: Exception, has_slot: bool = True):
-        # assert not req.finished   # may have finished but the client closed the connection, so do not assert
+    def _do_cleanup_on_error(self, req: ModelRequest, e: Exception, is_from_running: bool = True):
         req.finished = True
+        req.committed = True
         if req.loop is not None:
             req.loop.call_soon_threadsafe(req.token_queue.put_nowait, e)
 
-        self._free_resources(req, has_slot=has_slot)
+        self._free_resources(req, is_from_running=is_from_running)
         self.req_metrics_list.append(req.metrics)
         self.sch_metrics.report_on_error()
 
@@ -734,20 +734,31 @@ class Scheduler:
             self._do_cleanup_on_error(self.running.pop(), e)
 
         while self.waiting:
-            self._do_cleanup_on_error(self.waiting.popleft(), e, has_slot=False)
+            self._do_cleanup_on_error(self.waiting.popleft(), e, is_from_running=False)
 
     def cleanup_on_error(self, req: ModelRequest, e: Exception):
-        assert req in self.running
-        self.running.remove(req)
+        if req.committed:
+            # partial items in sch_out/pre_sch_out succeeded, 
+            # already cleaned up due to eos/max_new_tokens, so do nothing
+            return
 
-        self._do_cleanup_on_error(req, e)
+        if req in self.running:
+            # from sch_out/pre_sch_out
+            self.running.remove(req)
+            self._do_cleanup_on_error(req, e)
+        elif req in self.waiting:
+            # from pre_sch_out, may be preempted and moved to waiting
+            self.waiting.remove(req)
+            self._do_cleanup_on_error(req, e, is_from_running=False)
 
     def cleanup_on_abort(self, request_id: str):
         '''called from api.py maybe due to the connection lost, but the request may have finished now'''
         req = None
+        is_from_running = True
         for i in range(len(self.running)):
             if self.running[i].request_id == request_id:
                 req = self.running.pop(i)
+                break
 
         if req is None:
             for i in range(len(self.waiting)):
@@ -756,18 +767,18 @@ class Scheduler:
                     self.waiting.rotate(-i)
                     req = self.waiting.popleft()
                     self.waiting.rotate(i)
+                    is_from_running = False
+                    break
 
         if req is None:
             '''do not exist in both running and waiting, may have finished, so do nothing'''
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"the aborted request may have finished, do nothing.")
+                logger.debug(f"the aborted request may have finished, do nothing, request_id: {request_id}")
             return
 
-        self._free_resources(req)
-        self.req_metrics_list.append(req.metrics)
-        self.sch_metrics.report_on_error()
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"{request_id} aborted, removed")
+        self._do_cleanup_on_error(req,
+            e=RuntimeError(f"request {request_id} aborted"),
+            is_from_running=is_from_running)
 
     def _settle_and_check(self, r: ModelRequest) -> bool:
         # no in-flight batch will mutate r's actual states any more, so it can be re-admitted.
@@ -822,10 +833,10 @@ class Scheduler:
 
         return cache_slots
 
-    def _free_resources(self, req: ModelRequest, has_slot: bool = True):
-        self.cache.free(req)
+    def _free_resources(self, req: ModelRequest, is_from_running: bool = True):
+        self.cache.free(req, use_assert=is_from_running)
 
-        if has_slot:
+        if is_from_running:
             self.req_slot_pool.free(req)
 
     def schedule(self, step_metrics: SchedulerStepMetrics | None = None) -> SchedulerOutput | None:            # called by run_loop
