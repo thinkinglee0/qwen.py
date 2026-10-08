@@ -4,7 +4,18 @@ Runs in the SEPARATE vLLM venv (section 6a of env/vastai/vast-evn-build.md), whi
 has only vllm and its dependencies -- so this file imports nothing from qwen.py and
 nothing outside the stdlib + vllm. Do not add `from qwen...` here.
 
-"$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm eager --runs 3 --out ./log/vllm_eager.jsonl > ./log/vllm_eager.log 2>&1
+for arm in eager compile cudagraph; do
+  "$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm $arm --runs 3 --out ./log/vllm_$arm.jsonl > ./log/vllm_$arm.log 2>&1
+done
+
+Three arms, because A->B alone cannot tell you which half to build:
+
+  eager     (A)   no inductor, no graphs        engine design alone
+  compile   (A')  inductor, graphs OFF          A->A'  = inductor fusion
+  cudagraph (B)   inductor + graphs (default)   A'->B  = launch elimination
+
+log1003 ran only A and B, so its 7.28x at batch 1 and 1.17x at batch 512 are a bundle:
+enforce_eager=True turns off compilation AND capture together.
 
 --out holds only the JSON rows. Everything else -- vLLM's engine log plus this
 script's progress lines -- goes to stdout/stderr, so redirect the whole process to a
@@ -26,6 +37,14 @@ settings that silently destroy comparability if you get them wrong:
      top-p, so partial matching is worse than none).
   3. Offline closed loop, not `vllm serve`. The qwen.py test enqueues every request
      before starting the timer and has no HTTP and no tokenizer in the loop.
+
+Latency: rows carry `latency` with queueing / ttft / prefill / tpot summarised exactly
+as metrics.analyze_metrics() does it, including np.percentile's interpolation, so the
+columns line up with concurrency_sweep.txt (whose "TTFT ms" is in fact `prefill`). The
+pooled per-token ITL distribution is NOT reproducible here -- it needs per-token
+timestamps and the offline path exposes only the first and last. If this vLLM build
+leaves RequestOutput.metrics unpopulated, `latency` is {} and `latency_note` says so
+rather than the row quietly carrying nothing.
 """
 
 import argparse
@@ -101,6 +120,76 @@ REQUIRED_ENGINE_FIELDS = [
 OPTIONAL_ENGINE_FIELDS = {"swap_space": 0, "disable_log_stats": False}
 
 
+# Arms -- section 6d of the runbook, and log1003 section 6.4.
+#
+#   eager     (A)   no inductor, no graphs        -> engine design alone
+#   compile   (A')  inductor, graphs OFF          -> A->A' is fusion
+#   cudagraph (B)   inductor + graphs (default)   -> A'->B is launch elimination
+#
+# log1003 could only price the BUNDLE (A->B: 7.28x at batch 1, 1.17x at 512) because
+# enforce_eager=True turns off compilation AND capture together. A' splits it, and the
+# split decides which half to build in qwen.py first.
+ARMS = ("eager", "compile", "cudagraph")
+
+# What to look for in the engine log to prove an arm actually took. Printed at startup
+# so the expectation sits next to the evidence in the same file.
+ARM_EVIDENCE = {
+    "eager":     "expect  'mode': <CompilationMode.NONE  and  0 x 'Capturing CUDA graph'",
+    "compile":   "expect  'mode': <CompilationMode.VLLM_COMPILE  and  0 x 'Capturing CUDA graph'",
+    "cudagraph": "expect  'mode': <CompilationMode.VLLM_COMPILE  and  >=1 x 'Capturing CUDA graph'",
+}
+
+
+def resolve_arm(arm: str) -> dict:
+    """LLM() kwargs for this arm, with the compile-no-graphs path pre-flighted.
+
+    Arm A' asks for compilation WITHOUT capture, which is a CompilationConfig field
+    rather than an EngineArgs one -- so it needs its own check. A renamed or removed
+    `cudagraph_mode` would otherwise be swallowed by the dict and leave A' silently
+    identical to B, which is the one failure that would make the whole split useless.
+    """
+    if arm == "eager":
+        return {"enforce_eager": True}
+    if arm == "cudagraph":
+        return {"enforce_eager": False}          # vLLM's own default: compile + capture
+
+    try:
+        from vllm.config import CompilationConfig
+    except ImportError as e:
+        sys.exit(f"cannot import CompilationConfig ({e}) -- find where this vLLM version "
+                 f"keeps it and update resolve_arm(); do not fall back to arm B")
+
+    fields = set(getattr(CompilationConfig, "__dataclass_fields__", {})) or set(
+        getattr(CompilationConfig, "model_fields", {}))
+    if "cudagraph_mode" not in fields:
+        hints = sorted(f for f in fields if "graph" in f or "cudagraph" in f)
+        sys.exit(f"CompilationConfig has no 'cudagraph_mode' in this vLLM version.\n"
+                 f"Graph-related fields present: {hints}\n"
+                 f"Arm A' is 'compile on, capture off'. Find the new spelling -- running "
+                 f"without it would silently produce arm B again.")
+
+    return {"enforce_eager": False, "compilation_config": {"cudagraph_mode": "NONE"}}
+
+
+def read_cudagraph_mode(llm) -> str:
+    """Best-effort: what vLLM RESOLVED to, not what we asked for. Never fatal.
+
+    vLLM may override a requested cudagraph_mode (unsupported backend, a conflicting
+    flag), so the row records the resolved value where it is reachable. The attribute
+    path is version-dependent, hence the walk and the broad except.
+    """
+    for path in (("llm_engine", "vllm_config", "compilation_config", "cudagraph_mode"),
+                 ("llm_engine", "model_config", "compilation_config", "cudagraph_mode")):
+        try:
+            o = llm
+            for attr in path:
+                o = getattr(o, attr)
+            return str(o)
+        except Exception:
+            continue
+    return "unreadable"
+
+
 def resolve_engine_fields() -> tuple[dict, list[str]]:
     """Hard-fail on missing parity fields; drop absent optional ones and report them."""
     from vllm import EngineArgs
@@ -145,8 +234,84 @@ def sampling_params():
     )
 
 
-def run_one(model: str, bz: int, prompts_ids: list[list[int]], eager: bool, runs: int,
-            optional: dict) -> dict:
+def _pct(a: list[float], q: float) -> float:
+    """numpy's default 'linear' percentile, stdlib-only.
+
+    qwen.py's metrics.summarize() uses np.percentile, whose default method
+    interpolates; replicating it exactly is three lines and keeps the two sides'
+    p90/p99 comparable instead of nearly-comparable.
+    """
+    if len(a) == 1:
+        return a[0]
+    pos = q / 100.0 * (len(a) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(a) - 1)
+    return a[lo] + (a[hi] - a[lo]) * (pos - lo)
+
+
+def summarize(samples: list[float], scale: float = 1e3) -> dict:
+    """Same keys, same scale and the same percentile method as metrics.summarize()."""
+    if not samples:
+        return {"n": 0}
+    a = sorted(v * scale for v in samples)
+    mean = sum(a) / len(a)
+    var = sum((v - mean) ** 2 for v in a) / (len(a) - 1) if len(a) > 1 else 0.0
+    return {"n": len(a), "mean": round(mean, 3), "std": round(var ** 0.5, 3),
+            "p50": round(_pct(a, 50), 3), "p90": round(_pct(a, 90), 3),
+            "p99": round(_pct(a, 99), 3), "max": round(a[-1], 3)}
+
+
+# qwen.py's definitions, from metrics.analyze_metrics() -- match them or the columns
+# are not comparable:
+#   queueing = first_scheduled - arrival
+#   ttft     = first_token - arrival          (includes queueing)
+#   prefill  = first_token - first_scheduled  (this is what concurrency_sweep.txt
+#                                              labels "TTFT ms")
+#   tpot     = (last_token - first_token) / (n_output - 1)
+# NOT reproducible here: the `itls` DISTRIBUTION. qwen.py pools every inter-token
+# interval, which needs per-token timestamps; the offline path exposes only the first
+# and last. tpot is the per-request mean of those intervals and is comparable.
+_TIME_FIELDS = ("arrival_time", "first_scheduled_time", "first_token_time", "last_token_time")
+
+
+def request_latencies(outs) -> tuple[dict, str]:
+    """Per-request latency summaries, or an empty dict and the reason why.
+
+    vLLM's V1 engine does not necessarily populate RequestOutput.metrics in the
+    offline path. When it does not, say so -- a latency column derived from the
+    aggregate would be a fabrication, and a silently absent one is worse.
+    """
+    metrics = [getattr(o, "metrics", None) for o in outs]
+    missing = sum(1 for m in metrics if m is None)
+    if missing:
+        return {}, (f"RequestOutput.metrics is None for {missing}/{len(metrics)} requests -- "
+                    f"this vLLM build does not expose per-request timing from LLM.generate(). "
+                    f"Latency needs the streaming AsyncLLM path; see log1003 section 6.5.")
+
+    absent = [f for f in _TIME_FIELDS if not hasattr(metrics[0], f)]
+    if absent:
+        return {}, (f"RequestMetrics has no {absent} in this vLLM version; present: "
+                    f"{sorted(vars(metrics[0]))}. Update _TIME_FIELDS.")
+
+    queueing, ttft, prefill, tpot = [], [], [], []
+    for o, m in zip(outs, metrics):
+        if m.first_token_time is None or m.arrival_time is None:
+            continue
+        queueing.append(m.first_scheduled_time - m.arrival_time)
+        ttft.append(m.first_token_time - m.arrival_time)
+        prefill.append(m.first_token_time - m.first_scheduled_time)
+        n_out = len(o.outputs[0].token_ids)
+        if n_out > 1 and m.last_token_time is not None:
+            tpot.append((m.last_token_time - m.first_token_time) / (n_out - 1))
+
+    if not ttft:
+        return {}, "RequestOutput.metrics present but first_token_time unset on every request"
+    return {"queueing": summarize(queueing), "ttft": summarize(ttft),
+            "prefill": summarize(prefill), "tpot": summarize(tpot)}, ""
+
+
+def run_one(model: str, bz: int, prompts_ids: list[list[int]], arm: str, runs: int,
+            optional: dict, arm_kwargs: dict) -> dict:
     from vllm import LLM
     from vllm.inputs import TokensPrompt
 
@@ -166,8 +331,8 @@ def run_one(model: str, bz: int, prompts_ids: list[list[int]], eager: bool, runs
         block_size=BLOCK_SIZE,
         num_gpu_blocks_override=KV_TOKENS // BLOCK_SIZE,
         enable_prefix_caching=False,    # random prompts share no prefix anyway; keep it clean
-        enforce_eager=eager,            # arm A / arm B, section 6d
-        **optional,                      # swap_space=0 where the version still has it
+        **arm_kwargs,                   # enforce_eager, and cudagraph_mode for arm A'
+        **optional,                     # swap_space=0 where the version still has it
     )
     try:
         llm.generate(prompts[:bz], sp, use_tqdm=False)      # warmup is not optional (section 1b)
@@ -182,21 +347,29 @@ def run_one(model: str, bz: int, prompts_ids: list[list[int]], eager: bool, runs
             # ignore_eos + max_tokens must give EXACTLY req_num * OUT_LEN. A short count
             # means EOS leaked through and the arms are no longer doing equal work.
             assert o_tok == req_num * OUT_LEN, f"bz={bz}: got {o_tok}, want {req_num * OUT_LEN}"
-            samples.append((elapsed, o_tok))
+            # summarise per run and keep only the summary: holding three runs' worth of
+            # RequestOutputs to post-process later is pointless memory.
+            lat, lat_note = request_latencies(outs)
+            samples.append((elapsed, o_tok, lat, lat_note))
 
         # median, not mean: section 6e -- one neighbour-induced outlier drags a mean
-        elapsed = statistics.median(e for e, _ in samples)
-        o_tok = samples[0][1]
+        elapsed = statistics.median(e for e, *_ in samples)
+        # The reported latency must describe the SAME run as the reported elapsed. With an
+        # even number of runs the median is not one of the samples, so take the nearest.
+        _, o_tok, lat, lat_note = min(samples, key=lambda r: abs(r[0] - elapsed))
         return {
             "bz": bz,
             "req_num": req_num,
             "runs": runs,
             "elapsed": round(elapsed, 3),
-            "elapsed_all": [round(e, 3) for e, _ in samples],
+            "elapsed_all": [round(e, 3) for e, *_ in samples],
             "i_tok": req_num * IN_LEN,
             "o_tok": o_tok,
             "tok_s": round(o_tok / elapsed, 2),             # OUTPUT ONLY -- see module docstring
-            "arm": "eager" if eager else "cudagraph",
+            "arm": arm,
+            "cudagraph_mode": read_cudagraph_mode(llm),     # resolved, not requested
+            "latency": lat,                                 # {} when vLLM exposes none
+            "latency_note": lat_note,                       # why, when it is {}
         }
     finally:
         del llm
@@ -205,8 +378,10 @@ def run_one(model: str, bz: int, prompts_ids: list[list[int]], eager: bool, runs
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.environ.get("QWEN_MODEL_DIR", "") + "/qwen2.5-0.5b-instruct")
-    ap.add_argument("--arm", choices=["eager", "cudagraph"], default="eager",
-                    help="eager = arm A (your scheduler/sampler); cudagraph = arm B")
+    ap.add_argument("--arm", choices=list(ARMS), default="eager",
+                    help="eager = A (no inductor, no graphs); compile = A' (inductor, "
+                         "graphs off); cudagraph = B (vLLM default). A->A' is fusion, "
+                         "A'->B is launch elimination; A->B alone cannot separate them")
     ap.add_argument("--batch-sizes", default=",".join(map(str, DEFAULT_BATCH_SIZES)))
     ap.add_argument("--runs", type=int, default=3, help="per point; the median is reported")
     ap.add_argument("--out", default="vllm_sweep.jsonl",
@@ -217,6 +392,7 @@ def main() -> None:
     args = ap.parse_args()
 
     optional, dropped = resolve_engine_fields()
+    arm_kwargs = resolve_arm(args.arm)
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(",") if b]
     dump = pathlib.Path(args.dump_prompts) if args.dump_prompts else None
@@ -232,6 +408,8 @@ def main() -> None:
         "python": sys.version.split()[0],
         "gpu": torch.cuda.get_device_name(0),
         "omp_num_threads": os.environ.get("OMP_NUM_THREADS", "<unset>"),
+        "arm": args.arm,
+        "arm_kwargs": dict(arm_kwargs),     # what was requested; the rows carry what resolved
         "engine_fields_dropped": dropped,   # absent in this version; see OPTIONAL_ENGINE_FIELDS
         "prompts_seed": SEED,
         "prompts_sha256_16": prompts_digest,   # same digest == same input set
@@ -245,16 +423,22 @@ def main() -> None:
     # so redirect the whole process to a file and keep --out purely machine-readable:
     #   vllm_sweep.py --out results.jsonl > engine.log 2>&1
     log(f"header {json.dumps(header)}")
+    log(f"arm={args.arm}: {ARM_EVIDENCE[args.arm]}")
 
     with open(args.out, "a") as f:
         f.write(json.dumps(header) + "\n")
         for bz in batch_sizes:
             log(f"bz={bz} starting ({args.runs} runs)")
-            row = run_one(args.model, bz, prompts_ids, args.arm == "eager", args.runs, optional)
+            row = run_one(args.model, bz, prompts_ids, args.arm, args.runs, optional, arm_kwargs)
             f.write(json.dumps(row) + "\n")
             f.flush()
+            lat = row["latency"]
+            lat_s = (f"   prefill p50 {lat['prefill']['p50']:.1f} ms"
+                     f"   tpot p50 {lat['tpot']['p50']:.2f} ms") if lat else "   latency: n/a"
             log(f"bz={bz:<5} {row['tok_s']:>10.2f} output tok/s   median {row['elapsed']}s"
-                f"   runs {row['elapsed_all']}")
+                f"   runs {row['elapsed_all']}   cudagraph_mode={row['cudagraph_mode']}{lat_s}")
+            if row["latency_note"]:
+                log(f"bz={bz} latency unavailable: {row['latency_note']}")
 
 
 if __name__ == "__main__":

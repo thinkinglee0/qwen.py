@@ -611,14 +611,21 @@ python profile_decode.py --steps 50
 
 输出的 **idle fraction** 是这次对比的核心判据:7B 上 GPU 侧约 15.1 ms/step、CPU 侧约 600 × 7.1 μs = 4.3 ms,**idle fraction 应接近 0**。若显著大于 0,说明 CPU 没跟上,你与 vLLM 的差距主要来自 launch overhead 而非 scheduler 设计 —— 结论完全不同。
 
-### 6d. 双臂对照
+### 6d. 三臂对照
 
-单跑一个比值没有说服力:
+单跑一个比值没有说服力,而两条臂只能给出打包值:
 
 | 臂 | vLLM 配置 | 差距归因 |
 |---|---|---|
-| A | `--enforce-eager` | 你的 scheduler + KV 管理 + attention kernel 选择 |
-| B | 默认(CUDA graph) | A→B 的增量 = CUDA graph 消除的 CPU launch 开销 |
+| **A** | `--enforce-eager` | 你的 scheduler + KV 管理 + sampler + attention kernel 选择 |
+| **A′** | 编译开、`cudagraph_mode=NONE` | **A→A′ = inductor 融合** |
+| **B** | 默认(inductor + CUDA graph) | **A′→B = 消除 CPU launch 开销** |
+
+> ⚠️ **`--enforce-eager` 同时关掉编译和图捕获。** 日志里 A 是
+> `'mode': <CompilationMode.NONE: 0>` 且零条 `Capturing CUDA graph`，B 是
+> `VLLM_COMPILE` + 已捕获。所以**只跑 A 和 B，拿到的是一个打包值** —— log1003 那
+> 7.28×（batch 1）/ 1.17×（batch 512）就分不出哪一半是融合、哪一半是 launch。
+> A′ 才能拆开它，而它决定你自己这边先建哪一半。
 
 **先选对驱动方式 —— 离线和 serving 不是一回事,用错了对不上。**
 
@@ -627,12 +634,33 @@ python profile_decode.py --steps 50
 | `test_benchmark_sweep_batch_size`<br>`test_benchmark_on_pc` | **离线 `LLM.generate()`** —— 见 [`benchmark/tool/vllm_sweep.py`](../../benchmark/tool/vllm_sweep.py) | `engine.benchmark()` 在计时**之前**就把全部请求塞进 waiting 队列,然后 `run_to_completion()` 排空 —— 到达率无穷的闭环,没有 HTTP、没有 tokenizer 在环。套 server + client 会给 vLLM 加上你不付的开销,**反而低估它** |
 | HTTP 服务路径(`ServingDriver`) | `vllm serve` + benchmark client | 有到达率、有并发爬坡时才用这条 |
 
-离线臂:
+离线臂 —— 三条都跑,一次一个引擎(§6e):
 
 ```bash
-ARM=eager   "$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm eager     --runs 3
-ARM=default "$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm cudagraph --runs 3
+for arm in eager compile cudagraph; do        # A, A', B
+  "$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm $arm --runs 3 \
+    --out log_vast/<logN>/vllm_$arm.jsonl > log_vast/<logN>/vllm_$arm.log 2>&1
+done
 ```
+
+`--out` 只写 JSON 行,engine log 走 stdout/stderr 的重定向 —— vLLM 用哪条流随版本变,而
+V1 的 EngineCore 在独立进程里打日志,进程内挂 handler 抓不到。
+
+**跑完核对每条臂真的生效了**(脚本启动时也会把这三行期望打进 log):
+
+```bash
+for arm in eager compile cudagraph; do
+  echo "-- $arm"
+  grep -om1 "'mode': <CompilationMode[^>]*>" log_vast/<logN>/vllm_$arm.log
+  echo "   Capturing CUDA graph x $(grep -c 'Capturing CUDA graph' log_vast/<logN>/vllm_$arm.log)"
+done
+#   eager     -> CompilationMode.NONE          + 0 次捕获
+#   compile   -> CompilationMode.VLLM_COMPILE  + 0 次捕获
+#   cudagraph -> CompilationMode.VLLM_COMPILE  + >=1 次捕获
+```
+
+每行还带 `cudagraph_mode`,那是 vLLM **解析后**的值而不是请求值 —— 它可能因为后端不支持而
+覆盖你的请求,不一致本身就是信息。
 
 serving 臂(只在对照 HTTP 路径时):
 
@@ -649,6 +677,7 @@ serving 臂(只在对照 HTTP 路径时):
 4. **KV 容量对齐绝对 token 数,不是对齐 `block_size`。** qwen.py 是 `num_blocks 4096 × block_size 256` = **1 048 576 个 slot = 12.0 GiB**;vLLM 不支持 256,用 `--block-size 16 --num-gpu-blocks-override 65536` 配出同样的总量,并在启动日志里核对它没被显存反压掉。
 5. `--max-num-seqs` = sweep 变量、`--max-model-len 1024`、`--max-num-batched-tokens 8192`(决定一步挤几个 prefill)、`--no-enable-prefix-caching`(随机 token 下命中率本来≈0,关掉只为干净)。
 6. **`detokenize=False`** —— 容易漏。vLLM 默认增量 detokenize,是真实 CPU 开销,而 qwen.py 循环里一次都不做。
+7. **延迟列的定义要和 `metrics.analyze_metrics()` 对齐**:`queueing = first_scheduled − arrival`、`ttft = first_token − arrival`、`prefill = first_token − first_scheduled`(**`concurrency_sweep.txt` 里那列叫 "TTFT ms" 的其实是 `prefill`**)、`tpot = (last_token − first_token) / (n_out − 1)`,分位数连 `np.percentile` 的插值方式都要一致。**逐 token 的 ITL 分布在离线路径上拿不到** —— 它需要每个 token 的时间戳,而 `LLM.generate()` 只给首尾。若这个版本不填 `RequestOutput.metrics`,行里的 `latency` 会是 `{}` 并附 `latency_note`,不要把它当成"没有差异"。
 
 **消不掉、必须披露的差异**:block_size 256 vs 16(总量对齐了,但 block table 遍历和碎片行为不同);vLLM V1 的 EngineCore 跑在独立进程(多占一核 + 用 `/dev/shm`);两边采样分布不逐位相同 —— **吞吐可比,不要声称输出一致**。
 
@@ -664,7 +693,7 @@ clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_thermal_slowdown
 ```
 
 - 每点跑 ≥ 3 次,**报 median 不报 mean**(离群点会拽高 mean)
-- qwen.py 和两条 vLLM 基线**必须在同一次租用、同一台 host、同一个连续时间窗口内跑完**。宿主 CPU 换一台就全部作废 —— log1003 实测:同一份代码换台机器,`gpu_busy` 一致到 ±2 %,但 `wall_clean` 差 **2.3×**
+- qwen.py 和三条 vLLM 臂**必须在同一次租用、同一台 host、同一个连续时间窗口内跑完**。宿主 CPU 换一台就全部作废 —— log1003 实测:同一份代码换台机器,`gpu_busy` 一致到 ±2 %,但 `wall_clean` 差 **2.3×**
 - **一次只跑一个引擎**。两边同时占 GPU,数据全废
 - **profiling 和计时分开跑**。nsys 和 torch.profiler 的 CUPTI 回调在每次 kernel launch 上加几微秒,带 profiler 测出的 throughput 不能当 benchmark 结果报
 - 每轮记 `uptime`,事后判断某点是否被邻居污染。**log1003 漏了这一项**,补采时才发现 load average `12.11 / 12.81 / 12.96` 是在自己跑完 12 分钟后测的 —— 全是邻居,而那正是时钟被压在 80 % 的原因。漏了它,"这台为什么慢一倍"就只剩推断
@@ -689,7 +718,7 @@ overlay 可写层随 destroy 消失。**离开前确认:**
 - [ ] `/opt/constraints.txt` 存一份 —— 下次重建时 diff 一下就知道模板变了没有
 - [ ] 记下 instance ID、host ID、`nvidia-smi -q` 快照、`lscpu` 输出、launch overhead 中位数 —— **这些是判断下次的数据能否和这次拼接的唯一依据**
 - [ ] 加记主机侧四项(log1003 的教训,缺一项就只能靠推断):**`CPU max MHz` × `scaling MHz`**、**3M 次 Python 循环的毫秒数**、**跑完之后的 `uptime`**、**绑定策略**(无绑定 / `--cpunodebind` / `taskset` 到哪个 CCX)。launch overhead 过线**不能**代替这四项 —— 它只量一个 op,量不到解释器
-- [ ] 跑过 vLLM 对照的话,记下 `vllm.__version__` + 它那个 venv 里的 `torch.__version__` / `torch.version.cuda`,解释器的来源和版本(系统 python 还是 micromamba fallback,§6a —— 它决定链到哪个 `libstdc++`),以及 `OMP_NUM_THREADS` 用的是哪条臂 —— **和记 instance ID 同等性质:A/B 可复现的唯一依据**
+- [ ] 跑过 vLLM 对照的话,记下 `vllm.__version__` + 它那个 venv 里的 `torch.__version__` / `torch.version.cuda`,解释器的来源和版本(系统 python 还是 micromamba fallback,§6a —— 它决定链到哪个 `libstdc++`),以及 `OMP_NUM_THREADS` 是继承还是显式清空(§6a) —— **和记 instance ID 同等性质:A/B 可复现的唯一依据**
 
 权重不用备份,重下比传快。`$VLLM_VENV` 也不用,`rm -rf` 掉省 10–15 GB。
 
