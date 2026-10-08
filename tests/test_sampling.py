@@ -361,7 +361,7 @@ def test_param_table_clamps_top_k_at_admission():
     tab.set_slot(1, SamplingParams(top_k=5000), cfg)       # wider than useful -> cutoff
     tab.set_slot(2, SamplingParams(top_k=7), cfg)          # in range -> kept as is
     tab.set_slot(3, None, cfg)                             # no user params -> config default
-    assert tab.top_k_host[:4].tolist() == [cutoff, cutoff, 7, cfg.top_k]
+    assert tab.top_k_stage[:4].tolist() == [cutoff, cutoff, 7, cfg.top_k]
 
 
 def test_param_table_gather_max_k_is_plain_max_of_effective_k():
@@ -375,7 +375,7 @@ def test_param_table_gather_max_k_is_plain_max_of_effective_k():
         tab.set_slot(slot, SamplingParams(top_k=k), cfg)
 
     idx_host = torch.tensor([0, 1, 2])
-    _, top_k, max_k = tab.gather(slot_idx=idx_host.to(cfg.device), slot_idx_host=idx_host)
+    _, top_k, max_k = tab.gather(slot_idx=idx_host.to(cfg.device), slot_idx_stage=idx_host)
     assert top_k.tolist() == [cutoff, 7, cutoff]
     assert max_k == cutoff
 

@@ -33,35 +33,35 @@ class RequestBuffer:
 
         # row 0: slot index, 1: want
         self.slot_idx_device = torch.empty(cfg.max_num_seqs, dtype=torch.int64, device=cfg.device)
-        self.slot_idx_host = torch.empty(cfg.max_num_seqs, dtype=torch.int64, pin_memory=True) \
+        self.slot_idx_stage = torch.empty(cfg.max_num_seqs, dtype=torch.int64, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, dtype=torch.int64)
         
         self.want_device = torch.empty(cfg.max_num_seqs, dtype=torch.int32, device=cfg.device)
-        self.want_host = torch.empty(cfg.max_num_seqs, dtype=torch.int32, pin_memory=True) \
+        self.want_stage = torch.empty(cfg.max_num_seqs, dtype=torch.int32, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, dtype=torch.int32)
 
         # needs_sample
         self.needs_sample_device = torch.empty(cfg.max_num_seqs, dtype=torch.bool, device=cfg.device)
-        self.needs_sample_host = torch.empty(cfg.max_num_seqs, dtype=torch.bool, pin_memory=True) \
+        self.needs_sample_stage = torch.empty(cfg.max_num_seqs, dtype=torch.bool, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, dtype=torch.bool)
 
         # cache_slots
         self.cache_slot_device = torch.empty(cfg.max_num_batched_tokens, dtype=torch.int64, device=cfg.device)
-        self.cache_slot_host = torch.empty(cfg.max_num_batched_tokens, dtype=torch.int64, pin_memory=True) \
+        self.cache_slot_stage = torch.empty(cfg.max_num_batched_tokens, dtype=torch.int64, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(cfg.max_num_batched_tokens, dtype=torch.int64)
 
         # block table
         self.max_block_num_per_req = cdiv(cfg.max_model_len, cfg.block_size)
         self.block_table_device = torch.empty(cfg.max_num_seqs, self.max_block_num_per_req, dtype=torch.int32, device=cfg.device)
-        self.block_table_host = torch.empty(cfg.max_num_seqs, self.max_block_num_per_req, dtype=torch.int32, pin_memory=True) \
+        self.block_table_stage = torch.empty(cfg.max_num_seqs, self.max_block_num_per_req, dtype=torch.int32, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, self.max_block_num_per_req, dtype=torch.int32)
 
         # view of numpy
-        self.slot_idx_np = self.slot_idx_host.numpy()
-        self.want_np = self.want_host.numpy()
-        self.needs_sample_np = self.needs_sample_host.numpy()
-        self.cache_slot_np = self.cache_slot_host.numpy()
-        self.block_table_np = self.block_table_host.numpy()
+        self.slot_idx_np = self.slot_idx_stage.numpy()
+        self.want_np = self.want_stage.numpy()
+        self.needs_sample_np = self.needs_sample_stage.numpy()
+        self.cache_slot_np = self.cache_slot_stage.numpy()
+        self.block_table_np = self.block_table_stage.numpy()
 
         self._blk_cols = np.arange(self.max_block_num_per_req)  # costant variable
 
@@ -83,9 +83,9 @@ class RequestBuffer:
         # oracle
         # for i, bt in enumerate(block_tables):
         #     for j, b in enumerate(bt):
-        #         self.block_table_host[i, j] = b
+        #         self.block_table_stage[i, j] = b
 
-        self.block_table_device[:bsz, :max_blocks].copy_(self.block_table_host[:bsz, :max_blocks], non_blocking=True)
+        self.block_table_device[:bsz, :max_blocks].copy_(self.block_table_stage[:bsz, :max_blocks], non_blocking=True)
 
         return self.block_table_device[:bsz, :max_blocks]
 
@@ -104,17 +104,17 @@ class RequestBuffer:
         self.cache_slot_np[:cache_slot_cnt] = cache_slot_flat
 
         # async copy
-        self.slot_idx_device[:bsz].copy_(self.slot_idx_host[:bsz], non_blocking=True)
-        self.want_device[:bsz].copy_(self.want_host[:bsz], non_blocking=True)
-        self.needs_sample_device[:bsz].copy_(self.needs_sample_host[:bsz], non_blocking=True)
-        self.cache_slot_device[:cache_slot_cnt].copy_(self.cache_slot_host[:cache_slot_cnt], non_blocking=True)
+        self.slot_idx_device[:bsz].copy_(self.slot_idx_stage[:bsz], non_blocking=True)
+        self.want_device[:bsz].copy_(self.want_stage[:bsz], non_blocking=True)
+        self.needs_sample_device[:bsz].copy_(self.needs_sample_stage[:bsz], non_blocking=True)
+        self.cache_slot_device[:cache_slot_cnt].copy_(self.cache_slot_stage[:cache_slot_cnt], non_blocking=True)
 
         # block table
         block_table = self._build_block_table(block_tables=block_tables)
 
-        return self.slot_idx_device[:bsz], self.slot_idx_host[:bsz], \
-            self.want_device[:bsz], self.want_host[:bsz], \
-            self.needs_sample_device[:bsz], self.needs_sample_host[:bsz], \
+        return self.slot_idx_device[:bsz], self.slot_idx_stage[:bsz], \
+            self.want_device[:bsz], self.want_stage[:bsz], \
+            self.needs_sample_device[:bsz], self.needs_sample_stage[:bsz], \
             self.cache_slot_device[:cache_slot_cnt], block_table
 
 class ModelRequest:
@@ -252,7 +252,7 @@ class TokenIdTable:
 
         # shape [B, L], all token ids including prompt and output tokens per row
         self.tok_id_device = torch.empty(max_num_seqs, max_model_len, dtype=torch.int64, device=device)
-        self.tok_id_host = torch.empty(max_num_seqs, max_model_len, dtype=torch.int64, pin_memory=True) \
+        self.tok_id_stage = torch.empty(max_num_seqs, max_model_len, dtype=torch.int64, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(max_num_seqs, max_model_len, dtype=torch.int64)
 
         # row 0: input length, 1: output length, 2: numer of computed tokens
@@ -264,9 +264,9 @@ class TokenIdTable:
 
         # double buffer
         # only host-side buffer, for transfer next tokens from device to host. top-bsz elements used.
-        next_tok_host_double_buffer = torch.empty(2, max_num_seqs, dtype=torch.int64, pin_memory=True) \
+        next_tok_stage_double_buffer = torch.empty(2, max_num_seqs, dtype=torch.int64, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(2, max_num_seqs, dtype=torch.int64)
-        self.next_tok_host_bufs = next_tok_host_double_buffer.unbind() # tuple
+        self.next_tok_stage_bufs = next_tok_stage_double_buffer.unbind() # tuple
         self.dth_buf: int = 0
 
     def add_req(self, req: "ModelRequest"):
@@ -294,10 +294,10 @@ class TokenIdTable:
         self.num_computed_tok_device[slot].zero_()
 
         for i, tok in enumerate(req.input_ids):
-            self.tok_id_host[slot, i] = tok
+            self.tok_id_stage[slot, i] = tok
         for i, tok in enumerate(req.output_ids):        # for recompute
-            self.tok_id_host[slot, i+in_len] = tok
-        self.tok_id_device[slot, :in_len+out_len].copy_(self.tok_id_host[slot, :in_len+out_len], non_blocking=True)
+            self.tok_id_stage[slot, i+in_len] = tok
+        self.tok_id_device[slot, :in_len+out_len].copy_(self.tok_id_stage[slot, :in_len+out_len], non_blocking=True)
 
     # scatter next tokens to tok_id_device, then copy them from device to host asynchronously.
     def add_sampled_tokens_on_device(
@@ -328,25 +328,25 @@ class TokenIdTable:
         # async copy next tokens from device to host, then add them to ModelRequest.token_queue when the async copy finishes.
         buf = self.dth_buf
         with timed(step_metrics, "dth"):
-            self.next_tok_host_bufs[self.dth_buf][:bsz].copy_(next_tokens, non_blocking=True)
+            self.next_tok_stage_bufs[self.dth_buf][:bsz].copy_(next_tokens, non_blocking=True)
         self.dth_buf ^= 1   # flip
         return buf
 
-    def update_projected_state_in_advance(self, slot_idx_host: torch.Tensor, want_host: torch.Tensor, needs_sample_host_snapshot: torch.Tensor):
-        self.num_scheduled_tok_host.index_add_(0, slot_idx_host, want_host)
-        self.projected_out_len_host.index_add_(0, slot_idx_host, needs_sample_host_snapshot.int())
+    def update_projected_state_in_advance(self, slot_idx_stage: torch.Tensor, want_stage: torch.Tensor, needs_sample_stage_snapshot: torch.Tensor):
+        self.num_scheduled_tok_host.index_add_(0, slot_idx_stage, want_stage)
+        self.projected_out_len_host.index_add_(0, slot_idx_stage, needs_sample_stage_snapshot.int())
 
-    def gather_flat_pending_tok(self, slot_idx: torch.Tensor, slot_idx_host: torch.Tensor, want: torch.Tensor, want_host: torch.Tensor, num_tokens: int
+    def gather_flat_pending_tok(self, slot_idx: torch.Tensor, slot_idx_stage: torch.Tensor, want: torch.Tensor, want_stage: torch.Tensor, num_tokens: int
                                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         bsz = slot_idx.numel()
         assert want.numel() == bsz and num_tokens >= bsz
 
         # element-wise comparison
-        exceeds = (self.num_scheduled_tok_host[slot_idx_host] + want_host) > \
-            (self.in_len_host[slot_idx_host] + self.projected_out_len_host[slot_idx_host])
+        exceeds = (self.num_scheduled_tok_host[slot_idx_stage] + want_stage) > \
+            (self.in_len_host[slot_idx_stage] + self.projected_out_len_host[slot_idx_stage])
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"num_scheduled_tok_host: {self.num_scheduled_tok_host[slot_idx_host]}, want_host: {want_host}, "
-                    f"in_len_host: {self.in_len_host[slot_idx_host]}, projected_out_len_host: {self.projected_out_len_host[slot_idx_host]}")
+            logger.debug(f"num_scheduled_tok_host: {self.num_scheduled_tok_host[slot_idx_stage]}, want_stage: {want_stage}, "
+                    f"in_len_host: {self.in_len_host[slot_idx_stage]}, projected_out_len_host: {self.projected_out_len_host[slot_idx_stage]}")
         if exceeds.any():
             raise ValueError("want overflow, scheduler must malfunction")
 
@@ -355,7 +355,7 @@ class TokenIdTable:
         cu_seqlens_k = torch.cat([_cu_seqlens_k.new_zeros(1), _cu_seqlens_k])   # [B+1], begin with zero
 
         # max_seqlen_k in host-side
-        cache_seqlens_host = want_host + self.num_scheduled_tok_host[slot_idx_host]
+        cache_seqlens_host = want_stage + self.num_scheduled_tok_host[slot_idx_stage]
         max_seqlen_k = int(torch.max(cache_seqlens_host).item())
 
         cu_want = torch.cumsum(want, 0, dtype=torch.int32)      # [B]
@@ -429,15 +429,15 @@ class SchedulerOutput:
         self.config = config
         self.scheduler = scheduler
         self.slot_idx: torch.Tensor | None = None
-        self.slot_idx_host_snapshot: torch.Tensor | None = None
+        self.slot_idx_stage_snapshot: torch.Tensor | None = None
         self.want: torch.Tensor | None = None
-        self.want_host_snapshot: torch.Tensor | None = None
+        self.want_stage_snapshot: torch.Tensor | None = None
         self.attn_meta: AttentionMetadata | None = None
         self.needs_sample_device: torch.Tensor | None = None
         # WARNING: do not save a view of a host-side tensor as below, because it will be updated in the next step.
-        # self.needs_sample_host: torch.Tensor | None = None
+        # self.needs_sample_stage: torch.Tensor | None = None
         # USING a native variable and a snapshot of it instead
-        self.needs_sample_host_snapshot: torch.Tensor | None = None
+        self.needs_sample_stage_snapshot: torch.Tensor | None = None
         self.needs_sample_lst: list[bool] | None = None
         self.dth_buf: int = 0
 
@@ -471,13 +471,13 @@ class SchedulerOutput:
 
     def build_sampling_tensors(self) -> SamplingTensors:
         assert self.scheduler is not None and self.scheduler.sampling_param_tab is not None
-        assert self.slot_idx is not None and self.slot_idx_host_snapshot is not None
+        assert self.slot_idx is not None and self.slot_idx_stage_snapshot is not None
 
         prompt_mask, output_counts, output_mask = self.scheduler.tok_id_tab.bin_count_and_mask(slot_idx=self.slot_idx, vocab_size=self.config.vocab_size)
         return SamplingTensors.from_table(
             sampling_param_tab=self.scheduler.sampling_param_tab,
             slot_idx=self.slot_idx,
-            slot_idx_host=self.slot_idx_host_snapshot,
+            slot_idx_stage=self.slot_idx_stage_snapshot,
             prompt_mask=prompt_mask,
             output_counts=output_counts, output_mask=output_mask,)
 
@@ -491,16 +491,16 @@ class SchedulerOutput:
             assert req.num_in_flight >= 0
 
     def update_projected_state_in_advance(self):
-        assert self.scheduler is not None and self.needs_sample_host_snapshot is not None
-        assert self.want_host_snapshot is not None and self.slot_idx_host_snapshot is not None
+        assert self.scheduler is not None and self.needs_sample_stage_snapshot is not None
+        assert self.want_stage_snapshot is not None and self.slot_idx_stage_snapshot is not None
         self.scheduler.tok_id_tab.update_projected_state_in_advance(
-            slot_idx_host=self.slot_idx_host_snapshot, want_host=self.want_host_snapshot,
-            needs_sample_host_snapshot=self.needs_sample_host_snapshot)
+            slot_idx_stage=self.slot_idx_stage_snapshot, want_stage=self.want_stage_snapshot,
+            needs_sample_stage_snapshot=self.needs_sample_stage_snapshot)
 
         for i, req in enumerate(self.reqs):
             assert not req.projected_finished
 
-            req.num_scheduled_tokens += int(self.want_host_snapshot[i].item())
+            req.num_scheduled_tokens += int(self.want_stage_snapshot[i].item())
             assert self.needs_sample_lst is not None
             if not req.projected_is_decoding and self.needs_sample_lst[i]:
                 req.projected_is_decoding = True
@@ -525,18 +525,18 @@ class SchedulerOutput:
         lens = [s.want for s in self.s_infos]
         num_tokens = sum(lens)
         max_seqlen_q = max(lens)
-        self.slot_idx, slot_idx_host, self.want, want_host, self.needs_sample_device, needs_sample_host, cache_slot, block_table = \
+        self.slot_idx, slot_idx_stage, self.want, want_stage, self.needs_sample_device, needs_sample_stage, cache_slot, block_table = \
             self.scheduler.req_buf.set(reqs=self.reqs, s_infos=self.s_infos, block_tables=self.block_tables)
-        self.needs_sample_host_snapshot = needs_sample_host.clone().detach()
-        self.needs_sample_lst = needs_sample_host.tolist()
-        self.slot_idx_host_snapshot = slot_idx_host.clone().detach()
-        self.want_host_snapshot = want_host.clone().detach()
+        self.needs_sample_stage_snapshot = needs_sample_stage.clone().detach()
+        self.needs_sample_lst = needs_sample_stage.tolist()
+        self.slot_idx_stage_snapshot = slot_idx_stage.clone().detach()
+        self.want_stage_snapshot = want_stage.clone().detach()
 
         packed_ids, position_ids, cu_seqlens_q, cache_seqlens, cu_seqlens_k, max_seqlen_k = \
             self.scheduler.tok_id_tab.gather_flat_pending_tok(
                 slot_idx=self.slot_idx,
-                slot_idx_host=slot_idx_host,
-                want=self.want, want_host=want_host,
+                slot_idx_stage=slot_idx_stage,
+                want=self.want, want_stage=want_stage,
                 num_tokens=num_tokens)
 
         cos_sin = rope.gather_cos_sin(position_ids) if rope is not None and self.config.pre_gather_cos_sin else None
@@ -559,7 +559,7 @@ class SchedulerOutput:
     # after transferring next_tokens from device to host
     def add_sampled_tokens_on_host(self) -> int:
         assert self.scheduler is not None and self.slot_idx is not None and self.step_metrics is not None
-        next_tok_lst = self.scheduler.tok_id_tab.next_tok_host_bufs[self.dth_buf][:self.batch_size].tolist()
+        next_tok_lst = self.scheduler.tok_id_tab.next_tok_stage_bufs[self.dth_buf][:self.batch_size].tolist()
         num_truncated: int = 0
 
         now = time.perf_counter()

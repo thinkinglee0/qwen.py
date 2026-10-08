@@ -610,8 +610,8 @@ def test_gather_tok_in_recompute(tmp_target_config: ModelConfig):
     want_tensor = torch.tensor([want], device=tmp_target_config.device, dtype=torch.int64)
     want_tensor_host = torch.tensor([want], device=torch.device("cpu"), dtype=torch.int64)
     packed_ids, position_ids, cu_seqlens_q, cache_seqlens, cu_seqlens_k, max_seqlen_k = \
-        sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_host=slot_idx_host,
-                                               want=want_tensor, want_host=want_tensor_host, num_tokens=want)
+        sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_stage=slot_idx_host,
+                                               want=want_tensor, want_stage=want_tensor_host, num_tokens=want)
     assert packed_ids.tolist() == all_toks
     assert position_ids.tolist() == list(range(0, want))
     assert cu_seqlens_q.tolist() == [0, want]
@@ -627,8 +627,8 @@ def test_gather_tok_in_recompute(tmp_target_config: ModelConfig):
     want_tensor = torch.tensor([want], device=tmp_target_config.device, dtype=torch.int64)
     want_tensor_host = torch.tensor([want], device=torch.device("cpu"), dtype=torch.int64)
     packed_ids, position_ids, cu_seqlens_q, cache_seqlens, cu_seqlens_k, max_seqlen_k = \
-        sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_host=slot_idx_host,
-                                               want=want_tensor, want_host=want_tensor_host, num_tokens=want)
+        sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_stage=slot_idx_host,
+                                               want=want_tensor, want_stage=want_tensor_host, num_tokens=want)
     assert packed_ids.tolist() == all_toks[num_computed_tokens:num_computed_tokens+want]
     assert position_ids.tolist() == list(range(num_computed_tokens, num_computed_tokens+want))
 
@@ -640,8 +640,8 @@ def test_gather_tok_in_recompute(tmp_target_config: ModelConfig):
     want_tensor = torch.tensor([want], device=tmp_target_config.device, dtype=torch.int64)
     want_tensor_host = torch.tensor([want], device=torch.device("cpu"), dtype=torch.int64)
     packed_ids, position_ids, cu_seqlens_q, cache_seqlens, cu_seqlens_k, max_seqlen_k = \
-        sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_host=slot_idx_host,
-                                               want=want_tensor, want_host=want_tensor_host, num_tokens=want)
+        sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_stage=slot_idx_host,
+                                               want=want_tensor, want_stage=want_tensor_host, num_tokens=want)
     assert packed_ids.tolist() == all_toks[num_computed_tokens:num_computed_tokens+want]
     assert position_ids.tolist() == list(range(num_computed_tokens, num_computed_tokens+want))
 
@@ -654,8 +654,8 @@ def test_gather_tok_in_recompute(tmp_target_config: ModelConfig):
     want_tensor_host = torch.tensor([want], device=torch.device("cpu"), dtype=torch.int64)
     with pytest.raises(AssertionError):     # negative case
         packed_ids, position_ids, cu_seqlens_q, cache_seqlens, cu_seqlens_k, max_seqlen_k = \
-            sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_host=slot_idx_host,
-                                               want=want_tensor, want_host=want_tensor_host, num_tokens=want)
+            sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_stage=slot_idx_host,
+                                               want=want_tensor, want_stage=want_tensor_host, num_tokens=want)
 
     # case 5 (negative): [input_len:input_len+output_len+1], overflow
     num_computed_tokens = req1.input_len
@@ -666,8 +666,8 @@ def test_gather_tok_in_recompute(tmp_target_config: ModelConfig):
     want_tensor_host = torch.tensor([want], device=torch.device("cpu"), dtype=torch.int64)
     with pytest.raises(ValueError):     # negative case
         packed_ids, position_ids, cu_seqlens_q, cache_seqlens, cu_seqlens_k, max_seqlen_k = \
-            sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_host=slot_idx_host,
-                                               want=want_tensor, want_host=want_tensor_host, num_tokens=want)
+            sch.tok_id_tab.gather_flat_pending_tok(slot_idx=slot_idx, slot_idx_stage=slot_idx_host,
+                                               want=want_tensor, want_stage=want_tensor_host, num_tokens=want)
 
 
 def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, survival_req: ModelRequest, preempted_req: ModelRequest, tmp_target_config: ModelConfig):

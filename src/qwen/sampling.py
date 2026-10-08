@@ -52,11 +52,11 @@ class SamplingParamTable:
 
         bsz = config.max_num_seqs
         self.fields_device = torch.empty(len(self.FLOAT32_FIELDS), bsz, dtype=torch.float32, device=config.device)
-        self.fields_host = torch.empty(len(self.FLOAT32_FIELDS), bsz, dtype=torch.float32, pin_memory=True) \
+        self.fields_stage = torch.empty(len(self.FLOAT32_FIELDS), bsz, dtype=torch.float32, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(len(self.FLOAT32_FIELDS), bsz, dtype=torch.float32)
 
         self.top_k_device = torch.empty(bsz, dtype=torch.int64, device=config.device)
-        self.top_k_host = torch.empty(bsz, dtype=torch.int64, pin_memory=True) \
+        self.top_k_stage = torch.empty(bsz, dtype=torch.int64, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(bsz, dtype=torch.int64)
 
         self.top_k_cutoff = min(MAX_EFFECTIVE_TOP_K, config.vocab_size)
@@ -66,22 +66,22 @@ class SamplingParamTable:
 
         for i, name in enumerate(self.FLOAT32_FIELDS):
             v = getattr(user_sampling, name, None) if user_sampling is not None else None
-            self.fields_host[i, slot] = v if v is not None else getattr(config, name)
-        self.fields_device[:, slot].copy_(self.fields_host[:, slot], non_blocking=True)   # async H2D copy
+            self.fields_stage[i, slot] = v if v is not None else getattr(config, name)
+        self.fields_device[:, slot].copy_(self.fields_stage[:, slot], non_blocking=True)   # async H2D copy
 
         # clamp top-k to [1, top_k_cutoff]
         top_k_eff = user_sampling.top_k if user_sampling is not None and user_sampling.top_k is not None else config.top_k
         if top_k_eff <= 0 or top_k_eff >= self.top_k_cutoff:
             top_k_eff = self.top_k_cutoff
-        self.top_k_host[slot] = top_k_eff
-        self.top_k_device[slot].copy_(self.top_k_host[slot], non_blocking=True)     # async H2D copy
+        self.top_k_stage[slot] = top_k_eff
+        self.top_k_device[slot].copy_(self.top_k_stage[slot], non_blocking=True)     # async H2D copy
 
-    def gather(self, slot_idx: torch.Tensor, slot_idx_host: torch.Tensor):
+    def gather(self, slot_idx: torch.Tensor, slot_idx_stage: torch.Tensor):
         """Per step: one index_select on device, zero Python iteration."""
         sel = self.fields_device.index_select(1, slot_idx)
 
-        top_k_host = self.top_k_host.index_select(0, slot_idx_host)
-        max_k = int(top_k_host.max().item())
+        top_k_stage = self.top_k_stage.index_select(0, slot_idx_stage)
+        max_k = int(top_k_stage.max().item())
 
         # (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), top_k, max_k
         return sel.unbind(0), self.top_k_device.index_select(0, slot_idx), max_k
@@ -100,11 +100,11 @@ class SamplingTensors:
     output_mask: torch.Tensor
 
     @classmethod
-    def from_table(cls, sampling_param_tab: SamplingParamTable, slot_idx: torch.Tensor, slot_idx_host: torch.Tensor,
+    def from_table(cls, sampling_param_tab: SamplingParamTable, slot_idx: torch.Tensor, slot_idx_stage: torch.Tensor,
                    prompt_mask: torch.Tensor, output_counts: torch.Tensor, output_mask: torch.Tensor):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"from_table, {slot_idx}")
-        (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), top_k, max_k = sampling_param_tab.gather(slot_idx=slot_idx, slot_idx_host=slot_idx_host)
+        (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), top_k, max_k = sampling_param_tab.gather(slot_idx=slot_idx, slot_idx_stage=slot_idx_stage)
 
         return cls(
             temperature=temperature, top_k=top_k, max_k=max_k,
