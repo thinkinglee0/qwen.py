@@ -27,7 +27,7 @@ class StepEvents:
         # Each segment has a pair of events (start, stop).
         self._ev = {
             seg: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for seg in self.SEGMENTS
-        }
+        } if torch.cuda.is_available() else {}
 
     def start(self, seg: str):
         if not torch.cuda.is_available():
@@ -68,7 +68,10 @@ class StepEvents:
 class SchedulerStepMetrics:
     # ClassVar: one frozenset shared by all instances (not a dataclass field itself).
     # Names listed here are skipped when summing in merge() and when building output_dict().
-    EXCLUDE: ClassVar[frozenset[str]] = frozenset({"events", "pending_evs"})
+    EXCLUDE: ClassVar[frozenset[str]] = frozenset({
+        "events", "pending_evs",
+        "sched_pre", "sched_run", "sched_wait", "sched_ret"
+        })
 
     # NOTE: needs the annotation + default_factory. A bare `events = StepEvents()` is a plain
     # class attribute shared by every instance, so all 24 layers would record into one event dict.
@@ -119,12 +122,18 @@ class SchedulerStepMetrics:
     ci: float = 0.
 
     def start(self, ev: str):
+        if ev in self.EXCLUDE:
+            return
+
         self.pending_evs.append((ev, time.perf_counter()))
         self.events.start(ev)
         # if logger.isEnabledFor(logging.DEBUG):
         #     logger.debug(f"step_metrics.start({ev}), len: {len(self.pending_evs)}")
 
     def stop(self, ev: str):
+        if ev in self.EXCLUDE:
+            return
+
         cur_ev, start_time = self.pending_evs.pop()
         assert cur_ev == ev, f"stop event {ev} does not match start event {cur_ev}"
         self.events.stop(cur_ev)
@@ -139,7 +148,8 @@ class SchedulerStepMetrics:
     def merge(self, other: 'SchedulerStepMetrics'):
         # merge the events from other into self, and sum the metrics
         for k, v in other.events.read().items():
-            setattr(other, k, v)
+            if k not in self.EXCLUDE:
+                setattr(other, k, v)
 
         for f in fields(self):
             if f.name not in self.EXCLUDE:
