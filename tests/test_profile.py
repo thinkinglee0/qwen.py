@@ -120,6 +120,10 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
     '''
     logger.info(f"batch_size: {batch_size}, use_d_first_schedule: {use_d_first_schedule}")
 
+    # register gc callback
+    gc_callback = lambda phase, info: logger.info(f"gc callback: phase={phase}, info={info}")
+    gc.callbacks.append(gc_callback)
+
     # MEASURE_STEPS (run A, clean) carries the timing statistics -- it is the only
     # window free of profiler overhead, and one step_metrics line is dumped per step
     # either way. PROFILE_STEPS (run B) only has to be long enough to hold a
