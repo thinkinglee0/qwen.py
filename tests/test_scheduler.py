@@ -39,7 +39,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     tmp_target_config.use_d_first_schedule = use_d_first_schedule
 
     sch = Scheduler(tmp_target_config)
-    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_seqs == sch.req_slot_pool.capacity
+    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_req_slots  == sch.req_slot_pool.capacity
     assert sch.sch_metrics.step_id == 0
 
     temperature = 1.0
@@ -86,7 +86,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
 
     assert req1.metrics.first_schedule_time is not None
     assert req1.slot is not None
-    assert req1.slot not in sch.req_slot_pool._free and len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_seqs
+    assert req1.slot not in sch.req_slot_pool._free and len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_req_slots
 
     assert sch.tok_id_tab.num_computed_tok_device[req1.slot].item() == 0
     assert sch.tok_id_tab.in_len_device[req1.slot].item() == input_len
@@ -189,7 +189,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     assert sch_out.block_tables is not None and len(sch_out.block_tables)==1 and len(sch_out.block_tables[0])==4
 
     assert req1.slot is not None
-    assert req1.slot not in sch.req_slot_pool._free and len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_seqs
+    assert req1.slot not in sch.req_slot_pool._free and len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_req_slots
 
     assert sch_out.attn_meta is None
     assert sch_out.output_ids == [[]]
@@ -406,7 +406,7 @@ def finish_on_eos(ctx: LifeCycle):
 
     # all resource released
     assert req1.slot is None
-    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_seqs
+    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_req_slots
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
     assert sch.sch_metrics.num_finished == 1
 
@@ -433,7 +433,7 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
     assert sch_out.block_tables is not None and len(sch_out.block_tables)==1 and len(sch_out.block_tables[0])==5
 
     assert req1.slot is not None
-    assert req1.slot not in sch.req_slot_pool._free and len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_seqs
+    assert req1.slot not in sch.req_slot_pool._free and len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_req_slots
 
     assert sch_out.attn_meta is None
     assert sch_out.output_ids == [[]]
@@ -540,7 +540,7 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
 
     # all resource released
     assert req1.slot is None
-    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_seqs
+    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_req_slots
     assert len(sch.cache.pool.free) == tmp_target_config.num_blocks
     assert sch.sch_metrics.num_finished == 1
 
@@ -720,7 +720,7 @@ def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, su
     num_truncated = sch_out.add_sampled_tokens_on_host()
     assert survival_req.projected_is_decoding and survival_req.finished
     assert survival_req.slot is not None
-    assert len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_seqs
+    assert len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_req_slots
     assert survival_req in sch.running
     sch.commit_step(sch_out=sch_out, num_truncated=num_truncated)
     assert survival_req not in sch.running and survival_req not in list(sch.waiting) and sch.running == []
@@ -728,7 +728,7 @@ def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, su
     assert sch.cache.get_block_table(request=survival_req) is None      # kv cache released
     assert len(sch.cache.pool.free) == sch.cache.pool.num_blocks    # empty pool
     assert survival_req.slot is None    # slot released
-    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_seqs
+    assert len(sch.req_slot_pool._free) == tmp_target_config.max_num_req_slots
 
     # req3: P, i_len=30, o_len=0, num_scheduled_tokens=0
     input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(30)]
@@ -779,7 +779,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     req1.metrics.first_schedule_time = 1.
     assert req1.projected_is_decoding == False
     assert req1.slot is not None
-    assert len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_seqs
+    assert len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_req_slots
 
     # req2: P, i_len=20, o_len=0, num_scheduled_tokens=16
     input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(20)]
@@ -791,7 +791,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     req2.metrics.first_schedule_time = 1.
     assert req2.projected_is_decoding == False
     assert req2.slot is not None
-    assert len(sch.req_slot_pool._free) + 2 == tmp_target_config.max_num_seqs
+    assert len(sch.req_slot_pool._free) + 2 == tmp_target_config.max_num_req_slots
 
     sch.running = [req1, req2]
 

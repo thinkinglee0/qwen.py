@@ -30,20 +30,21 @@ logger = logging.getLogger(__name__)
 class RequestBuffer:
     def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
+        capacity = cfg.max_num_req_slots
 
         # row 0: slot index, 1: want
-        self.slot_idx_device = torch.empty(cfg.max_num_seqs, dtype=torch.int64, device=cfg.device)
-        self.slot_idx_stage = torch.empty(cfg.max_num_seqs, dtype=torch.int64, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, dtype=torch.int64)
+        self.slot_idx_device = torch.empty(capacity, dtype=torch.int64, device=cfg.device)
+        self.slot_idx_stage = torch.empty(capacity, dtype=torch.int64, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(capacity, dtype=torch.int64)
         
-        self.want_device = torch.empty(cfg.max_num_seqs, dtype=torch.int32, device=cfg.device)
-        self.want_stage = torch.empty(cfg.max_num_seqs, dtype=torch.int32, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, dtype=torch.int32)
+        self.want_device = torch.empty(capacity, dtype=torch.int32, device=cfg.device)
+        self.want_stage = torch.empty(capacity, dtype=torch.int32, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(capacity, dtype=torch.int32)
 
         # needs_sample
-        self.needs_sample_device = torch.empty(cfg.max_num_seqs, dtype=torch.bool, device=cfg.device)
-        self.needs_sample_stage = torch.empty(cfg.max_num_seqs, dtype=torch.bool, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, dtype=torch.bool)
+        self.needs_sample_device = torch.empty(capacity, dtype=torch.bool, device=cfg.device)
+        self.needs_sample_stage = torch.empty(capacity, dtype=torch.bool, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(capacity, dtype=torch.bool)
 
         # cache_slots
         self.cache_slot_device = torch.empty(cfg.max_num_batched_tokens, dtype=torch.int64, device=cfg.device)
@@ -52,9 +53,9 @@ class RequestBuffer:
 
         # block table
         self.max_block_num_per_req = cdiv(cfg.max_model_len, cfg.block_size)
-        self.block_table_device = torch.empty(cfg.max_num_seqs, self.max_block_num_per_req, dtype=torch.int32, device=cfg.device)
-        self.block_table_stage = torch.empty(cfg.max_num_seqs, self.max_block_num_per_req, dtype=torch.int32, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(cfg.max_num_seqs, self.max_block_num_per_req, dtype=torch.int32)
+        self.block_table_device = torch.empty(capacity, self.max_block_num_per_req, dtype=torch.int32, device=cfg.device)
+        self.block_table_stage = torch.empty(capacity, self.max_block_num_per_req, dtype=torch.int32, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(capacity, self.max_block_num_per_req, dtype=torch.int32)
 
         # view of numpy
         self.slot_idx_np = self.slot_idx_stage.numpy()
@@ -245,27 +246,27 @@ class ScheduledInfo:
         assert self.want == len(self.cache_slots)
 
 class TokenIdTable:
-    def __init__(self, max_num_seqs: int, max_model_len: int, device: torch.device):
+    def __init__(self, capacity: int, max_model_len: int, device: torch.device):
         '''periodically async-copy output token and output len from device to host'''
-        self.max_num_seqs = max_num_seqs
+        self.capacity = capacity
         self.max_model_len = max_model_len
 
         # shape [B, L], all token ids including prompt and output tokens per row
-        self.tok_id_device = torch.empty(max_num_seqs, max_model_len, dtype=torch.int64, device=device)
-        self.tok_id_stage = torch.empty(max_num_seqs, max_model_len, dtype=torch.int64, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(max_num_seqs, max_model_len, dtype=torch.int64)
+        self.tok_id_device = torch.empty(capacity, max_model_len, dtype=torch.int64, device=device)
+        self.tok_id_stage = torch.empty(capacity, max_model_len, dtype=torch.int64, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(capacity, max_model_len, dtype=torch.int64)
 
         # row 0: input length, 1: output length, 2: numer of computed tokens
-        tok_len_device = torch.empty(3, max_num_seqs, dtype=torch.int32, device=device)
+        tok_len_device = torch.empty(3, capacity, dtype=torch.int32, device=device)
         (self.in_len_device, self.out_len_device, self.num_computed_tok_device) = tok_len_device.unbind() # shape [B]
         # do not act as stages on DMA to out_len_device/num_computed_tok_device, so its device set to 'cpu'
         (self.in_len_host, self.projected_out_len_host, self.num_scheduled_tok_host) = \
-            torch.empty(3, max_num_seqs, dtype=torch.int32, device=torch.device("cpu")).unbind()
+            torch.empty(3, capacity, dtype=torch.int32, device=torch.device("cpu")).unbind()
 
         # double buffer
         # only host-side buffer, for transfer next tokens from device to host. top-bsz elements used.
-        next_tok_stage_double_buffer = torch.empty(2, max_num_seqs, dtype=torch.int64, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(2, max_num_seqs, dtype=torch.int64)
+        next_tok_stage_double_buffer = torch.empty(2, capacity, dtype=torch.int64, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(2, capacity, dtype=torch.int64)
         self.next_tok_stage_bufs = next_tok_stage_double_buffer.unbind() # tuple
         self.dth_buf: int = 0
 
@@ -609,13 +610,14 @@ class Scheduler:
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.max_num_seqs = config.max_num_seqs
+        self.max_num_req_slots = config.max_num_req_slots
         assert self.max_num_batched_tokens >= self.max_num_seqs # ensure that all reqs in decoding can be admitted.
 
         # slot
-        self.req_slot_pool = RequestSlotPool(capacity=self.max_num_seqs)
+        self.req_slot_pool = RequestSlotPool(capacity=self.max_num_req_slots)
         assert config.device is not None
         self.req_buf = RequestBuffer(cfg=config)
-        self.tok_id_tab = TokenIdTable(max_num_seqs=self.max_num_seqs, max_model_len=config.max_model_len, device=config.device)
+        self.tok_id_tab = TokenIdTable(capacity=self.max_num_req_slots, max_model_len=config.max_model_len, device=config.device)
         self.sampling_param_tab = SamplingParamTable(self.config)
 
         # scheduling strategy
@@ -685,8 +687,6 @@ class Scheduler:
         self.waiting.appendleft(victim)
 
     def commit_step(self, sch_out: SchedulerOutput, num_truncated:int):
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"call commit_step, ")
         fin = 0
         for req in sch_out.reqs:
             if req.finished:
@@ -864,15 +864,17 @@ class Scheduler:
             self.running: list[ModelRequest] = decoding + prefill
 
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
+                logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}, step_id: {self.sch_metrics.step_id}")
 
         # 1) running first — protect in-flight decodes' TPOT.
+        num_projected_finished = 0
         with timed(step_metrics, "sched_run"):
             scheduled_running: list[ModelRequest] = []
             for req in list(self.running):
                 # all finished requests should have been removed by cleanup_on_finished in commit_step after add_sampled_tokens
                 assert not req.finished
                 if req.projected_finished:
+                    num_projected_finished += 1
                     continue
 
                 # the request that was preempted in the current or previous step should be skipped.
@@ -902,7 +904,9 @@ class Scheduler:
 
                     new_slots = self.cache.allocate_slots(req, want)
 
-                if new_slots is None:               # still cannot get new blocks
+                if new_slots is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"step_id: {self.sch_metrics.step_id}, no more slots for {req.request_id}, skip over")
                     break
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -914,7 +918,7 @@ class Scheduler:
 
         # 2) waiting next — fill remaining budget with (chunked) prefills
         with timed(step_metrics, "sched_wait"):
-            while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
+            while self.waiting and budget > 0 and len(scheduled_running) < self.max_num_seqs:
                 req = self._pick_waiting()
                 if req is None:
                     if logger.isEnabledFor(logging.DEBUG):
@@ -925,6 +929,8 @@ class Scheduler:
                 want = min(req.num_projected_prompt_remaining, budget, self.long_prefill_token_threshold)
                 cache_slots = self._alloc_resources_on_admission(req, want=want)    # alloc cache slots and req slot, if failed, return None
                 if cache_slots is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"step_id: {self.sch_metrics.step_id}, no more slots for {req.request_id}, skip over")
                     break                                 # no room, stop admitting
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -937,7 +943,8 @@ class Scheduler:
                 budget -= want
 
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"schedule1, scheduled: {len(scheduled_running)}, running: {len(self.running)}, waiting: {len(self.waiting)}")
+            logger.debug(f"before sched_ret, step_id: {self.sch_metrics.step_id}, scheduled: {len(scheduled_running)}, "
+                         f"running: {len(self.running)}, waiting: {len(self.waiting)}, num_projected_finished: {num_projected_finished}")
 
         if not scheduled_running:
             return None     # no work to do
@@ -978,16 +985,18 @@ class Scheduler:
             scheduled: dict[str, ScheduledInfo] = {}
 
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}")
+                logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}, step_id: {self.sch_metrics.step_id}")
         
         # 1) running first — protect in-flight decodes' TPOT.
         #    Note: Ps and Ds may interleave.
+        num_projected_finished = 0
         with timed(step_metrics, "sched_run"):
             scheduled_running: list[ModelRequest] = []
             for req in list(self.running):  # snapshot
                 # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
                 assert not req.finished
                 if req.projected_finished:
+                    num_projected_finished += 1
                     continue
 
                 # the request that was preempted in the current or previous step should be skipped.
@@ -1030,6 +1039,8 @@ class Scheduler:
                     new_slots = self.cache.allocate_slots(req, want)
 
                 if new_slots is None:                   # yield, according to "victim is None"
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"step_id: {self.sch_metrics.step_id}, no more slots for {req.request_id}, skip over")
                     continue
 
                 s_info = ScheduledInfo(want=want, cache_slots=new_slots)
@@ -1042,7 +1053,7 @@ class Scheduler:
 
         # 2) waiting next — fill remaining budget with (chunked) prefills
         with timed(step_metrics, "sched_wait"):
-            while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
+            while self.waiting and budget > 0 and len(scheduled_running) < self.max_num_seqs:
                 req = self._pick_waiting()
                 if req is None:
                     if logger.isEnabledFor(logging.DEBUG):
@@ -1053,6 +1064,8 @@ class Scheduler:
                 want = min(req.num_projected_prompt_remaining, budget, self.long_prefill_token_threshold)
                 cache_slots = self._alloc_resources_on_admission(req, want=want)    # alloc cache slots and req slot, if failed, return None
                 if cache_slots is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"step_id: {self.sch_metrics.step_id}, no more slots for {req.request_id}, skip over")
                     break                                 # no room, stop admitting
 
                 self.running.append(req)
@@ -1066,7 +1079,8 @@ class Scheduler:
                 budget -= want
 
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"schedule1, scheduled: {len(scheduled_running)}, running: {len(self.running)}, waiting: {len(self.waiting)}")
+            logger.debug(f"before sched_ret, step_id: {self.sch_metrics.step_id}, scheduled: {len(scheduled_running)}, "
+                         f"running: {len(self.running)}, waiting: {len(self.waiting)}, num_projected_finished: {num_projected_finished}")
 
         if not scheduled_running:
             return None     # no work to do
@@ -1084,6 +1098,9 @@ class Scheduler:
                 scheduled=scheduled, block_tables=block_tables,
                 config=self.config, scheduler=self,
                 step_metrics=step_metrics)
+
+    def count_projected_finished(self) -> int:
+        return sum(1 for req in self.running if req.projected_finished)
 
     def log_metrics(self, sch_out: SchedulerOutput, is_exiting: bool=False):
         self.log_step_metrics(sch_out=sch_out)

@@ -50,14 +50,14 @@ class SamplingParamTable:
     def __init__(self, config: ModelConfig):
         '''Called once in the constructor of Scheduler'''
 
-        bsz = config.max_num_seqs
-        self.fields_device = torch.empty(len(self.FLOAT32_FIELDS), bsz, dtype=torch.float32, device=config.device)
-        self.fields_stage = torch.empty(len(self.FLOAT32_FIELDS), bsz, dtype=torch.float32, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(len(self.FLOAT32_FIELDS), bsz, dtype=torch.float32)
+        capacity = config.max_num_req_slots
+        self.fields_device = torch.empty(len(self.FLOAT32_FIELDS), capacity, dtype=torch.float32, device=config.device)
+        self.fields_stage = torch.empty(len(self.FLOAT32_FIELDS), capacity, dtype=torch.float32, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(len(self.FLOAT32_FIELDS), capacity, dtype=torch.float32)
 
-        self.top_k_device = torch.empty(bsz, dtype=torch.int64, device=config.device)
-        self.top_k_stage = torch.empty(bsz, dtype=torch.int64, pin_memory=True) \
-            if torch.cuda.is_available() else torch.empty(bsz, dtype=torch.int64)
+        self.top_k_device = torch.empty(capacity, dtype=torch.int64, device=config.device)
+        self.top_k_stage = torch.empty(capacity, dtype=torch.int64, pin_memory=True) \
+            if torch.cuda.is_available() else torch.empty(capacity, dtype=torch.int64)
 
         self.top_k_cutoff = min(MAX_EFFECTIVE_TOP_K, config.vocab_size)
 

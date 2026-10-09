@@ -49,7 +49,8 @@ class LLMEngine:
     @torch.inference_mode()
     def forward(self, sch_out: SchedulerOutput | None) -> int:
         if sch_out is None:
-            logger.info(f"no available request in running or waiting, step_id: {self.scheduler.sch_metrics.step_id}")
+            logger.info(f"no request scheduled, step_id: {self.scheduler.sch_metrics.step_id}"
+                        f" (running: {len(self.scheduler.running)}, waiting: {len(self.scheduler.waiting)}, num_projected_finished: {self.scheduler.count_projected_finished()})")
             return 0
                 
         assert sch_out.step_metrics is not None
@@ -92,7 +93,7 @@ class LLMEngine:
 
     def pop_landable_step(self, cur_sch_out: SchedulerOutput | None) -> SchedulerOutput | None:
         if not self.in_flight_steps:
-            logger.info(f"no in-flight request, step_id: {self.scheduler.sch_metrics.step_id}")
+            logger.info(f"no request in-flight, step_id: {self.scheduler.sch_metrics.step_id}")
             return None
 
         if cur_sch_out is self.in_flight_steps[0]:

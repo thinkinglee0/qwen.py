@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from qwen.sampling import (apply_top_p, apply_top_k, apply_fused_top_k_and_p, apply_penalties, sample,
                           SamplingParams, SamplingParamTable, SamplingTensors)
-from qwen.constants import MAX_EFFECTIVE_TOP_K
+from qwen.constants import MAX_EFFECTIVE_TOP_K, DEFAULT_PIPELINE_DEPTH
 from qwen.utils import pad_token_ids
 from constants import *
 from qwen.utils import resolve_device, default_dtype
@@ -345,7 +345,8 @@ def test_fused_equivalent_to_sequential_reference(k_list, p_list):
 
 def _stub_config(vocab_size=151936, max_num_seqs=8, top_k=20):
     """SamplingParamTable only reads these few fields, so the test stays free of real weights."""
-    return SimpleNamespace(vocab_size=vocab_size, max_num_seqs=max_num_seqs, device=resolve_device(),
+    return SimpleNamespace(vocab_size=vocab_size, max_num_seqs=max_num_seqs,
+                           max_num_req_slots=max_num_seqs * DEFAULT_PIPELINE_DEPTH, device=resolve_device(),
                            temperature=1.0, top_p=1.0, repetition_penalty=1.0, frequency_penalty=0.0, presence_penalty=0.0,
                            top_k=top_k)
 

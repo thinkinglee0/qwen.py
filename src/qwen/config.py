@@ -139,6 +139,11 @@ class ModelConfig():
         if self.compile_rope is None:
             self.set_default_compile_rope()
 
+    @property
+    def max_num_req_slots(self) -> int:
+        """max number of request slots in the scheduler"""
+        return self.max_num_seqs * DEFAULT_PIPELINE_DEPTH
+
     def set_default_compile_rope(self):
         assert self.device is not None, "device is not set"
         self.compile_rope = self.device.type == "cuda"  # enable rope compilation for CUDA
