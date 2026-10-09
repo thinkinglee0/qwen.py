@@ -72,67 +72,31 @@ grep -q 'venv/main/bin/activate' ~/.bashrc \
 
 任何一项不合格 → **destroy 重租,别将就**。此时沉没成本为零。
 
+脚本在仓库里,所以先 clone(§2 直接复用这份 checkout):
+
 ```bash
-# --- disk: the writable overlay layer is the ONLY line that matters.
-# /dev/nvme* mounted on /etc/hosts or /usr/bin/nvidia-smi are the HOST's
-# filesystems bind-mounted in; you cannot use a byte of them.
-df -h | head -5
-#   expect: overlay  150G  ...  /
-
-# --- shm: docker defaults to 64 MB, which kills vLLM outright
-df -h /dev/shm          # expect >= 16G
-
-# --- GPU identity. Do NOT trust the label: A10 (150W) and A10G (300W)
-# are both listed as "A10" on some platforms.
-nvidia-smi --query-gpu=name,power.limit,power.max_limit,pcie.link.width.current \
-  --format=csv
-#   expect: NVIDIA GeForce RTX 4090, 450.00 W, 450.00 W, 16
-
-nvidia-smi -q -d POWER | grep -E "Current|Default|Min|Max Power Limit"
-#   4090 exposes a 150-450 W range, but see section 6: writing it needs
-#   CAP_SYS_ADMIN, which Vast containers do not grant.
-
-# --- CPU. Single-thread perf drives the Python decode loop, so what matters is
-# clock x IPC, NOT core count. Read "CPU max MHz" AND the scaling line: a shared
-# host pinned at 80 % by neighbour load is a ~2x slowdown on the decode loop that
-# no amount of cores fixes.
-nproc && lscpu | grep -E "Model name|CPU max MHz|scaling MHz|^NUMA node|L3 cache"
-
-# --- What this container may ACTUALLY use. Ask the kernel; do not guess the cgroup
-# path (log1003 read nothing because 1b used the v2 path on a v1 host, and the error
-# went to stderr while the capture only redirected stdout).
-python3 -c "import os; a=sorted(os.sched_getaffinity(0)); print(len(a),'cpus:',a)"
-
-# The platform's "12.0/48 CPU" is usually a CFS QUOTA, not a cpuset: you see all 48
-# cores and may run on any, but total CPU time is capped. quota/period = your cores.
-# A single-threaded decode loop can never reach a >1-core quota, so a quota alone
-# does NOT explain a slow host -- check the clock instead.
-cat /sys/fs/cgroup/cpu.max 2>&1                    # cgroup v2: "<quota> <period>"
-cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>&1       # cgroup v1: divide by 100000
-cat /sys/fs/cgroup/cpuset.cpus.effective 2>&1      # v2
-cat /sys/fs/cgroup/cpuset/cpuset.cpus 2>&1         # v1
-
-# --- Neighbours. Take this AFTER the GPU is idle again: load that persists once your
-# own run has ended is somebody else's, and it is what holds the clock down.
-uptime
-
-# --- Pure-interpreter speed. The launch-overhead test below does NOT capture this --
-# it times one op in a tight loop, while the engine pays Python dispatch on ~4 400
-# aten calls per step. Record it on every host; it is the only number that compares
-# decode-loop speed across machines.
-for i in 1 2 3; do python -c "
-import time
-t = time.perf_counter()
-s = 0
-for i in range(3_000_000): s += i * 2
-print(f'{(time.perf_counter()-t)*1000:.0f} ms / 3M-iter loop')"; done
-#   reference: ~276 ms on EPYC 7402 @ 2.24 GHz effective (log1003, a SLOW host)
-#   a Zen 4 desktop part at 3.7-5.0 GHz lands roughly 2x lower
-
-# --- NUMA. Find the socket the GPU hangs off.
-nvidia-smi topo -m | head -3                 # read the "NUMA Affinity" column
-numactl --hardware | grep -E "^node . cpus|^node . free"
+cd /workspace
+git clone https://github.com/thinkinglee0/qwen.py.git && cd qwen.py
+bash env/vastai/check_instance.sh 2>&1 | tee host_check.log    # ~1 min; run on an IDLE instance
 ```
+
+`2>&1` 不能省:脚本里大量 `cat` 是"v1/v2 两条路径都试",报错本身就是信息。`host_check.log` 随结果一起带走(§7)。
+
+逐节判读(编号对应脚本里的 section):
+
+| § | 看什么 | 不合格 |
+|---|---|---|
+| 1 | `/` 的 overlay 大小 | 远小于租的 150 G |
+| 2 | `/dev/shm` | TP=1 有 1–2 G 够用;TP>1 要更大 |
+| 3 | name / power / `pcie.link.width` | 不是 4090、width < 16 |
+| 4 | `CPU max MHz`、boost、governor | **不要**用 `scaling MHz` 判断负载;acpi-cpufreq 下 `max MHz` 是 base,不含 boost |
+| 5 | `clock_while_running`、`scheduled` | 单核远低于该型号 boost;`scheduled` < ~98 % |
+| 7 | 自己空闲时别的核的 `busy`,尤其你那些核的 SMT sibling | 大片被占 → 绑到 sibling 空闲的核,或重租 |
+| 8 | `cpu.stat` 的 `nr_throttled` 在涨 | 有 quota 时把 `OMP_NUM_THREADS` 压到 quota 核数以下(§3) |
+| 9 | 3M 次循环毫秒数 + `python3 -VV` | 显著慢于参考值 → 小 batch 的数字不可跨机器比 |
+| 10 | GPU 挂在哪个 NUMA node | 供 §5 的绑定使用 |
+
+为什么不看 `vmstat` 的 `st`:Vast 基本是**裸金属上的容器**,没有 hypervisor,steal 恒为 0。邻居是通过同核 CFS 争用、SMT sibling、L3/内存带宽、all-core boost 降档影响你的,对应脚本 §5、§7、§9。
 
 ### launch overhead 基线
 
@@ -164,7 +128,7 @@ uptime      # snapshot neighbour load alongside the number
 > 比前一台慢 **2.3×**,而 `gpu_busy` 一致到 ±2 %。原因:这个微基准只量**一个 op 在紧循环里**
 > 的驱动路径,而引擎每步要为 **约 4 400 次 `aten::` 调用**付解释器成本。
 >
-> 所以 §1b 的 CPU 块里那个 **3M 次纯 Python 循环**是独立的第二道门,必须一起看:
+> 所以 `check_instance.sh` §9 的 **3M 次纯 Python 循环**是独立的第二道门,必须一起看:
 >
 > | 两项 | 含义 |
 > |---|---|
@@ -172,9 +136,11 @@ uptime      # snapshot neighbour load alongside the number
 > | launch 过线但解释器慢 ~2× | **设备侧结论仍可信**(kernel 不变),但**主机瓶颈区的数字不可跨机器迁移** —— batch 小的那一半全是这台 CPU 的 Python 速度 |
 > | launch > 10 μs | destroy 重租 |
 >
-> 解释器慢的根因看 `CPU max MHz` × `scaling MHz` 和 `uptime`:log1003 是
-> max 2800 × 80 % ≈ **2.24 GHz**,而 `load average 12.1`(自己跑完 12 分钟后测的)说明
-> 那是邻居把时钟压住的。
+> 解释器慢的根因看 `check_instance.sh` §5(实测时钟 / 被调度占比)、§7(邻居)、§8(quota 节流)。
+> **log1003 的"2.24 GHz、邻居把时钟压住"是错误推断**:2800 是 acpi-cpufreq 报的 7402 base(boost 3.35 GHz),
+> 80 % 是 `scaling MHz` 的瞬时读数,不是负载;就算真是 80 %,也只解释 1.25×。时钟从没实测过。
+> 对比的上一台是 Ryzen 5 7500F(Zen 4,boost 5.0 GHz):单看 boost 1.5×,再乘 Zen 2→4 约 1.3× 的 IPC,
+> 估算 ~2×,**CPU 档次本身就足以解释大部分 2.3×**(估算,未实测)。
 
 > 注意 7B 和 0.5B 处于不同 regime:0.5B 只有 ~1.0 GB 权重,GPU 侧约 1.0 ms < CPU 侧 4.3 ms,**完全 CPU-bound**。用 0.5B 跑性能对比,测到的是 Python 循环 vs CUDA graph,不是 scheduler 设计。
 
@@ -183,8 +149,7 @@ uptime      # snapshot neighbour load alongside the number
 ## 2. 装依赖(5 分钟)
 
 ```bash
-cd /workspace
-git clone https://github.com/thinkinglee0/qwen.py.git && cd qwen.py
+cd /workspace/qwen.py      # cloned in 1b
 ```
 
 ### 2a. torch 版本对齐
@@ -425,7 +390,7 @@ taskset -c 0,1,2,24,25,26 pytest -x -v          # log1003's CCX0: cores 0-2 + si
 
 两点注意:
 
-- **这是压方差兼提均值,但量级有限。** log1003 的 2.3× 主项是时钟(2.24 GHz),CCX 绑定大概找回 10–20 %,抹不平它。先看时钟,再谈绑定。
+- **这是压方差兼提均值,但量级有限。** log1003 的 2.3× 主项大概率是 CPU 档次(Zen 2 @ ≤3.35 GHz vs Zen 4 @ 5.0 GHz,见 §1b),CCX 绑定大概找回 10–20 %,抹不平它。先看 `check_instance.sh` §5 的实测时钟,再谈绑定。
 - **同 §3 的纪律:加就两边都加。** qwen.py 和 vLLM 必须用同一条绑定策略,并记进结果元数据(§7)。
 
 ### GPU 上第一次跑要预期失败
@@ -696,14 +661,15 @@ clocks_throttle_reasons.sw_power_cap,clocks_throttle_reasons.hw_thermal_slowdown
 - qwen.py 和三条 vLLM 臂**必须在同一次租用、同一台 host、同一个连续时间窗口内跑完**。宿主 CPU 换一台就全部作废 —— log1003 实测:同一份代码换台机器,`gpu_busy` 一致到 ±2 %,但 `wall_clean` 差 **2.3×**
 - **一次只跑一个引擎**。两边同时占 GPU,数据全废
 - **profiling 和计时分开跑**。nsys 和 torch.profiler 的 CUPTI 回调在每次 kernel launch 上加几微秒,带 profiler 测出的 throughput 不能当 benchmark 结果报
-- 每轮记 `uptime`,事后判断某点是否被邻居污染。**log1003 漏了这一项**,补采时才发现 load average `12.11 / 12.81 / 12.96` 是在自己跑完 12 分钟后测的 —— 全是邻居,而那正是时钟被压在 80 % 的原因。漏了它,"这台为什么慢一倍"就只剩推断
-- **别只采 GPU 侧。** 上面那条 `nvidia-smi` 给的是 `clocks.current.sm` 和 throttle reason,但主机侧的降频它看不见。每轮另记一次 `lscpu | grep "scaling MHz"` + `uptime`:
+- 每轮记 `uptime`,事后判断某点是否被邻居污染。**log1003 漏了这一项**,补采时 load average `12.11 / 12.81 / 12.96` 是在自己跑完 12 分钟后测的 —— 说明有邻居,但**说明不了时钟被压住**:load 不是频率,它的代价走 CFS 争用 / SMT / 缓存(`check_instance.sh` §7)
+- **别只采 GPU 侧。** 上面那条 `nvidia-smi` 给的是 `clocks.current.sm` 和 throttle reason,主机侧它看不见。每轮另记一次实测时钟、quota 节流计数和 `uptime`(`/tmp/freq` 由 `check_instance.sh` §5 编译;**不要**记 `scaling MHz`,那是瞬时频率比,不是负载):
 
 ```bash
-{ date -Is; uptime; lscpu | grep -E "scaling MHz|CPU max MHz"; } >> host_clock_c${C}.log
+{ date -Is; uptime; /tmp/freq;
+  cat /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/cpu/cpu.stat 2>/dev/null | grep -E "nr_throttled|throttled_(usec|time)"; } >> host_clock_c${C}.log
 ```
 
-判读吞吐差异之前先对一遍这两个数,否则引擎的差距和宿主的降频分不开
+判读吞吐差异之前先对一遍这几个数,否则引擎的差距和宿主的问题分不开。`/tmp/freq` 测的是它落到的那个核,不是引擎线程那个核;要看引擎线程本身是否在排队,用 `check_instance.sh` §7 末尾的 `schedstat` 公式
 
 **`nvidia-smi -pl` 在 Vast 容器里不可用** —— 报 `Insufficient Permissions`,容器缺 `CAP_SYS_ADMIN`,容器内 root 不等于 capability。`-lgc` 锁频走同一条权限路径,同样不行。要做 power sweep 得换 AWS g5(VM + 直通,guest 有 root)或裸金属。
 
@@ -717,7 +683,7 @@ overlay 可写层随 destroy 消失。**离开前确认:**
 - [ ] benchmark 结果 CSV / JSON 上传(`git`、对象存储、或 `scp` 到本地)
 - [ ] `/opt/constraints.txt` 存一份 —— 下次重建时 diff 一下就知道模板变了没有
 - [ ] 记下 instance ID、host ID、`nvidia-smi -q` 快照、`lscpu` 输出、launch overhead 中位数 —— **这些是判断下次的数据能否和这次拼接的唯一依据**
-- [ ] 加记主机侧四项(log1003 的教训,缺一项就只能靠推断):**`CPU max MHz` × `scaling MHz`**、**3M 次 Python 循环的毫秒数**、**跑完之后的 `uptime`**、**绑定策略**(无绑定 / `--cpunodebind` / `taskset` 到哪个 CCX)。launch overhead 过线**不能**代替这四项 —— 它只量一个 op,量不到解释器
+- [ ] 加记主机侧四项(log1003 的教训,缺一项就只能靠推断):**`host_check.log`(`check_instance.sh` 全量输出,含 §5 实测时钟)**、**3M 次 Python 循环的毫秒数 + `python3 -VV`**、**跑完之后的 `uptime`**、**绑定策略**(无绑定 / `--cpunodebind` / `taskset` 到哪个 CCX)。launch overhead 过线**不能**代替这四项 —— 它只量一个 op,量不到解释器
 - [ ] 跑过 vLLM 对照的话,记下 `vllm.__version__` + 它那个 venv 里的 `torch.__version__` / `torch.version.cuda`,解释器的来源和版本(系统 python 还是 micromamba fallback,§6a —— 它决定链到哪个 `libstdc++`),以及 `OMP_NUM_THREADS` 是继承还是显式清空(§6a) —— **和记 instance ID 同等性质:A/B 可复现的唯一依据**
 
 权重不用备份,重下比传快。`$VLLM_VENV` 也不用,`rm -rf` 掉省 10–15 GB。
@@ -747,9 +713,9 @@ overlay 可写层随 destroy 消失。**离开前确认:**
 | `python -m venv` 报 `ensurepip is not available` | conda/rattler build 裁掉了 ensurepip | 同上,改用系统 python |
 | vLLM 起不来 / 卡在 worker 初始化 | `/dev/shm` 是 docker 默认的 64 MB | 容器内 remount 不了(缺 `CAP_SYS_ADMIN`,和 `-pl` 同一条权限路径)。destroy 重租并设 shm ≥ 16 G;单卡临时解法是绕开多进程 executor,**具体开关随 vLLM 版本变,在机器上现查** |
 | `no kernel image is available` | wheel arch list 无 sm_89 | 换 wheel 源 |
-| 换台机器后吞吐腰斩,但 `gpu_busy_from_trace` 一致到 ±2 % | **主机侧慢,不是 GPU 慢。** GPU 在干同样的活,Python 跑得慢一半 | 查 `CPU max MHz` × `scaling MHz`(log1003: 2800 × 80 % = 2.24 GHz)、3M 循环毫秒数、跑完后的 `uptime`。设备侧结论仍可信,主机瓶颈区(小 batch)的数字不可跨机器迁移(§1b、§6e) |
-| launch overhead 7.5 μs 过线,但引擎就是慢 | 微基准只量一个 op 的驱动路径,量不到约 4 400 次 `aten::` 调用的解释器成本 | 跑 §1b 的 3M 次 Python 循环,那才是 decode 循环的尺子 |
-| `cat /sys/fs/cgroup/cpuset.cpus.effective` 无输出 | 用了 cgroup **v2** 的路径,而宿主是 **v1**;且 `cat` 的报错走 stderr,只重定向 stdout 就看不见 | 用 `os.sched_getaffinity(0)` 问内核,并给捕获加 `2>&1`(§1b) |
+| 换台机器后吞吐腰斩,但 `gpu_busy_from_trace` 一致到 ±2 % | **主机侧慢,不是 GPU 慢。** GPU 在干同样的活,Python 跑得慢一半 | 跑 `check_instance.sh`:§5 实测时钟 / scheduled、§8 quota 节流、§9 3M 循环毫秒数。**不要**用 `CPU max MHz` × `scaling MHz` 估时钟(log1003 就这样误判成"邻居压时钟")。设备侧结论仍可信,主机瓶颈区(小 batch)的数字不可跨机器迁移(§1b、§6e) |
+| launch overhead 7.5 μs 过线,但引擎就是慢 | 微基准只量一个 op 的驱动路径,量不到约 4 400 次 `aten::` 调用的解释器成本 | 跑 `check_instance.sh` §9 的 3M 次 Python 循环,那才是 decode 循环的尺子 |
+| `cat /sys/fs/cgroup/cpuset.cpus.effective` 无输出 | 用了 cgroup **v2** 的路径,而宿主是 **v1**;且 `cat` 的报错走 stderr,只重定向 stdout 就看不见 | 用 `os.sched_getaffinity(0)` 问内核,并给捕获加 `2>&1`(`check_instance.sh` §6) |
 | `numactl --hardware` 只有 1 个 node,"没什么可绑的" | 单 node 只说明**内存**局部性没得优化;**L3 局部性是另一条轴**(EPYC 7402 有 8 个独立 L3) | `taskset` 绑到一个 CCX,见 §3「单 NUMA node 的机器上,要绑的是 CCX」 |
 
 ---
