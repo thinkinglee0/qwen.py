@@ -9,6 +9,7 @@ from qwen.attention import AttentionMetadata
 from qwen.utils import RMSNorm
 from qwen.sampling import apply_penalties, sample2, SamplingTensors
 from qwen.rope import init_rope
+from qwen.metrics import SchedulerStepMetrics, timed
 
 logger = logging.getLogger(__name__)
 
@@ -68,19 +69,21 @@ class QwenForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor):
         return self.lm_head(hidden_states)  # shape [T, vocab_size]
 
-    def sampler(self, logits: torch.Tensor, sampling_tensors: SamplingTensors) -> torch.Tensor:
+    def sampler(self, logits: torch.Tensor, sampling_tensors: SamplingTensors, step_metrics: SchedulerStepMetrics | None = None) -> torch.Tensor:
         if not self.config.do_penalities and not self.config.do_sample:     # shortcut for greedy decoding without penalties
             return logits.argmax(dim=-1)
 
         if self.config.do_penalities:
             assert sampling_tensors is not None
-            logits = apply_penalties(logits, sampling_tensors, self.config.vocab_size)
+            with timed(step_metrics, "smp_pen"):
+                logits = apply_penalties(logits, sampling_tensors, self.config.vocab_size)
 
-        if self.config.do_sample:
-            assert sampling_tensors is not None
-            next_tokens = sample2(logits, sampling_tensors)
-        else:
-            next_tokens = logits.argmax(dim=-1)
+        with timed(step_metrics, "smp_pick"):
+            if self.config.do_sample:
+                assert sampling_tensors is not None
+                next_tokens = sample2(logits, sampling_tensors)
+            else:
+                next_tokens = logits.argmax(dim=-1)
 
         return next_tokens
 

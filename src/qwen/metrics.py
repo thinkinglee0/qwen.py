@@ -17,14 +17,17 @@ class StepEvents:
     """CUDA events for one step. record() is async; read() must run after a sync (e.g.: next_tokens.tolist())."""
 
     # shared across all instances
-    SEGMENTS = ("fwd", "logits", "sample", "rope", "bld_meta", "dth")
+    SEGMENTS = ("fwd", "logits", "smp", "smp_prep", "smp_run", "smp_pen", "smp_pick", "smp_post", "rope", "bld_meta", "dth")
 
     def __init__(self):
         if not torch.cuda.is_available():
             return
 
-        # enable_timing=True is required for elapsed_time(); it costs nothing extra.
-        self._ev = {}
+        # pre-allocate events for each segment avoiding gc while allocating events in the middle of a step.
+        # Each segment has a pair of events (start, stop).
+        self._ev = {
+            seg: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for seg in self.SEGMENTS
+        }
 
     def start(self, seg: str):
         if not torch.cuda.is_available():
@@ -33,7 +36,6 @@ class StepEvents:
         if seg not in self.SEGMENTS:
             return
 
-        self._ev[seg] = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         self._ev[seg][0].record()  # type: ignore[call-arg]
 
     def stop(self, seg: str):
@@ -98,8 +100,19 @@ class SchedulerStepMetrics:
     rope_gpu: float = 0.
     logits: float = 0.
     logits_gpu: float = 0.
-    sample: float = 0.
-    sample_gpu: float = 0.
+    smp: float = 0.
+    smp_gpu: float = 0.
+    smp_prep: float = 0.
+    smp_prep_gpu: float = 0.
+    smp_run: float = 0.
+    smp_run_gpu: float = 0.
+    smp_pen: float = 0.
+    smp_pen_gpu: float = 0.
+    smp_pick: float = 0.
+    smp_pick_gpu: float = 0.
+    smp_post: float = 0.
+    smp_post_gpu: float = 0.
+    upd_proj: float = 0.
     dth: float = 0.
     dth_gpu: float = 0.
     dth_wait: float = 0.

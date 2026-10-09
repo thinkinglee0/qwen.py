@@ -70,18 +70,24 @@ class LLMEngine:
             last_idx = md.cu_seqlens_q[1:] - 1          # [B]
             logits = self.model.compute_logits(hidden[last_idx])   # [B, vocab]
 
-        with timed(sch_out.step_metrics, "sample"):
-            sampling_tensors = sch_out.build_sampling_tensors()
-            next_tokens = self.model.sampler(logits, sampling_tensors)          # [B]
-            assert sch_out.slot_idx is not None and sch_out.want is not None and sch_out.needs_sample_device is not None
-            sch_out.dth_buf = self.scheduler.tok_id_tab.add_sampled_tokens_on_device(
-                slot_idx=sch_out.slot_idx, needs_sample=sch_out.needs_sample_device,
-                next_tokens=next_tokens, want=sch_out.want,
-                step_metrics=sch_out.step_metrics)
+        with timed(sch_out.step_metrics, "smp"):
+            with timed(sch_out.step_metrics, "smp_prep"):
+                sampling_tensors = sch_out.build_sampling_tensors()
 
-        sch_out.update_projected_state_in_advance()
-        self.in_flight_steps.append(sch_out)
-        sch_out.incr_num_in_flight()
+            with timed(sch_out.step_metrics, "smp_run"):
+                next_tokens = self.model.sampler(logits, sampling_tensors, sch_out.step_metrics)          # [B]
+
+            with timed(sch_out.step_metrics, "smp_post"):
+                assert sch_out.slot_idx is not None and sch_out.want is not None and sch_out.needs_sample_device is not None
+                sch_out.dth_buf = self.scheduler.tok_id_tab.add_sampled_tokens_on_device(
+                    slot_idx=sch_out.slot_idx, needs_sample=sch_out.needs_sample_device,
+                    next_tokens=next_tokens, want=sch_out.want,
+                    step_metrics=sch_out.step_metrics)
+
+        with timed(sch_out.step_metrics, "upd_proj"):
+            sch_out.update_projected_state_in_advance()
+            self.in_flight_steps.append(sch_out)
+            sch_out.incr_num_in_flight()
         return sch_out.batch_size
 
     def pop_landable_step(self, cur_sch_out: SchedulerOutput | None) -> SchedulerOutput | None:
