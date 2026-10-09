@@ -497,10 +497,14 @@ class SchedulerOutput:
             slot_idx_stage=self.slot_idx_stage_snapshot, want_stage=self.want_stage_snapshot,
             needs_sample_stage_snapshot=self.needs_sample_stage_snapshot)
 
+        wants = self.want_stage_snapshot.tolist()
         for i, req in enumerate(self.reqs):
             assert not req.projected_finished
 
-            req.num_scheduled_tokens += int(self.want_stage_snapshot[i].item())
+            # NOTE: use list instead of tensor to avoid the overhead of aten::item/select/as_strided
+            # req.num_scheduled_tokens += int(self.want_stage_snapshot[i].item())
+            req.num_scheduled_tokens += wants[i]
+
             assert self.needs_sample_lst is not None
             if not req.projected_is_decoding and self.needs_sample_lst[i]:
                 req.projected_is_decoding = True
