@@ -320,20 +320,22 @@ def target_engine_for_sharegpt_benchmarking(
     tmp_target_config.req_metrics_interval = 60.
     tmp_target_config.is_benchmarking = True
     # tmp_target_config.do_sample = False
-    tmp_target_config.compile_rope = True   # enable rope compilation for benchmarking
 
+    engine = None
     try:
         engine = LLMEngine(tmp_target_config)
         yield engine
     finally:
         # explicitly release kv cache
-        engine.teardown()
-        del engine
+        if engine is not None:
+            engine.teardown()
+            del engine
 
         gc.collect()
         gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 
 @pytest.fixture(scope="function")
