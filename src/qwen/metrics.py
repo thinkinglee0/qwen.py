@@ -29,12 +29,16 @@ class StepEvents:
             seg: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for seg in self.SEGMENTS
         } if torch.cuda.is_available() else {}
 
+        self.used_seg = set()  # segments used in this step
+
     def start(self, seg: str):
         if not torch.cuda.is_available():
             return
 
         if seg not in self.SEGMENTS:
             return
+
+        self.used_seg.add(seg)
 
         self._ev[seg][0].record()  # type: ignore[call-arg]
 
@@ -61,8 +65,11 @@ class StepEvents:
         if not torch.cuda.is_available():
             return {}
 
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     logger.debug(f"unused: {[s for s in self.SEGMENTS if s not in self.used_seg]}, used: {self.used_seg}")
+
         """Call ONLY after the stream has been drained -- otherwise this syncs."""
-        return {f"{s}_gpu": a.elapsed_time(b) for s, (a, b) in self._ev.items()}
+        return {f"{s}_gpu": a.elapsed_time(b) for s, (a, b) in self._ev.items() if s in self.used_seg}  # elapsed_time returns ms
 
 @dataclass
 class SchedulerStepMetrics:
