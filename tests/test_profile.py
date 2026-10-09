@@ -269,8 +269,8 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
                     f"gpu_sum_from_trace_us={gpu_sum_per_step_us:.1f} us/step, "
                     f"gpu_idle_fraction={1 - gpu_utilization:.1%}, batch_size: {batch_size}")
         logger.info(f"key_averages len: {len(ka)} distinct rows")
-        logger.info(ka.table(sort_by=_ATTR, row_limit=-1))
-        # logger.info(ka.table(sort_by="self_cpu_time_total", row_limit=-1))
+        logger.info(ka.table(sort_by=_ATTR, row_limit=-1, max_name_column_width=100))
+        # logger.info(ka.table(sort_by="self_cpu_time_total", row_limit=-1, max_name_column_width=100))
     finally:
         # explicitly release kv cache
         if engine is not None:
