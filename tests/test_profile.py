@@ -89,6 +89,24 @@ def parse_chrome_trace(trace_path: Path, profile_steps:int=0):
                       wall_us=wall,
                       gpu_names={e["name"] for e in gpu_events})
 
+class GCCallback:
+    def __init__(self):
+        self.start_times = {}
+
+    def __call__(self, phase, info):
+        gen = info.get("generation")
+        if gen != 2:
+            return  # only track Gen2, which is the one that matters for long-lived objects
+
+        if phase == "start":
+            self.start_times[gen] = time.perf_counter()
+        elif phase == "stop":
+            start_time = self.start_times.pop(gen, None)
+            if start_time is not None:
+                duration_ms = (time.perf_counter() - start_time) * 1000
+                # Record metrics here (e.g., Prometheus histogram, OpenTelemetry gauge)
+                logger.info(f"GC Gen {gen} took {duration_ms:.2f}ms, collected {info.get('collected')} objects")
+
 CHROME_TRACE_FILE_NAME = "decode_tracing_chrome.{}.json"
 DECODE_STACK_CUDA_FILE_NAME = "decode_stacks_cuda.{}.txt"
 DECODE_STACK_CPU_FILE_NAME = "decode_stacks_cpu.{}.txt"
@@ -121,8 +139,7 @@ def test_profile_decode_idle_fraction(tmp_target_config_for_sharegpt_benchmarkin
     logger.info(f"batch_size: {batch_size}, use_d_first_schedule: {use_d_first_schedule}")
 
     # register gc callback
-    gc_callback = lambda phase, info: logger.info(f"gc callback: phase={phase}, info={info}")
-    gc.callbacks.append(gc_callback)
+    gc.callbacks.append(GCCallback())
 
     # MEASURE_STEPS (run A, clean) carries the timing statistics -- it is the only
     # window free of profiler overhead, and one step_metrics line is dumped per step
