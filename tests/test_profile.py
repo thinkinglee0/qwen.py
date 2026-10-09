@@ -405,6 +405,13 @@ def _load_step_metrics(run_dir: Path, batch: str | None, lines_spec: str | None)
     # keep only pure-decode steps: a step that carries prefill tokens is a different
     # workload and its timings are not comparable to steady-state decode
     numbered = [(ln, r) for ln, r in numbered if r.get("n_p") == 0]
+    label = (f"{path.parent.name}/{path.name}: lines {start + 1}-{stop} of {len(lines)}, "
+             f"{len(numbered)} decode steps")
+    return _run_stats(label, path, numbered)
+
+
+def _run_stats(label: str, path: Path, numbered: list[tuple[int, dict]]) -> RunStats:
+    """(line number, row) pairs -> per-field stats and raw series."""
     rows = [r for _, r in numbered]
 
     # summarize() uses a ddof=1 sample std, which needs two points
@@ -417,8 +424,6 @@ def _load_step_metrics(run_dir: Path, batch: str | None, lines_spec: str | None)
     assert float_keys, f"no float fields in {path}"
 
     series = {k: [float(r[k]) for r in rows] for k in float_keys}
-    label = (f"{path.parent.name}/{path.name}: lines {start + 1}-{stop} of {len(lines)}, "
-             f"{len(rows)} decode steps")
     # scale=1.0: summarize() defaults to s -> ms, but a step metrics dump is already ms
     return RunStats(label, path, numbered, {k: summarize(v, scale=1.0) for k, v in series.items()}, series)
 
@@ -433,9 +438,10 @@ def _rolling_median(a: np.ndarray, w: int) -> np.ndarray:
     return np.median(windows, axis=-1)
 
 
-def _write_anomalies(run: RunStats) -> Path:
+def _write_anomalies(run: RunStats) -> set[int]:
     """Flag the individual steps that spike on any field, next to the dump as
-    <dump>.anomaly (JSONL: the original row plus the fields that tripped)."""
+    <dump>.anomaly (JSONL: the original row plus the fields that tripped).
+    Returns the dump line numbers of the flagged steps."""
     local = {k: _rolling_median(np.asarray(xs, dtype=np.float64), ANOMALY_WINDOW)
              for k, xs in run.series.items()}
 
@@ -457,7 +463,18 @@ def _write_anomalies(run: RunStats) -> Path:
     out_path.write_bytes(b"".join(orjson.dumps(h) + b"\n" for h in hits))
     logger.info(f"{len(hits)}/{len(run.rows)} anomalous steps -> {out_path}")
     logger.info(f"  by field: {per_field.most_common()}") if hits else None
-    return out_path
+    return {h["line"] for h in hits}
+
+
+def _drop_anomalies(run: RunStats, anomalous: set[int]) -> RunStats:
+    """Recompute the stats without the flagged steps. One stalled step (a GC pause,
+    say) adds ~60 ms to every field whose window contains it, which is enough to
+    move a 20-step mean by 3 ms and make nested segments stop adding up."""
+    if not anomalous:
+        return run
+
+    kept = [(ln, r) for ln, r in run.rows if ln not in anomalous]
+    return _run_stats(f"{run.label}, {len(anomalous)} anomalous excluded", run.path, kept)
 
 
 def _report_dir_name(runs: list[str]) -> str:
@@ -491,6 +508,8 @@ def test_mean_step_metrics(log_dir: str):
     STEP_METRICS_OUT   where the report lands, relative to STEP_METRICS_DIR (default:
                        'slot_against_slot2' for the two runs above, the run's own
                        directory for a single run)
+    STEP_METRICS_KEEP_ANOMALIES  1 keeps the anomalous steps in the stats (default:
+                       each run drops its own flagged steps before the stats)
 
     The per-step anomaly dumps are NOT part of the report: they stay next to the
     step_metrics dump they were computed from, one per run.
@@ -499,6 +518,7 @@ def test_mean_step_metrics(log_dir: str):
     runs = [r.strip() for r in os.environ.get("STEP_METRICS_RUNS", "").split(",") if r.strip()]
     specs = [r.strip() for r in os.environ.get("STEP_METRICS_LINES", "").split(",") if r.strip()] or [None]
     batch = os.environ.get("STEP_METRICS_BATCH") or None
+    keep_anomalies = os.environ.get("STEP_METRICS_KEEP_ANOMALIES", "") not in ("", "0")
 
     run_dirs = [base / r for r in runs] if runs else [base]
     assert len(run_dirs) <= 2, f"pass one run, or two to compare, got {len(run_dirs)}"
@@ -514,13 +534,16 @@ def test_mean_step_metrics(log_dir: str):
     report_path = out_dir / REPORT_FILE_NAME.format(batch or "latest")
     with _tee_logs(report_path):
         logger.info(f"report -> {report_path}")
-        _report_step_metrics(run_dirs, batch, specs)
+        _report_step_metrics(run_dirs, batch, specs, keep_anomalies)
 
 
-def _report_step_metrics(run_dirs: list[Path], batch: str | None, specs: list[str | None]):
+def _report_step_metrics(run_dirs: list[Path], batch: str | None, specs: list[str | None],
+                         keep_anomalies: bool = False):
     loaded = [_load_step_metrics(d, batch, spec) for d, spec in zip(run_dirs, specs)]
-    for run in loaded:
-        _write_anomalies(run)
+    # flagged on the full series, so the .anomaly dump lists every flagged step either way
+    anomalies = [_write_anomalies(run) for run in loaded]
+    if not keep_anomalies:
+        loaded = [_drop_anomalies(run, lines) for run, lines in zip(loaded, anomalies)]
 
     if len(loaded) == 1:
         run = loaded[0]
