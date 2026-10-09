@@ -45,7 +45,9 @@
    **10 970 对 18 032 tok/s = 61 %**。
 2. **batch 512 上这个差距干净地分解成 1.23 × 1.17 = 1.44。** 1.23 是引擎设计，同条件测出（两边都
    eager、都 `FLASH_ATTN`、KV 容量相同、采样参数相同）。1.17 是 `torch.compile` + CUDA graph 给
-   vLLM 买到的东西 —— 一项 qwen.py 完全没有的能力。
+   vLLM 买到的东西 —— 一项 qwen.py 完全没有的能力。**`enforce_eager` 并不关掉 vLLM 的采样器
+   kernel**（FlashInfer + 五个 Triton kernel，两条臂都在用），所以它采样器的全部优势都在 1.23 里面，
+   没有一点在 1.17 里（§2.1）。
 3. **第二个因子在低并发下极其巨大：batch 1 上 7.28×**，然后单调衰减：batch 64 上 3.58×、256 上
    1.72×、512 上 1.17×、1024 上 0.98×。这是 [log1001 §7.3](./performance_analysis_log1001.zh.md)
    指出的那笔"每步固定税"（约 4 400 次 `aten::` 调用）第一次拿到外部价签。
@@ -135,6 +137,24 @@ Qwen2.5-0.5B-Instruct，bf16，`vocab_size = 151 936`。来自 `test_benchmark_s
 **A→B 的差值不是"CUDA graph"一项。** `enforce_eager=True` 同时关掉了 inductor 编译**和**图捕获，所以
 这批数据里两者不可分。本项目早先把这条臂叫做"CUDA graph 臂"；日志说它是 compile + graph。要拆开需要
 第三条臂（compile 开、`cudagraph_mode=NONE`）—— §6.4。
+
+**而 `enforce_eager` 完全没碰 vLLM 的采样器。** 两条臂都有这些行，每个 batch 点各一次：
+
+```
+[topk_topp_sampler.py:78] Using FlashInfer for top-p & top-k sampling.
+[jit_monitor.py:141] Triton kernel JIT compilation during inference: _topk_topp_kernel
+                                                                     _topp_sb_stats_kernel
+                                                                     _topp_sb_step_kernel
+                                                                     _topp_sb_mask_kernel
+                                                                     _gumbel_sample_kernel
+```
+
+也就是说 vLLM 在臂 A 和臂 B 里都通过自定义 kernel 采样，**它采样器的优势没有一点在 1.17× 里面** ——
+全部坐在 §3.2 标为"引擎设计"的那个 1.23× 里。§4 按此解读这个贡献者。
+
+那些 JIT 行出现在 `init engine … took 94.65 s` 之后、第一次 `generate()` 期间，也就是工具的 warmup
+调用里，所以编译尖峰在计时区间之外。臂 B 在 batch 128/256/512 的首轮偏慢（§2.3）更可能是 inductor 和
+图捕获的预热，不是 Triton JIT。
 
 ### 2.2 吞吐定义，以及把这个对比做废的三种方式
 
@@ -331,8 +351,54 @@ compile+graph 因子才是 batch 1 上那 12× 头条的来源，而它几乎全
 **3. 设备侧比头条数字显示的更接近，但不相等。** 臂 A 只在 sweep 顶端才是设备瓶颈，所以最干净的设备侧
 读数是 batch 512 的 1.23×。已识别两个贡献者：
 
-* **采样器，26.93 ms/步里的 16.32 ms（61 %）。** vLLM 在参数完全相同的情况下，采样器只占它一步的
-  一小部分。§3.3 把剩下这笔修复定价为 qwen.py 设备时间的约 1.8×。
+* **采样器，26.93 ms/步里的 16.32 ms（61 %）。** 在参数完全相同的情况下，vLLM 走的是 FlashInfer 加
+  五个 JIT 编译的 Triton kernel，**两条臂都是**（§2.1），而 qwen.py 走的是 eager 的 `aten::` 算子。
+  它在那边的成本没有被测量（§5.5），所以"1.23× 的大部分"**不是**这批数据支持的论断 —— 但采样器是
+  最大的单一候选者，而且 kernel 层面的差异现在是有证据的，不再是推断。
+
+  **但诊断不是"qwen.py 该用 Triton"，按那个读法行动会是个错误。** batch 512 上 logits 是
+  `[512, 151 936]` —— **bf16 下 155.6 MB，转成 fp32 后 311.2 MB**。按实测 919 GB/s，一遍全词表
+  elementwise pass 在 fp32 下读+写是 **0.68 ms**，在 bf16 或只读时是 **0.34 ms**。这个单位值得核对而
+  不是直接相信，而访存模式最明确的两个算子证实了它：死行的 `sum` 实测 **0.346 ms/次**、`argmax`
+  **0.357 ms/次**，对预测的只读 fp32 pass 0.339 ms。按这个尺度，采样器那 16.32 ms **大约是 24–48 遍
+  全词表 pass 的等效量**，区间来自其中有多少跑在 bf16 而不是 fp32。
+
+  这里面哪些能逐算子归因、哪些不能：`sampler()` **每步只调用一次**，作用在最后一个位置的
+  `[B, vocab]` logits 上 —— **不是每层一次** —— 所以 `key_averages` 会把它的算子和模型 24 层的算子
+  按同样的名字聚在一起。只有那些**每一次调用都属于采样器**的算子可以直接读：
+
+  | 算子 | ms/步 | 调用/步 | 其中采样器的 |
+  | --- | --- | --- | --- |
+  | `aten::multinomial`（CUDA total，含 `exponential_` 0.31） | 2.735 | 1 | 1 |
+  | `aten::topk` | 1.857 | 1 | 1 |
+  | `aten::_softmax`（窗口那个 + 全词表那个） | 1.254 | 2 | 2 |
+  | `aten::masked_fill_` | 0.672 | 3 | 3 |
+  | `aten::scatter_` | 0.046 | 3 | 3 |
+  | **可确定归因的合计** | **6.56** | | **占 16.32 的 40 %** |
+
+  剩下的 **9.76 ms** 落在模型也会用的算子类型里 —— `div`（3 次/步，采样器占 2）、`where`（9 / 4）、
+  `argmax`（2 / 1）、`sum`（2 / 1）、`fill_`（11 / 2）、`copy_`（**191 / 1**）—— 而 `key_averages`
+  拆不开它们。按次均摊也救不了，因为各次调用的规模差了几个数量级：`copy_` 的 191 次里，采样器只做了
+  那一次 311 MB 的 `.float()` 转换，模型做了另外 190 次小的。**本节早先的草稿把这些整步总量当成了
+  采样器自己的；它们不是。** 这批测量之后新加的 `sample_prep` / `sample_run` / `sample_post` 拆分是
+  缩小这个缺口的第一步，不过它解析的是阶段，不是算子。
+
+  关于那个"等效遍数"的估算有三处要声明，但都不削弱结论：919 GB/s 来自一次纯 1 GiB 的设备内拷贝，是
+  最好情况，所以每遍实际还要更贵一点；`_softmax`（约 1.8 遍）和 `multinomial`（约 4 遍）是多遍而不是
+  一遍；而 `topk` 的 1.86 ms 根本不是 elementwise pass，它是一次 radix select，跑在**其 0.17 ms
+  最小读取量的 11 倍**上，并且**不可约** —— 它必须看全部 151 936 列。
+
+  这个论证其实不依赖遍数，所以那个宽区间无妨。它只需要操作数的大小：**存活候选集是 `[512, 20]` =
+  41 kB，比这些算子遍历的 311 MB fp32 张量小 7 600 倍。** 一个仍然在每一步都摸 `[512, 151 936]` 的
+  Triton 重写，成本一样 —— 因为成本是带宽 × 流量，换 kernel 语言这两者都不动；除非它同时把这些步骤
+  融掉，而真正值钱的那个融合恰恰就是把它们搬进窗口。**那个融合是纯 PyTorch 的。** log1001 §7.1–7.2
+  那个 16.32 → ~4 ms 的估算前提是完全不用 Triton；做完之后剩下的主要是 `topk` 那不可约的 1.86 ms。
+  **那里**才是融合的 select-and-sample kernel 开始值钱的地方 —— 先算法，再 kernel 语言。
+
+  有一个在 PyTorch 层面就值得抄的想法：`_gumbel_sample_kernel` 说明 vLLM 根本不用 `multinomial`。
+  Gumbel-max —— 给 logits 加 `-log(-log(u))` 再取 argmax —— 是一遍加一次归约，而
+  `torch.multinomial` 要先归一化再查找，在这里花掉 qwen.py **2.74 ms/步**，搬进 20 列的窗口后几乎
+  免费。
 * **forward 距带宽屋顶比 vLLM 远。** batch 1 上 qwen.py 的设备工作是 **3.18 ms/步**（实测
   `gpu_busy_from_trace`），而仅权重就有 0.99 GB —— 按实测 919 GB/s 是 **1.08 ms**。这把 qwen.py 放在
   权重带宽屋顶的约 34 %。vLLM 臂 B 的同一个量没有直接测，但可以定界：15.877 s / 64 请求 =
@@ -343,6 +409,9 @@ compile+graph 因子才是 batch 1 上那 12× 头条的来源，而它几乎全
 **4. 哪些**不是**贡献者，并且已经查过：** attention kernel 家族（都是 `FLASH_ATTN`）、KV 容量（都是
 1 048 576 tokens，而且 vLLM 自己更大的分配被 override **压到**了平手）、prefix caching（关）、
 抢占（两边都是零）、EOS 处理（两边都断言了恰好 128 token 的输出）、以及 GPU 温度。
+
+采样器的**实现**刻意不在这张清单上。对齐的是采样**参数**（§2.2）；它们背后的 kernel 是各自引擎的选择，
+属于被比较的内容本身，不是该被消除的混淆项。
 
 ---
 
@@ -381,7 +450,13 @@ qwen.py 数字上的做法，正是 [log1001 §8](./performance_analysis_log1001
   只有吞吐。qwen.py 自己的 prefill 延迟在 `concurrency_sweep.txt` 里（batch 1 的 23.8 ms 到 512 的
   137.5 ms），但没有对照物。
 * **vLLM 的内部单步拆解。** 这里没有 vLLM 版的 `step_metrics`，所以 §4 第 3 条的设备侧归因是从总量和
-  roofline 推出来的，不是逐算子测出来的。
+  roofline 推出来的，不是逐算子测出来的。engine log 点出了 vLLM 采样器用的是哪些 kernel（§2.1），但没
+  说它们花了多少 —— 所以采样器在**它那一步**里占多少是未知的，这正是 §4 第 3 条止步于"最大的单一候选者"
+  的原因。
+* **qwen.py **自己**采样器的逐算子拆解。** `sampler()` 每步只调一次，所以 `key_averages` 把它的算子和
+  24 层模型的算子按同名聚在一起；16.32 ms 里只有 6.56 ms 可以确定归因（§4 第 3 条）。要补上这一块，
+  需要给采样器各阶段加 NVTX range，或者用这批 run 之后新加的
+  `sample_prep`/`sample_run`/`sample_post` 事件。
 * **采样输出质量。** 参数对齐了，分布没有对比。对吞吐对比足够，也没有超出这个范围声称什么。
 
 ---
@@ -393,6 +468,11 @@ qwen.py 数字上的做法，正是 [log1001 §8](./performance_analysis_log1001
 可迁移的结果说：batch 512 上 qwen.py 在 vLLM 臂 A 的 81 %、臂 B 的 69 %，而已识别的采样器工作
 （log1001 §7.1–7.2）在那里值约 1.8× 的设备时间 —— **比整个差距还大**。把下一笔租金花在更快的宿主上去
 重测一个已经被定界的东西，收益低于把下一个会话花在 `sample()` 上。
+
+**要做的是算法，不是 kernel 语言。** 在 vLLM 日志里看见 FlashInfer 和 Triton，很容易得出"qwen.py 需要
+Triton kernel"这个结论；§4 第 3 条就是这个结论为什么反了的算术。这里能拿到的约 4× 来自"在 20 列上算
+而不是在 151 936 列上算"，那是纯 PyTorch；一个仍然做约 24 遍全词表 pass 的 Triton kernel，成本还是
+那约 16 ms。等采样器降到约 4 ms/步、`topk` 那不可约的 1.86 ms 开始占主导时，再回头看 kernel 语言。
 
 ### 6.2 然后加编译 / 图化路径，因为那是另一半
 

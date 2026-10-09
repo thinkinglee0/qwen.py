@@ -49,6 +49,8 @@ arm B 04:33–05:00 → qwen.py sweep run 1 05:02–05:14 → run 2 05:17–05:2
 2. **The gap factorises cleanly at batch 512: 1.23 × 1.17 = 1.44.** The 1.23 is engine design, measured
    like-for-like (both eager, both `FLASH_ATTN`, identical KV capacity, identical sampling params). The
    1.17 is what `torch.compile` + CUDA graphs buy vLLM — a capability qwen.py does not have at all.
+   **`enforce_eager` does not disable vLLM's sampler kernels** (FlashInfer + five Triton kernels, in
+   both arms), so the whole of its sampler advantage sits inside the 1.23, not the 1.17 (§2.1).
 3. **That second factor is enormous at low concurrency: 7.28× at batch 1**, decaying monotonically
    through 3.58× at batch 64, 1.72× at 256, 1.17× at 512, and 0.98× at 1024. This is the first external
    price tag on the per-step host tax [log1001 §7.3](./performance_analysis_log1001.md) identified as
@@ -145,6 +147,25 @@ Qwen2.5-0.5B-Instruct, bf16, `vocab_size = 151 936`. From `test_benchmark_sweep_
 graph capture, so the two effects are inseparable in this data. Earlier framing in this project called
 this "the CUDA-graph arm"; the logs say it is compile + graphs. Splitting them needs a third arm
 (compile on, `cudagraph_mode=NONE`) — §6.4.
+
+**And `enforce_eager` does not touch vLLM's sampler.** Both arms log, once per batch point:
+
+```
+[topk_topp_sampler.py:78] Using FlashInfer for top-p & top-k sampling.
+[jit_monitor.py:141] Triton kernel JIT compilation during inference: _topk_topp_kernel
+                                                                     _topp_sb_stats_kernel
+                                                                     _topp_sb_step_kernel
+                                                                     _topp_sb_mask_kernel
+                                                                     _gumbel_sample_kernel
+```
+
+So vLLM samples through custom kernels in arm A as well as arm B, and **none of its sampler advantage
+is inside the 1.17×** — all of it sits in the 1.23× that §3.2 labels engine design. §4 reads that
+contributor accordingly.
+
+The JIT lines land after `init engine … took 94.65 s` and inside the first `generate()`, which is the
+harness's warm-up call, so the compilation spike is outside the timed runs. Arm B's slow first runs at
+batches 128/256/512 (§2.3) are more likely inductor and capture warm-up than Triton JIT.
 
 ### 2.2 Throughput definition, and the three ways to get this comparison wrong
 
@@ -358,8 +379,64 @@ that transfers across hosts (§2.4). This is the same quantity log1001 §7.3 mea
 at the top of the sweep, so the cleanest device-side read is batch 512's 1.23×. Two contributors are
 identified:
 
-* **The sampler, 16.32 of 26.93 ms/step (61 %).** vLLM's sampler, with identical parameters, is a
-  small fraction of its step. §3.3 prices the remaining fix at ~1.8× on qwen.py's device time.
+* **The sampler, 16.32 of 26.93 ms/step (61 %).** With identical parameters, vLLM runs this through
+  FlashInfer plus five JIT-compiled Triton kernels, **in both arms** (§2.1), against qwen.py's eager
+  `aten::` ops. Its cost there is not measured (§5.5), so "most of the 1.23×" is not a claim this data
+  supports — but the sampler is the largest single candidate, and the kernel difference is now
+  evidenced rather than inferred.
+
+  **The diagnosis is not "qwen.py should use Triton", and acting on that reading would be a mistake.**
+  At batch 512 the logits are `[512, 151 936]` — **155.6 MB in bf16, 311.2 MB once cast to fp32**. At
+  the measured 919 GB/s one full-vocabulary elementwise pass therefore costs **0.68 ms** read+write in
+  fp32 and **0.34 ms** in bf16 or read-only. That unit is worth checking rather than trusting, and the
+  two ops whose access pattern is unambiguous confirm it: the dead-row `sum` measures **0.346 ms/call**
+  and `argmax` **0.357 ms/call** against 0.339 predicted for a read-only fp32 pass. On that scale the
+  sampler's 16.32 ms is **roughly 24–48 full-vocabulary pass-equivalents**, the range being how much of
+  it runs in bf16 rather than fp32.
+
+  How much of that is attributable per op, and how much is not: `sampler()` runs **once per step**, on
+  the `[B, vocab]` logits of the last position — not per layer — so `key_averages` aggregates its ops
+  together with the model's 24 layers under the same names. Only the ops whose every call belongs to
+  the sampler can be read off directly:
+
+  | op | ms/step | calls/step | sampler's calls |
+  | --- | --- | --- | --- |
+  | `aten::multinomial` (CUDA total, incl. `exponential_` 0.31) | 2.735 | 1 | 1 |
+  | `aten::topk` | 1.857 | 1 | 1 |
+  | `aten::_softmax` (the window one + the full-vocab one) | 1.254 | 2 | 2 |
+  | `aten::masked_fill_` | 0.672 | 3 | 3 |
+  | `aten::scatter_` | 0.046 | 3 | 3 |
+  | **attributable with certainty** | **6.56** | | **40 % of 16.32** |
+
+  The other **9.76 ms** sits in op types the model also uses — `div` (3 calls/step, 2 the sampler's),
+  `where` (9 / 4), `argmax` (2 / 1), `sum` (2 / 1), `fill_` (11 / 2), `copy_` (**191 / 1**) — and
+  `key_averages` cannot split them. Per-call averaging would not rescue it either, because the calls
+  differ in size by orders of magnitude: of `copy_`'s 191 calls the sampler makes the single
+  311 MB `.float()` cast and the model makes 190 small ones. **An earlier draft of this section quoted
+  those whole-step totals as if they were the sampler's; they are not.** The `sample_prep` /
+  `sample_run` / `sample_post` split added after these measurements is the first step toward closing
+  that gap, though even it resolves phases rather than ops.
+
+  Three caveats on the pass-equivalent estimate, none of which weaken the conclusion: 919 GB/s came
+  from a pure 1 GiB device-to-device copy, so it is a best case and each pass really costs a little
+  more; `_softmax` (~1.8 passes) and `multinomial` (~4) are multi-pass rather than single; and `topk`'s
+  1.86 ms is not an elementwise pass at all but a radix select running at **11× its 0.17 ms minimum
+  read**, and it is **irreducible** — it must see all 151 936 columns.
+
+  The argument does not actually need the pass count, which is why the loose range is fine. It needs
+  only the operand size: **the live candidate set is `[512, 20]` = 41 kB, 7 600× smaller than the
+  311 MB fp32 tensor these ops traverse.** A Triton rewrite that still touches `[512, 151 936]` at
+  every step costs the same, because the price is bandwidth × traffic and a change of kernel language
+  moves neither — unless it also fuses the steps, and the fusion that pays is precisely the one that
+  moves them into the window. That fusion is plain PyTorch. log1001 §7.1–7.2's 16.32 → ~4 ms estimate
+  assumes no Triton at all; the residue is then dominated by `topk`'s irreducible 1.86 ms. **That** is
+  where a fused select-and-sample kernel would start to earn its keep — algorithm first, kernel
+  language second.
+
+  One idea worth stealing at the PyTorch level: `_gumbel_sample_kernel` says vLLM does not use
+  `multinomial` at all. Gumbel-max — add `-log(-log(u))` to the logits and take the argmax — is one
+  pass plus a reduction, against `torch.multinomial`'s normalise-then-search, which costs qwen.py
+  **2.74 ms/step** here and would be near-free inside a 20-column window.
 * **The forward pass is further from the bandwidth roof than vLLM's.** At batch 1 qwen.py's device
   work is **3.18 ms/step** (measured, `gpu_busy_from_trace`) while the weights alone are 0.99 GB —
   **1.08 ms at the measured 919 GB/s**. That puts qwen.py at ~34 % of the weight-bandwidth roof.
@@ -373,6 +450,10 @@ identified:
 capacity (both 1 048 576 tokens, with vLLM's own larger allocation overridden *down* to parity),
 prefix caching (off), preemption (zero on both), EOS handling (exact 128-token outputs asserted on
 both sides), and GPU thermals.
+
+The sampler implementation is deliberately **not** on that list. Sampling *parameters* were aligned
+(§2.2); the kernels behind them are each engine's own choice and are part of what is being compared,
+not a confound to be removed.
 
 ---
 
@@ -415,7 +496,13 @@ that batch would not.
   so this report has no latency comparison — only throughput. qwen.py's own prefill latency is in
   `concurrency_sweep.txt` (23.8 ms at batch 1 rising to 137.5 ms at 512) with nothing to compare it to.
 * **vLLM's internal step breakdown.** There is no vLLM equivalent of `step_metrics` here, so the
-  device-side attribution in §4.3 is inferred from totals and the roofline, not measured per op.
+  device-side attribution in §4.3 is inferred from totals and the roofline, not measured per op. The
+  engine log names vLLM's sampler kernels (§2.1) but not what they cost, so the sampler's share of
+  *its* step is unknown — which is exactly why §4.3 stops at "largest single candidate".
+* **A per-op breakdown of qwen.py's *own* sampler.** `sampler()` is called once per step, so
+  `key_averages` lumps its ops in with the 24 model layers under the same op names; only 6.56 of the
+  16.32 ms is attributable with certainty (§4.3). Closing this needs NVTX ranges around the sampler's
+  phases, or the `sample_prep`/`sample_run`/`sample_post` events added after this report's runs.
 * **Sampling output quality.** Parameters were matched; distributions were not compared. Fine for a
   throughput comparison, and not claimed beyond that.
 
@@ -429,6 +516,12 @@ The transferable results say qwen.py is at 81 % of vLLM arm A and 69 % of arm B 
 the identified sampler work (log1001 §7.1–7.2) is worth ~1.8× on device time there — **more than the
 entire gap**. Spending the next rental on a faster host to re-measure what is already bounded buys
 less than spending the next session on `sample()`.
+
+**Do the algorithm, not the kernel language.** Seeing FlashInfer and Triton in vLLM's log invites the
+conclusion that qwen.py needs Triton kernels; §4.3 is the arithmetic for why that is backwards. The
+~4× available here comes from operating on 20 columns instead of 151 936, which is plain PyTorch;
+a Triton kernel that still makes ~24 full-vocabulary passes costs the same ~16 ms. Revisit kernel
+language once the sampler is ~4 ms/step and `topk`'s irreducible 1.86 ms dominates it.
 
 ### 6.2 Then add a compiled / graphed path, because that is the other half
 
