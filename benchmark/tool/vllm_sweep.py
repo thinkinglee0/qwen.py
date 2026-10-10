@@ -45,6 +45,11 @@ pooled per-token ITL distribution is NOT reproducible here -- it needs per-token
 timestamps and the offline path exposes only the first and last. If this vLLM build
 leaves RequestOutput.metrics unpopulated, `latency` is {} and `latency_note` says so
 rather than the row quietly carrying nothing.
+
+vLLM 0.30.x does populate it, under `queued_ts` / `scheduled_ts` / `first_token_ts` /
+`last_token_ts` / `first_token_latency` / `num_generation_tokens` / `num_preemptions`
+(discovered from log1009/host2's latency_note, which is what that guard is for).
+_SCHEMAS carries that naming and the older one; see the clock-domain warning there.
 """
 
 import argparse
@@ -271,7 +276,38 @@ def summarize(samples: list[float], scale: float = 1e3) -> dict:
 # NOT reproducible here: the `itls` DISTRIBUTION. qwen.py pools every inter-token
 # interval, which needs per-token timestamps; the offline path exposes only the first
 # and last. tpot is the per-request mean of those intervals and is comparable.
-_TIME_FIELDS = ("arrival_time", "first_scheduled_time", "first_token_time", "last_token_time")
+#
+# vLLM renames these between releases, and -- the trap -- the two generations do not
+# share a clock. `arrival_time` has historically been wall-clock while the `*_ts`
+# fields are monotonic, so a ttft taken as `first_token_ts - arrival_time` is off by
+# the epoch (~1.7e9 s) and looks like a plausible number of milliseconds only after
+# the subtraction silently overflows your expectations. Each schema below therefore
+# names its own fields, and every quantity is computed inside ONE domain.
+_SCHEMAS = (
+    {   # vLLM 0.30.x -- field names confirmed from log1009/host2's latency_note
+        "name": "ts",
+        "need": ("queued_ts", "scheduled_ts", "first_token_ts", "last_token_ts"),
+        "queued": "queued_ts", "scheduled": "scheduled_ts",
+        "first": "first_token_ts", "last": "last_token_ts",
+        "n_out": "num_generation_tokens",   # optional
+        "ttft": "first_token_latency",      # optional: vLLM already computed it
+    },
+    {   # older RequestMetrics
+        "name": "legacy",
+        "need": ("arrival_time", "first_scheduled_time", "first_token_time", "last_token_time"),
+        "queued": "arrival_time", "scheduled": "first_scheduled_time",
+        "first": "first_token_time", "last": "last_token_time",
+        "n_out": None, "ttft": None,
+    },
+)
+
+
+def _attrs(obj) -> set:
+    """Field names, whether RequestMetrics uses __dict__ or __slots__."""
+    try:
+        return set(vars(obj))
+    except TypeError:
+        return {a for a in dir(obj) if not a.startswith("_")}
 
 
 def request_latencies(outs) -> tuple[dict, str]:
@@ -288,26 +324,56 @@ def request_latencies(outs) -> tuple[dict, str]:
                     f"this vLLM build does not expose per-request timing from LLM.generate(). "
                     f"Latency needs the streaming AsyncLLM path; see log1003 section 6.5.")
 
-    absent = [f for f in _TIME_FIELDS if not hasattr(metrics[0], f)]
-    if absent:
-        return {}, (f"RequestMetrics has no {absent} in this vLLM version; present: "
-                    f"{sorted(vars(metrics[0]))}. Update _TIME_FIELDS.")
+    present = _attrs(metrics[0])
+    schema = next((sc for sc in _SCHEMAS if set(sc["need"]) <= present), None)
+    if schema is None:
+        return {}, (f"RequestMetrics matches no schema in _SCHEMAS; present: {sorted(present)}. "
+                    f"Add one -- and keep each quantity inside a single clock domain.")
+
+    g = lambda m, key: getattr(m, schema[key])
+    use_ttft_field = schema["ttft"] in present if schema["ttft"] else False
+    use_n_out_field = schema["n_out"] in present if schema["n_out"] else False
 
     queueing, ttft, prefill, tpot = [], [], [], []
+    preempted = short = 0
     for o, m in zip(outs, metrics):
-        if m.first_token_time is None or m.arrival_time is None:
+        if g(m, "first") is None or g(m, "queued") is None:
             continue
-        queueing.append(m.first_scheduled_time - m.arrival_time)
-        ttft.append(m.first_token_time - m.arrival_time)
-        prefill.append(m.first_token_time - m.first_scheduled_time)
-        n_out = len(o.outputs[0].token_ids)
-        if n_out > 1 and m.last_token_time is not None:
-            tpot.append((m.last_token_time - m.first_token_time) / (n_out - 1))
+        queueing.append(g(m, "scheduled") - g(m, "queued"))
+        prefill.append(g(m, "first") - g(m, "scheduled"))
+        # Prefer vLLM's own TTFT: it is the one number guaranteed to be a duration
+        # rather than a difference of two timestamps that may not share a clock.
+        ttft.append(getattr(m, schema["ttft"]) if use_ttft_field
+                    else g(m, "first") - g(m, "queued"))
+
+        n_out = getattr(m, schema["n_out"]) if use_n_out_field else len(o.outputs[0].token_ids)
+        if n_out != OUT_LEN:
+            short += 1
+        if n_out > 1 and g(m, "last") is not None:
+            tpot.append((g(m, "last") - g(m, "first")) / (n_out - 1))
+
+        preempted += getattr(m, "num_preemptions", 0) or 0
 
     if not ttft:
-        return {}, "RequestOutput.metrics present but first_token_time unset on every request"
-    return {"queueing": summarize(queueing), "ttft": summarize(ttft),
-            "prefill": summarize(prefill), "tpot": summarize(tpot)}, ""
+        return {}, f"RequestOutput.metrics present ({schema['name']}) but first/queued unset on every request"
+
+    out = {"queueing": summarize(queueing), "ttft": summarize(ttft),
+           "prefill": summarize(prefill), "tpot": summarize(tpot),
+           "schema": schema["name"], "preemptions": preempted}
+
+    # ttft should equal queueing + prefill. When it does not, the three were not read
+    # from one clock -- which is the failure this split is designed to catch, and it
+    # would otherwise produce numbers that look fine and are not.
+    want = out["queueing"]["mean"] + out["prefill"]["mean"]
+    got = out["ttft"]["mean"]
+    note = ""
+    if want and abs(got - want) / want > 0.05:
+        note = (f"ttft mean {got:.1f} ms != queueing + prefill {want:.1f} ms -- the three are "
+                f"probably not on one clock, or '{schema['ttft']}' means something else. "
+                f"Treat the latency columns as suspect.")
+    if short:
+        note += f" {short}/{len(outs)} requests did not generate exactly {OUT_LEN} tokens."
+    return out, note
 
 
 def run_one(model: str, bz: int, prompts_ids: list[list[int]], arm: str, runs: int,
@@ -434,11 +500,13 @@ def main() -> None:
             f.flush()
             lat = row["latency"]
             lat_s = (f"   prefill p50 {lat['prefill']['p50']:.1f} ms"
-                     f"   tpot p50 {lat['tpot']['p50']:.2f} ms") if lat else "   latency: n/a"
+                     f"   tpot p50 {lat['tpot']['p50']:.2f} ms"
+                     f"   preempt {lat['preemptions']}") if lat else "   latency: n/a"
             log(f"bz={bz:<5} {row['tok_s']:>10.2f} output tok/s   median {row['elapsed']}s"
                 f"   runs {row['elapsed_all']}   cudagraph_mode={row['cudagraph_mode']}{lat_s}")
             if row["latency_note"]:
-                log(f"bz={bz} latency unavailable: {row['latency_note']}")
+                kind = "latency WARNING" if lat else "latency unavailable"
+                log(f"bz={bz} {kind}: {row['latency_note']}")
 
 
 if __name__ == "__main__":
