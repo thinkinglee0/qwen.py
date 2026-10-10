@@ -76,8 +76,8 @@ grep -q 'venv/main/bin/activate' ~/.bashrc \
 
 ```bash
 cd /workspace
-git clone https://github.com/thinkinglee0/qwen.py.git && cd qwen.py
-bash env/vastai/check_instance.sh 2>&1 | tee host_check.log    # ~1 min; run on an IDLE instance
+git clone https://github.com/thinkinglee0/qwen.py.git && cd qwen.py && mkdir log
+bash env/vastai/check_instance.sh 2>&1 | tee log/host_check.log    # ~1 min; run on an IDLE instance
 ```
 
 `2>&1` 不能省:脚本里大量 `cat` 是"v1/v2 两条路径都试",报错本身就是信息。`host_check.log` 随结果一起带走(§7)。
@@ -604,7 +604,7 @@ python profile_decode.py --steps 50
 ```bash
 for arm in eager compile cudagraph; do        # A, A', B
   "$VLLM_VENV/bin/python" benchmark/tool/vllm_sweep.py --arm $arm --runs 3 \
-    --out log_vast/<logN>/vllm_$arm.jsonl > log_vast/<logN>/vllm_$arm.log 2>&1
+    --out log/vllm_$arm.jsonl > log/vllm_$arm.log 2>&1
 done
 ```
 
@@ -616,8 +616,8 @@ V1 的 EngineCore 在独立进程里打日志,进程内挂 handler 抓不到。
 ```bash
 for arm in eager compile cudagraph; do
   echo "-- $arm"
-  grep -om1 "'mode': <CompilationMode[^>]*>" log_vast/<logN>/vllm_$arm.log
-  echo "   Capturing CUDA graph x $(grep -c 'Capturing CUDA graph' log_vast/<logN>/vllm_$arm.log)"
+  grep -om1 "'mode': <CompilationMode[^>]*>" log/vllm_$arm.log
+  echo "   Capturing CUDA graph x $(grep -c 'Capturing CUDA graph' log/vllm_$arm.log)"
 done
 #   eager     -> CompilationMode.NONE          + 0 次捕获
 #   compile   -> CompilationMode.VLLM_COMPILE  + 0 次捕获
