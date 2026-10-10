@@ -12,6 +12,7 @@ import uuid
 import torch
 import numpy as np
 from itertools import chain
+from typing import Any
 
 from qwen.utils import round_floats
 from qwen.sampling import SamplingTensors, SamplingParams, SamplingParamTable
@@ -90,33 +91,50 @@ class RequestBuffer:
 
         return self.block_table_device[:bsz, :max_blocks]
 
-    def set(self, reqs: list["ModelRequest"], s_infos: list["ScheduledInfo"],
-            block_tables: list[list[int]],
+    def set(self, sch_out: "SchedulerOutput",
+            tok_id_tab: "TokenIdTable",
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz = len(reqs)
+        bsz = len(sch_out.reqs)
 
-        self.slot_idx_np[:bsz] = [r.slot for r in reqs]
-        self.want_np[:bsz]     = [s.want for s in s_infos]
-        self.needs_sample_np[:bsz] = [r.projected_is_decoding or
-                                (r.num_scheduled_tokens + s.want == r._num_projected_prefill_tokens)
-                                for r, s in zip(reqs, s_infos)]
-        cache_slot_flat = list(chain.from_iterable(s.cache_slots for s in s_infos))
-        cache_slot_cnt = len(cache_slot_flat)
-        self.cache_slot_np[:cache_slot_cnt] = cache_slot_flat
+        self.slot_idx_np[:bsz] = sch_out.slots
+        self.want_np[:bsz]     = sch_out.wants
+        num_cache_slots = len(sch_out.cache_slot_flat)
+        self.cache_slot_np[:num_cache_slots] = sch_out.cache_slot_flat
+
+        # oracle
+        # self.needs_sample_np[:bsz] = [r.projected_is_decoding or
+        #                         (r.num_scheduled_tokens + s == r._num_projected_prefill_tokens)
+        #                         for r, s in zip(sch_out.reqs, sch_out.wants)]
+
+        # np, more efficient than for loop, but less readable
+        # end = tok_id_tab.num_scheduled_tok_np[sch_out.slots] + self.want_np[:bsz]
+        # known = tok_id_tab.in_len_np[sch_out.slots] + tok_id_tab.projected_out_len_np[sch_out.slots]
+        # self.needs_sample_np[:bsz] = (end == known)
+
+        # np, implemented in TokenIdTable.get_needs_sample() for better encapsulation
+        self.needs_sample_np[:bsz] = tok_id_tab.get_needs_sample(
+            slots=sch_out.slots, want_np=self.want_np[:bsz])
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"SchedulerOutput: "
+                         f"slots: {sch_out.slots}, num_scheduled_tok: {tok_id_tab.num_scheduled_tok_np[sch_out.slots]}, wants: {sch_out.wants}, "
+                         f"in_len: {tok_id_tab.in_len_np[sch_out.slots]}, projected_out_len: {tok_id_tab.projected_out_len_np[sch_out.slots]}, "
+                        #  f"end: {end}, known: {known}, "
+                         f"needs_sample: {self.needs_sample_np[:bsz]}")
 
         # async copy
         self.slot_idx_device[:bsz].copy_(self.slot_idx_stage[:bsz], non_blocking=True)
         self.want_device[:bsz].copy_(self.want_stage[:bsz], non_blocking=True)
         self.needs_sample_device[:bsz].copy_(self.needs_sample_stage[:bsz], non_blocking=True)
-        self.cache_slot_device[:cache_slot_cnt].copy_(self.cache_slot_stage[:cache_slot_cnt], non_blocking=True)
+        self.cache_slot_device[:num_cache_slots].copy_(self.cache_slot_stage[:num_cache_slots], non_blocking=True)
 
         # block table
-        block_table = self._build_block_table(block_tables=block_tables)
+        block_table = self._build_block_table(block_tables=sch_out.block_tables)
 
         return self.slot_idx_device[:bsz], self.slot_idx_stage[:bsz], \
             self.want_device[:bsz], self.want_stage[:bsz], \
             self.needs_sample_device[:bsz], self.needs_sample_stage[:bsz], \
-            self.cache_slot_device[:cache_slot_cnt], block_table
+            self.cache_slot_device[:num_cache_slots], block_table
 
 class ModelRequest:
     def __init__(self, config: ModelConfig, loop, input_ids: list[int], request_id: str | None=None, sampling: SamplingParams | None = None, max_new_tokens: int=DEFAULT_MAX_NEW_TOKEN):
@@ -263,12 +281,23 @@ class TokenIdTable:
         (self.in_len_host, self.projected_out_len_host, self.num_scheduled_tok_host) = \
             torch.empty(3, capacity, dtype=torch.int32, device=torch.device("cpu")).unbind()
 
+        self.in_len_np = self.in_len_host.numpy()
+        self.projected_out_len_np = self.projected_out_len_host.numpy()
+        self.num_scheduled_tok_np = self.num_scheduled_tok_host.numpy()
+
         # double buffer
         # only host-side buffer, for transfer next tokens from device to host. top-bsz elements used.
         next_tok_stage_double_buffer = torch.empty(2, capacity, dtype=torch.int64, pin_memory=True) \
             if torch.cuda.is_available() else torch.empty(2, capacity, dtype=torch.int64)
         self.next_tok_stage_bufs = next_tok_stage_double_buffer.unbind() # tuple
         self.dth_buf: int = 0
+
+    def get_needs_sample(self, slots: list[int], want_np: Any) -> Any:
+        # end = tok_id_tab.num_scheduled_tok_np[sch_out.slots] + self.want_np[:bsz]
+        # known = tok_id_tab.in_len_np[sch_out.slots] + tok_id_tab.projected_out_len_np[sch_out.slots]
+        end = self.num_scheduled_tok_np[slots] + want_np
+        known = self.in_len_np[slots] + self.projected_out_len_np[slots]
+        return (end == known)
 
     def add_req(self, req: "ModelRequest"):
         assert req.slot is not None
@@ -417,15 +446,20 @@ class TokenIdTable:
 
 class SchedulerOutput:
     def __init__(self, step_id: int, reqs: list[ModelRequest],
-                 scheduled: dict[str, ScheduledInfo],
+                 slots: list[int], wants: list[int], cache_slot_flat: list[int],
                  block_tables: list[list[int]],
                  config: ModelConfig,
                  scheduler: "Scheduler | None" = None,
                  step_metrics: SchedulerStepMetrics | None = None):
         assert len(reqs) > 0, "SchedulerOutput must have at least one request"
+        assert len(slots) == len(wants) == len(reqs), "slots, wants, and reqs must have the same length"
+        assert len(cache_slot_flat) == sum(wants), "cache_slot_flat length must equal sum of wants"
+
         self.reqs = reqs
         self.batch_size = len(reqs)
-        self.s_infos = [s for s in scheduled.values()]
+        self.slots = slots
+        self.wants = wants
+        self.cache_slot_flat = cache_slot_flat
         self.block_tables = block_tables
         self.config = config
         self.scheduler = scheduler
@@ -453,7 +487,7 @@ class SchedulerOutput:
             if not req.projected_is_decoding:
                 # prefill
                 num_prefill += 1
-                num_prefill_tokens += self.s_infos[i].want
+                num_prefill_tokens += self.wants[i]
                 req.metrics.num_prefill_chunk += 1
             else:
                 # decode
@@ -527,11 +561,10 @@ class SchedulerOutput:
     def build_attn_metadata(self, cache_data: KVCacheData | None = None, rope: BaseRoPE | None = None) -> tuple[torch.Tensor, AttentionMetadata]:
         assert self.scheduler is not None
 
-        lens = [s.want for s in self.s_infos]
-        num_tokens = sum(lens)
-        max_seqlen_q = max(lens)
+        num_tokens = sum(self.wants)
+        max_seqlen_q = max(self.wants)
         self.slot_idx, slot_idx_stage, self.want, want_stage, self.needs_sample_device, needs_sample_stage, cache_slot, block_table = \
-            self.scheduler.req_buf.set(reqs=self.reqs, s_infos=self.s_infos, block_tables=self.block_tables)
+            self.scheduler.req_buf.set(sch_out=self, tok_id_tab=self.scheduler.tok_id_tab)
         self.needs_sample_stage_snapshot = needs_sample_stage.clone().detach()
         self.needs_sample_lst = needs_sample_stage.tolist()
         self.slot_idx_stage_snapshot = slot_idx_stage.clone().detach()
@@ -572,14 +605,13 @@ class SchedulerOutput:
             if req.finished:    # discard due to EOS in the previous step, or due to error/abort
                 continue
 
-            s_info = self.s_infos[i]
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"add_sampled_tokens_on_host, before adding, step_id: {self.step_metrics.step_id}, req_id: {req.request_id}, "
                              f"projected_is_decoding: {req.projected_is_decoding}, "
                              f"num_computed_tokens: {req.num_computed_tokens}, num_scheduled_tokens: {req.num_scheduled_tokens}, "
-                             f"want: {s_info.want}, out_len: {len(req.output_ids)}, max: {req.max_new_tokens}, tok={tok}")
+                             f"want: {self.wants[i]}, out_len: {len(req.output_ids)}, max: {req.max_new_tokens}, tok={tok}")
 
-            req.num_computed_tokens += s_info.want
+            req.num_computed_tokens += self.wants[i]
 
             # NOTE: must be handled before the needs_sample shortcut below, otherwise a victim that was
             # preempted while prefilling (needs_sample == False) would keep its stale num_computed_tokens.
@@ -948,8 +980,13 @@ class Scheduler:
             return None     # no work to do
 
         with timed(step_metrics, "sched_ret"):
-            block_tables = []
+            slots, wants, cache_slot_flat, block_tables = [], [], [], []
             for req in scheduled_running:
+                slots.append(req.slot)
+                s = scheduled[req.request_id]
+                wants.append(s.want)
+                cache_slot_flat.extend(s.cache_slots)
+
                 bt = self.cache.get_block_table(req)
                 assert bt is not None
                 block_tables.append(bt)
@@ -957,7 +994,8 @@ class Scheduler:
             self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
             return SchedulerOutput(
                 step_id=self.sch_metrics.step_id, reqs=scheduled_running,
-                scheduled=scheduled, block_tables=block_tables,
+                slots=slots, wants=wants, cache_slot_flat=cache_slot_flat,
+                block_tables=block_tables,
                 config=self.config, scheduler=self,
                 step_metrics=step_metrics)
     
@@ -1082,8 +1120,13 @@ class Scheduler:
             return None     # no work to do
 
         with timed(step_metrics, "sched_ret"):
-            block_tables = []
+            slots, wants, cache_slot_flat, block_tables = [], [], [], []
             for req in scheduled_running:
+                slots.append(req.slot)
+                s = scheduled[req.request_id]
+                wants.append(s.want)
+                cache_slot_flat.extend(s.cache_slots)
+
                 bt = self.cache.get_block_table(req)
                 assert bt is not None
                 block_tables.append(bt)
@@ -1091,7 +1134,8 @@ class Scheduler:
             self.sch_metrics.report_on_schedule(scheduled_reqs=scheduled_running)
             return SchedulerOutput(
                 step_id=self.sch_metrics.step_id, reqs=scheduled_running,
-                scheduled=scheduled, block_tables=block_tables,
+                slots=slots, wants=wants, cache_slot_flat=cache_slot_flat,
+                block_tables=block_tables,
                 config=self.config, scheduler=self,
                 step_metrics=step_metrics)
 

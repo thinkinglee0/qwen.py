@@ -82,20 +82,19 @@ def test_build_attn_metadata(tmp_target_config):
     # uuid
     assert req1.request_id != req2.request_id and req1.request_id != req3.request_id and req2.request_id != req3.request_id
 
+
+    wants = [1, 2, 3]
+    slots = [0, 1, 2]
+    cache_slot_flat = [110, 120, 121, 130, 131, 132]
     s_info_1 = ScheduledInfo(want=1, cache_slots=[110])
     s_info_2 = ScheduledInfo(want=2, cache_slots=[120, 121])
     s_info_3 = ScheduledInfo(want=3, cache_slots=[130, 131, 132])
 
-    scheduled: dict[str, ScheduledInfo] = {
-        req1.request_id: s_info_1,
-        req2.request_id: s_info_2,
-        req3.request_id: s_info_3,
-    }
-
     block_tables: list[list[int]] = [[100], [200, 400], [300]]
 
-    sch_out = SchedulerOutput(step_id=0, reqs=[req1, req2, req3], scheduled=scheduled,
-                              block_tables=block_tables, config=tmp_target_config, scheduler=None)
+    sch_out = SchedulerOutput(step_id=0, reqs=[req1, req2, req3],
+                              wants=wants, slots=slots, cache_slot_flat=cache_slot_flat,
+                              block_tables=block_tables, config=tmp_target_config)
     packed_ids, md = build_attn_metadata(sch_out, tmp_target_config, cache_data=None, rope=None)
 
     assert len(packed_ids) == 6

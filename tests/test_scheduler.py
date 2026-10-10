@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 class LifeCycle:
     sch: Scheduler
     req: ModelRequest
-    s_info1: ScheduledInfo          # step 1: first prefill chunk
-    s_info2: ScheduledInfo          # step 2: last prefill chunk, the batch still in flight
+    sch_out1: SchedulerOutput          # step 1: first prefill chunk
+    sch_out2: SchedulerOutput          # step 2: last prefill chunk, the batch still in flight
     pre_sch_out: SchedulerOutput    # that in-flight batch, committed one step later
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
@@ -76,12 +76,10 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     sch_out = sch.schedule(step_metrics=SchedulerStepMetrics())
     assert sch_out is not None
     assert sch_out.reqs == [req1] and sch_out.batch_size == 1
+    assert sch_out.slots is not None and sch_out.slots == [req1.slot]
     assert sch_out.needs_sample_device is None
-    assert len(sch_out.s_infos) == 1
-    s_info = sch_out.s_infos[0]
-    assert s_info.want == tmp_target_config.max_num_batched_tokens
-    assert cdiv(s_info.want, tmp_target_config.block_size) == 3
-    assert len(s_info.cache_slots) == s_info.want
+    assert sch_out.wants[0] == tmp_target_config.max_num_batched_tokens
+    assert cdiv(sch_out.wants[0], tmp_target_config.block_size) == 3
     assert sch_out.block_tables is not None and len(sch_out.block_tables)==1 and len(sch_out.block_tables[0])==3
 
     assert req1.metrics.first_schedule_time is not None
@@ -108,19 +106,24 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     # build attention metadata
     packed_ids, attn_meta = sch_out.build_attn_metadata(cache_data=sch.cache.data, rope=None)
     assert sch_out.slot_idx is not None and sch_out.slot_idx.tolist() == [req1.slot]
-    assert sch_out.want is not None and sch_out.want.tolist() == [s_info.want]
+    assert sch_out.want is not None and sch_out.want.tolist() == sch_out.wants
     assert sch_out.needs_sample_device is not None and sch_out.needs_sample_device.tolist() == [False]
-    assert packed_ids.tolist() == input_ids[:s_info.want]
+    assert packed_ids.tolist() == input_ids[:sch_out.wants[0]]
     assert attn_meta.cos_sin is None    # due to None of rope
     assert attn_meta.cache == sch.cache.data
-    assert attn_meta.max_seqlen_k == attn_meta.max_seqlen_q == s_info.want
-    assert attn_meta.cu_seqlens_q.tolist() == [0, s_info.want] == attn_meta.cu_seqlens_k.tolist()
-    assert attn_meta.cache_seqlens.tolist() == [s_info.want]
+    assert attn_meta.max_seqlen_k == attn_meta.max_seqlen_q == sch_out.wants[0]
+    assert attn_meta.cu_seqlens_q.tolist() == [0, sch_out.wants[0]] == attn_meta.cu_seqlens_k.tolist()
+    assert attn_meta.cache_seqlens.tolist() == [sch_out.wants[0]]
 
-    assert attn_meta.position_ids.tolist() == list(range(0, s_info.want))
+    assert attn_meta.position_ids.tolist() == list(range(0, sch_out.wants[0]))
     assert attn_meta.block_table.tolist() == sch_out.block_tables
-    assert attn_meta.slot_mapping.tolist() == s_info.cache_slots
+    assert attn_meta.slot_mapping.tolist() == sch_out.cache_slot_flat
     assert attn_meta.step_metrics_lst is not None and len(attn_meta.step_metrics_lst) == tmp_target_config.num_hidden_layers
+
+    oracle = [r.projected_is_decoding or
+              (r.num_scheduled_tokens + w == r._num_projected_prefill_tokens)
+              for r, w in zip(sch_out.reqs, sch_out.wants)]
+    assert sch_out.needs_sample_lst == oracle
 
     # build sampling tensors
     sampling_tensors = sch_out.build_sampling_tensors()
@@ -132,7 +135,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     sch_out.update_projected_state_in_advance()
 
     # projected states
-    assert req1.num_scheduled_tokens == s_info.want
+    assert req1.num_scheduled_tokens == sch_out.wants[0]
     assert req1.projected_is_decoding == False
     assert req1.projected_finished == False
     assert sch.tok_id_tab.num_scheduled_tok_host[req1.slot].item() == req1.num_scheduled_tokens
@@ -163,7 +166,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
         # assert sch.tok_id_tab.out_len_device[req1.slot].item() == 0
         pass
     else:
-        assert sch.tok_id_tab.num_computed_tok_device[req1.slot].item() == s_info.want
+        assert sch.tok_id_tab.num_computed_tok_device[req1.slot].item() == sch_out.wants[0]
         assert sch.tok_id_tab.out_len_device[req1.slot].item() == 0
 
     # increase in-flight counter
@@ -173,19 +176,15 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     
     # ---------- snapshot of step 1 ----------
     pre_sch_out = sch_out
-    s_info1 = s_info
-    pre_s_info = s_info
+    sch_out1 = sch_out
 
     # ---------- step 2: schedule ----------
     sch_out = sch.schedule(step_metrics=SchedulerStepMetrics())
     assert sch_out is not None
     assert sch_out.reqs == [req1] and sch_out.batch_size == 1
     assert sch_out.needs_sample_device is None
-    assert len(sch_out.s_infos) == 1
-    s_info = sch_out.s_infos[0]
-    assert s_info.want == input_len - tmp_target_config.max_num_batched_tokens   # 40 = 100 - 60
+    assert sch_out.wants[0] == input_len - tmp_target_config.max_num_batched_tokens   # 40 = 100 - 60
     assert cdiv(input_len, tmp_target_config.block_size) == 4   # 100 / 25
-    assert len(s_info.cache_slots) == s_info.want
     assert sch_out.block_tables is not None and len(sch_out.block_tables)==1 and len(sch_out.block_tables[0])==4
 
     assert req1.slot is not None
@@ -203,21 +202,21 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     # build attention metadata
     packed_ids, attn_meta = sch_out.build_attn_metadata(cache_data=sch.cache.data, rope=None)
     assert sch_out.slot_idx is not None and sch_out.slot_idx.tolist() == [req1.slot]
-    assert sch_out.want is not None and sch_out.want.tolist() == [s_info.want]
+    assert sch_out.want is not None and sch_out.want.tolist() == sch_out.wants
     assert sch_out.needs_sample_lst is not None and sch_out.needs_sample_lst == [True]
     assert sch_out.needs_sample_device is not None
-    assert packed_ids.tolist() == input_ids[s_info1.want:]
+    assert packed_ids.tolist() == input_ids[sch_out1.wants[0]:]
     assert attn_meta.cos_sin is None    # due to None of rope
     assert attn_meta.cache == sch.cache.data
-    assert attn_meta.max_seqlen_q == s_info.want
-    assert attn_meta.cu_seqlens_q.tolist() == [0, s_info.want]
+    assert attn_meta.max_seqlen_q == sch_out.wants[0]
+    assert attn_meta.cu_seqlens_q.tolist() == [0, sch_out.wants[0]]
     assert attn_meta.max_seqlen_k == input_len
     assert attn_meta.cu_seqlens_k.tolist() == [0, input_len]
     assert attn_meta.cache_seqlens.tolist() == [input_len]
 
-    assert attn_meta.position_ids.tolist() == list(range(s_info1.want, s_info1.want + s_info.want))
+    assert attn_meta.position_ids.tolist() == list(range(sch_out1.wants[0], sch_out1.wants[0] + sch_out.wants[0]))
     assert attn_meta.block_table.tolist() == sch_out.block_tables
-    assert attn_meta.slot_mapping.tolist() == s_info.cache_slots
+    assert attn_meta.slot_mapping.tolist() == sch_out.cache_slot_flat
     assert attn_meta.step_metrics_lst is not None and len(attn_meta.step_metrics_lst) == tmp_target_config.num_hidden_layers
 
     # build sampling tensors
@@ -230,7 +229,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     sch_out.update_projected_state_in_advance()
 
     # projected states
-    assert req1.num_scheduled_tokens == pre_s_info.want + s_info.want
+    assert req1.num_scheduled_tokens == pre_sch_out.wants[0] + sch_out.wants[0]
     assert req1.projected_is_decoding == True       # flip because of the finish of prompt tokens
     assert req1.projected_finished == False
     assert sch.tok_id_tab.num_scheduled_tok_host[req1.slot].item() == req1.num_scheduled_tokens
@@ -261,7 +260,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     # verify req1
     assert req1.output_ids == []
     # actual states
-    assert req1.num_computed_tokens == s_info1.want
+    assert req1.num_computed_tokens == sch_out1.wants[0]
     assert req1.finished == False
 
     # increase in-flight counter
@@ -270,7 +269,7 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
     assert req1.num_in_flight == 1
 
     # ---------- snapshot of step 2 ----------
-    ctx = LifeCycle(sch=sch, req=req1, s_info1=s_info1, s_info2=s_info, pre_sch_out=sch_out)
+    ctx = LifeCycle(sch=sch, req=req1, sch_out1=sch_out1, sch_out2=sch_out, pre_sch_out=sch_out)
 
     if is_finish_on_eos:
         finish_on_eos(ctx)
@@ -280,13 +279,12 @@ def test_life_cycle(tmp_target_config: ModelConfig, is_finish_on_eos: bool, use_
 def finish_on_eos(ctx: LifeCycle):
     sch, req1 = ctx.sch, ctx.req
     tmp_target_config = sch.config
-    s_info1, s_info2 = ctx.s_info1, ctx.s_info2
-    pre_sch_out, pre_s_info = ctx.pre_sch_out, s_info2      # the in-flight batch and its ScheduledInfo
+    sch_out1, sch_out2 = ctx.sch_out1, ctx.sch_out2
+    pre_sch_out = ctx.pre_sch_out      # the in-flight batch and its ScheduledInfo
 
     # ---------- step 3: schedule ----------
     sch_out = sch.schedule(step_metrics=SchedulerStepMetrics())
     assert sch_out is not None
-    s_info = sch_out.s_infos[0]
 
     # ---------- step 3, mock forward / compute_logits / sampler  ----------
     # build attention metadata
@@ -320,7 +318,7 @@ def finish_on_eos(ctx: LifeCycle):
     # verify req1
     assert req1.output_ids == [TOK]
     # actual states
-    assert req1.num_computed_tokens == s_info1.want + pre_s_info.want
+    assert req1.num_computed_tokens == sch_out1.wants[0] + pre_sch_out.wants[0]
     assert req1.finished == False
 
     sch.commit_step(sch_out=pre_sch_out, num_truncated=num_truncated)
@@ -328,14 +326,12 @@ def finish_on_eos(ctx: LifeCycle):
     # ---------- snapshot of step 3 ----------
     sch_out.incr_num_in_flight()
     pre_sch_out = sch_out
-    s_info3 = s_info
-    pre_s_info = s_info
+    sch_out3 = sch_out
 
     # ---------- step 4: schedule ----------
     sch_out = sch.schedule(step_metrics=SchedulerStepMetrics())
     assert sch_out is not None
-    s_info = sch_out.s_infos[0]
-    assert s_info.want == 1
+    assert sch_out.wants[0] == 1
 
     # ---------- step 4, mock forward / compute_logits / sampler  ----------
     # build attention metadata
@@ -371,7 +367,7 @@ def finish_on_eos(ctx: LifeCycle):
     # verify req1
     assert req1.output_ids == [TOK]
     # actual states
-    assert req1.num_computed_tokens == s_info1.want + s_info2.want + pre_s_info.want
+    assert req1.num_computed_tokens == sch_out1.wants[0] + sch_out2.wants[0] + pre_sch_out.wants[0]
     assert req1.finished == True
     assert req1.committed == True
     assert req1 not in sch.running
@@ -379,8 +375,7 @@ def finish_on_eos(ctx: LifeCycle):
     # ---------- snapshot of step 4 ----------
     sch_out.incr_num_in_flight()
     pre_sch_out = sch_out
-    s_info4 = s_info
-    pre_s_info = s_info
+    sch_out4 = sch_out
 
     # ---------- step 5: schedule ----------
     sch_out = sch.schedule(step_metrics=SchedulerStepMetrics())
@@ -400,7 +395,7 @@ def finish_on_eos(ctx: LifeCycle):
     # verify req1
     assert req1.output_ids == [TOK]
     # actual states
-    assert req1.num_computed_tokens == s_info1.want + s_info2.want + pre_s_info.want
+    assert req1.num_computed_tokens == sch_out1.wants[0] + sch_out2.wants[0] + pre_sch_out.wants[0]
     assert req1.finished == True
     assert req1 not in sch.running
 
@@ -413,11 +408,12 @@ def finish_on_eos(ctx: LifeCycle):
 def finish_on_max_new_token_limit(ctx: LifeCycle):
     sch, req1 = ctx.sch, ctx.req
     tmp_target_config = sch.config
+    sch_out1, sch_out2 = ctx.sch_out1, ctx.sch_out2
+    pre_sch_out = ctx.pre_sch_out      # the in-flight batch and its ScheduledInfo
+
     input_len = req1.input_len
     assert req1.sampling is not None
     top_k, temperature = req1.sampling.top_k, req1.sampling.temperature
-    s_info1, s_info2 = ctx.s_info1, ctx.s_info2
-    pre_sch_out, pre_s_info = ctx.pre_sch_out, s_info2      # the in-flight batch and its ScheduledInfo
 
     # ---------- step 3: schedule ----------
     # req1.projected_is_decoding == True
@@ -425,11 +421,8 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
     assert sch_out is not None
     assert sch_out.reqs == [req1] and sch_out.batch_size == 1
     assert sch_out.needs_sample_device is None
-    assert len(sch_out.s_infos) == 1
-    s_info = sch_out.s_infos[0]
-    assert s_info.want == 1     # decoding
+    assert sch_out.wants[0] == 1     # decoding
     assert cdiv(input_len+1, tmp_target_config.block_size) == 5   # 101 / 25
-    assert len(s_info.cache_slots) == s_info.want
     assert sch_out.block_tables is not None and len(sch_out.block_tables)==1 and len(sch_out.block_tables[0])==5
 
     assert req1.slot is not None
@@ -440,29 +433,31 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
     assert sch_out.step_metrics is not None and sch_out.step_metrics.step_id == sch.sch_metrics.step_id == 3    # step 3
 
     # actual states
-    assert req1.num_computed_tokens == s_info1.want
+    assert req1.num_computed_tokens == sch_out1.wants[0]
     assert req1.finished == False
 
     # ---------- step 3, mock forward / compute_logits / sampler  ----------
     # build attention metadata
     packed_ids, attn_meta = sch_out.build_attn_metadata(cache_data=sch.cache.data, rope=None)
     assert sch_out.slot_idx is not None and sch_out.slot_idx.tolist() == [req1.slot]
-    assert sch_out.want is not None and sch_out.want.tolist() == [s_info.want]
+    assert sch_out.want is not None and sch_out.want.tolist() == sch_out.wants
     assert sch_out.needs_sample_lst is not None and sch_out.needs_sample_lst == [True]
     assert sch_out.needs_sample_device is not None
     assert packed_ids.numel() == 1
     assert attn_meta.cos_sin is None    # due to None of rope
     assert attn_meta.cache == sch.cache.data
-    assert attn_meta.max_seqlen_q == s_info.want
-    assert attn_meta.cu_seqlens_q.tolist() == [0, s_info.want]
-    cache_len = input_len + s_info.want
+    assert attn_meta.max_seqlen_q == sch_out.wants[0]
+    assert attn_meta.cu_seqlens_q.tolist() == [0, sch_out.wants[0]]
+    cache_len = input_len + sch_out.wants[0]
     assert attn_meta.max_seqlen_k == cache_len
     assert attn_meta.cu_seqlens_k.tolist() == [0, cache_len]
     assert attn_meta.cache_seqlens.tolist() == [cache_len]
 
-    assert attn_meta.position_ids.tolist() == list(range(s_info1.want+pre_s_info.want, s_info1.want+pre_s_info.want+s_info.want))
+    # assert attn_meta.position_ids.tolist() == list(range(s_info1.want+pre_s_info.want, s_info1.want+pre_s_info.want+s_info.want))
+    start = sch_out1.wants[0]+pre_sch_out.wants[0]
+    assert attn_meta.position_ids.tolist() == list(range(start, start+sch_out.wants[0]))
     assert attn_meta.block_table.tolist() == sch_out.block_tables
-    assert attn_meta.slot_mapping.tolist() == s_info.cache_slots
+    assert attn_meta.slot_mapping.tolist() == sch_out.cache_slot_flat
     assert attn_meta.step_metrics_lst is not None and len(attn_meta.step_metrics_lst) == tmp_target_config.num_hidden_layers
 
     # build sampling tensors
@@ -475,7 +470,7 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
     sch_out.update_projected_state_in_advance()
 
     # projected states have been updated
-    assert req1.num_scheduled_tokens == s_info1.want + s_info2.want + s_info.want
+    assert req1.num_scheduled_tokens == sch_out1.wants[0] + sch_out2.wants[0] + sch_out.wants[0]
     assert req1.projected_is_decoding == True   # flip because of the finish of prompt tokens
     assert req1.projected_finished == True      # due to max_new_token=2
     assert sch.tok_id_tab.num_scheduled_tok_host[req1.slot].item() == req1.num_scheduled_tokens
@@ -506,14 +501,13 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
     # verify req1
     assert req1.output_ids == [TOK]
     # actual states
-    assert req1.num_computed_tokens == s_info1.want + pre_s_info.want
+    assert req1.num_computed_tokens == sch_out1.wants[0] + pre_sch_out.wants[0]
     assert req1.finished == False
 
     # ---------- snapshot of step 3 ----------
     sch_out.incr_num_in_flight()
     pre_sch_out = sch_out
-    s_info3 = s_info
-    pre_s_info = s_info
+    sch_out3 = sch_out
 
     # ---------- step 4: schedule ----------
     sch_out = sch.schedule(step_metrics=SchedulerStepMetrics())
@@ -532,7 +526,7 @@ def finish_on_max_new_token_limit(ctx: LifeCycle):
     # verify req1
     assert req1.output_ids == [TOK, TOK+1]
     # actual states
-    assert req1.num_computed_tokens == s_info1.want + s_info2.want + pre_s_info.want
+    assert req1.num_computed_tokens == sch_out1.wants[0] + sch_out2.wants[0] + pre_sch_out.wants[0]
     assert req1.finished == True
     assert req1.projected_finished == True
     assert req1.committed == True
@@ -681,7 +675,6 @@ def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, su
     # only survival_req succeeds
     assert sch.running == [survival_req]
     assert sch_out.reqs == [survival_req]
-    assert len(sch_out.s_infos) == len(sch_out.reqs)
     assert survival_req.slot is not None
 
     # # preempted_req fails, and is preempted, which means that its kv block table is freed, 
@@ -752,6 +745,12 @@ def _test_preemption_and_reschedule(sch: Scheduler, sch_out: SchedulerOutput, su
     assert list(sch.waiting) == [req3]
     assert sch.sch_metrics.num_rescheduled == 1
 
+    sch_out2.build_attn_metadata(cache_data=sch.cache.data, rope=None)
+    oracle = [r.projected_is_decoding or
+              (r.num_scheduled_tokens + w == r._num_projected_prefill_tokens)
+              for r, w in zip(sch_out2.reqs, sch_out2.wants)]
+    assert sch_out2.needs_sample_lst == oracle
+
 
 @pytest.mark.parametrize("use_d_first_schedule", [True, False])
 def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_schedule: bool):
@@ -777,6 +776,9 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     sch._alloc_resources_on_admission(req1, want=want)      # construct its block table, and consume one block
     req1.num_scheduled_tokens = want
     req1.metrics.first_schedule_time = 1.
+    sch.tok_id_tab.add_req(req1)   # register to tokken id table.
+    sch.tok_id_tab.num_scheduled_tok_host[req1.slot] = req1.num_scheduled_tokens
+    
     assert req1.projected_is_decoding == False
     assert req1.slot is not None
     assert len(sch.req_slot_pool._free) + 1 == tmp_target_config.max_num_req_slots
@@ -789,6 +791,9 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     sch._alloc_resources_on_admission(req2, want=want)      # construct its block table, and consume one block
     req2.num_scheduled_tokens = want
     req2.metrics.first_schedule_time = 1.
+    sch.tok_id_tab.add_req(req2)   # register to tokken id table.
+    sch.tok_id_tab.num_scheduled_tok_host[req2.slot] = req2.num_scheduled_tokens
+
     assert req2.projected_is_decoding == False
     assert req2.slot is not None
     assert len(sch.req_slot_pool._free) + 2 == tmp_target_config.max_num_req_slots
@@ -805,7 +810,7 @@ def test_preemption_in_prefill(tmp_target_config: ModelConfig, use_d_first_sched
     assert sch_out.batch_size == 1
 
     # only req1 succeeds
-    assert sch_out.s_infos[0].want == 7
+    assert sch_out.wants[0] == 7
     table1 = sch.cache.get_block_table(req1)
     assert table1 is not None and len(table1) == 2
     assert len(sch.cache.pool.free) == 1
@@ -838,6 +843,8 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     req1.output_ids = [TOK]
     req1.projected_is_decoding = True
     req1.metrics.first_schedule_time = 1.
+    sch.tok_id_tab.add_req(req1)
+    sch.tok_id_tab.num_scheduled_tok_host[req1.slot] = req1.num_scheduled_tokens
 
     # req2: D, i_len=16, o_len=1, num_scheduled_tokens=16
     input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(16)]
@@ -849,6 +856,8 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     req2.output_ids = [TOK]
     req2.projected_is_decoding = True
     req2.metrics.first_schedule_time = 1.
+    sch.tok_id_tab.add_req(req2)
+    sch.tok_id_tab.num_scheduled_tok_host[req2.slot] = req2.num_scheduled_tokens
 
     sch.running = [req1, req2]
 
@@ -861,7 +870,7 @@ def test_preemption_in_decoding(tmp_target_config: ModelConfig, use_d_first_sche
     assert sch_out is not None
 
     # only req1 succeeds
-    assert sch_out.s_infos[0].want == 1
+    assert sch_out.wants[0] == 1
     table1 = sch.cache.get_block_table(req1)
     assert table1 is not None and len(table1) == 2
     assert len(sch.cache.pool.free) == 1    # freed by req2 due to preemption.
@@ -893,6 +902,8 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     req1.output_ids = [TOK]
     req1.projected_is_decoding = True
     req1.metrics.first_schedule_time = 1.
+    sch.tok_id_tab.add_req(req1)
+    sch.tok_id_tab.num_scheduled_tok_host[req1.slot] = req1.num_scheduled_tokens
 
     # req2: P, i_len=23, o_len=0, num_scheduled_tokens=16
     input_ids = [random.randrange(tmp_target_config.vocab_size) for _ in range(23)]
@@ -903,6 +914,8 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     req2.num_scheduled_tokens = 16
     assert req2.projected_is_decoding == False
     req2.metrics.first_schedule_time = 1.
+    sch.tok_id_tab.add_req(req2)
+    sch.tok_id_tab.num_scheduled_tok_host[req2.slot] = req2.num_scheduled_tokens
 
     sch.running = [req2, req1] if p_before_d else [req1, req2]
 
@@ -914,7 +927,7 @@ def test_preemption_PD(tmp_target_config: ModelConfig, use_d_first_schedule: boo
     assert sch_out is not None
 
     # only req1 succeeds
-    assert sch_out.s_infos[0].want == 1
+    assert sch_out.wants[0] == 1
     table2 = sch.cache.get_block_table(req1)
     assert table2 is not None and len(table2) == 2
     assert len(sch.cache.pool.free) == 0

@@ -60,18 +60,15 @@ def build_block_table(tables, device):
 def build_attn_metadata(sch_out: SchedulerOutput, config: ModelConfig, cache_data: KVCacheData | None = None, rope: BaseRoPE | None = None) -> tuple[Tensor, AttentionMetadata]:
     # packing
     packed_id_list: list[int] = []
-    lens: list[int] = []
+    lens: list[int] = sch_out.wants
     cache_lens: list[int] = []
     position_id_lst: list[int] = []
-    cache_slots: list[int] = []
+    cache_slots: list[int] = sch_out.cache_slot_flat
     for i, req in enumerate(sch_out.reqs):
-        s_info = sch_out.s_infos[i]
-        lens.append(s_info.want)
-        cache_slots.extend(s_info.cache_slots)
-        packed_id_list.extend(req.get_existing_ids(s_info.want))    # compatible for recompute
+        packed_id_list.extend(req.get_existing_ids(sch_out.wants[i]))    # compatible for recompute
 
         start = req.num_computed_tokens
-        end = start + s_info.want
+        end = start + sch_out.wants[i]
         cache_lens.append(end)
         position_id_lst.extend(range(start, end))
 

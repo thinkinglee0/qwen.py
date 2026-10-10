@@ -50,41 +50,46 @@ def sampling_batch(tok, last_logits):
 
 def build_scheduler_output_on_prefill(model, cache, input_ids_lst) -> SchedulerOutput:
     reqs = []
-    scheduled: dict[str, ScheduledInfo] = {}
+    wants = []
+    slots = [0]*len(input_ids_lst)
+    cache_slot_flat = []
     block_tables: list[list[int]] = []
     for input_ids in input_ids_lst:
         req = ModelRequest(model.config, loop=None, input_ids=input_ids, sampling=None)
         reqs.append(req)
         want = len(input_ids)
         cache_slots = cache.allocate_slots(req, want)
-        scheduled[req.request_id] = ScheduledInfo(want, cache_slots)
+        wants.append(want)
+        cache_slot_flat.extend(cache_slots)
         block_table = cache.get_block_table(req)
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, slots=slots, wants=wants, cache_slot_flat=cache_slot_flat, block_tables=block_tables, config=model.config)
 
 def build_scheduler_output_on_decoding(model, cache, reqs) -> SchedulerOutput:
-    scheduled: dict[str, ScheduledInfo] = {}
+    wants = []
+    slots = [0]*len(reqs)
+    cache_slot_flat = []
     block_tables: list[list[int]] = []
     for req in reqs:
         want = 1
         cache_slots = cache.allocate_slots(req, want)
-        scheduled[req.request_id] = ScheduledInfo(want, cache_slots)
+        wants.append(want)
+        cache_slot_flat.extend(cache_slots)
         block_table = cache.get_block_table(req)
         assert block_table is not None
         block_tables.append(block_table)
 
-    return SchedulerOutput(step_id=0, reqs=reqs, scheduled=scheduled, block_tables=block_tables, config=model.config)
+    return SchedulerOutput(step_id=0, reqs=reqs, slots=slots, wants=wants, cache_slot_flat=cache_slot_flat, block_tables=block_tables, config=model.config)
 
 def add_sampled_tokens(sch_out: SchedulerOutput, decode_ids: list[int], eos_token_id_set):
     assert sch_out.batch_size == len(decode_ids)
     now = time.perf_counter()
     for i, (req, tok) in enumerate(zip(sch_out.reqs, decode_ids)):
         req.add_sampled_token(tok, eos_token_id_set, now=now)
-        s_info = sch_out.s_infos[i]
-        req.num_scheduled_tokens += s_info.want
-        req.num_computed_tokens += s_info.want
+        req.num_scheduled_tokens += sch_out.wants[i]
+        req.num_computed_tokens += sch_out.wants[i]
 
 class HookManager:
     hooks: dict[str, Any]   # save_i/save_o store a Tensor directly; patch_rope's hooks store list[Tensor]
