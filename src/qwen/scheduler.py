@@ -867,14 +867,12 @@ class Scheduler:
                 logger.debug(f"len, running: {len(self.running)}, waiting: {len(self.waiting)}, step_id: {self.sch_metrics.step_id}")
 
         # 1) running first — protect in-flight decodes' TPOT.
-        num_projected_finished = 0
         with timed(step_metrics, "sched_run"):
             scheduled_running: list[ModelRequest] = []
             for req in list(self.running):
                 # all finished requests should have been removed by cleanup_on_finished in commit_step after add_sampled_tokens
                 assert not req.finished
                 if req.projected_finished:
-                    num_projected_finished += 1
                     continue
 
                 # the request that was preempted in the current or previous step should be skipped.
@@ -944,7 +942,7 @@ class Scheduler:
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"before sched_ret, step_id: {self.sch_metrics.step_id}, scheduled: {len(scheduled_running)}, "
-                         f"running: {len(self.running)}, waiting: {len(self.waiting)}, num_projected_finished: {num_projected_finished}")
+                         f"running: {len(self.running)}, waiting: {len(self.waiting)}, num_projected_finished: {self.count_projected_finished()}")
 
         if not scheduled_running:
             return None     # no work to do
@@ -989,14 +987,12 @@ class Scheduler:
         
         # 1) running first — protect in-flight decodes' TPOT.
         #    Note: Ps and Ds may interleave.
-        num_projected_finished = 0
         with timed(step_metrics, "sched_run"):
             scheduled_running: list[ModelRequest] = []
             for req in list(self.running):  # snapshot
                 # all finished requests has been removed by cleanup_on_finished in commit_step after add_sampled_tokens
                 assert not req.finished
                 if req.projected_finished:
-                    num_projected_finished += 1
                     continue
 
                 # the request that was preempted in the current or previous step should be skipped.
@@ -1080,7 +1076,7 @@ class Scheduler:
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"before sched_ret, step_id: {self.sch_metrics.step_id}, scheduled: {len(scheduled_running)}, "
-                         f"running: {len(self.running)}, waiting: {len(self.waiting)}, num_projected_finished: {num_projected_finished}")
+                         f"running: {len(self.running)}, waiting: {len(self.waiting)}, num_projected_finished: {self.count_projected_finished()}")
 
         if not scheduled_running:
             return None     # no work to do
