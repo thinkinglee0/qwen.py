@@ -61,9 +61,12 @@ arm B 04:33–05:00 → qwen.py sweep run 1 05:02–05:14 → run 2 05:17–05:2
    host-bound loops transfers across hosts** (§2.4).
 5. **This host's Python is ~2.3× slower than log1001's, and the data proves it is only the host.**
    Same code, same branch: `gpu_busy_from_trace` agrees with log1001 **within ±2 % at every batch**,
-   while `wall_clean` is 2.26–2.38× higher at batch ≤ 128 and converges to 1.01× at 512. Cause:
-   `CPU max MHz 2800` × `scaling 80 %` ≈ **2.24 GHz**, held down by neighbour load (`load average
-   12.11` measured 12 minutes *after* our last run ended, with no users logged in).
+   while `wall_clean` is 2.26–2.38× higher at batch ≤ 128 and converges to 1.01× at 512. Most likely
+   cause: **a slower CPU class.** A Zen 2 EPYC 7402 (boost 3.35 GHz) against log1001's Zen 4
+   Ryzen 5 7500F (boost 5.0 GHz) gives 1.5× from clock and roughly 1.3× from IPC, about 2× together.
+   That is an estimate: this host's clock was never measured (see the correction under §1).
+   *An earlier version of this report blamed neighbours for holding the clock at 2.24 GHz. That was
+   wrong; see §1.*
 6. **So read the two halves of the sweep differently.** Batch 512/1024 is a measurement and transfers.
    Batch ≤ 256 absolute throughput does not transfer; the *ratios* in point 4 do.
 7. **The device-side picture from log1001 is confirmed, not disturbed.** The sampler is still
@@ -88,13 +91,25 @@ arm B 04:33–05:00 → qwen.py sweep run 1 05:02–05:14 → run 2 05:17–05:2
 | GPU | RTX 4090, driver **580.142** | RTX 4090, driver 550.127.08 |
 | Enforced power limit | **400 W** (max 600) | 450 W (max 600) |
 | HBM, measured | **919 GB/s** | 876.8 GB/s (vendor panel) |
-| CPU | **AMD EPYC 7402**, 24C/48T, `max 2800 MHz`, `scaling 80 %` → **≈ 2.24 GHz** | Ryzen 5 7500F, 6C/12T, 3.7/5.0 GHz |
+| CPU | **AMD EPYC 7402** (Zen 2), 24C/48T, 2.8/3.35 GHz; lscpu `max 2800 MHz` (= base), `scaling 80 %`; **effective clock not measured** | Ryzen 5 7500F (Zen 4), 6C/12T, 3.7/5.0 GHz |
 | L3 | **128 MiB in 8 instances** (8 CCX × 3 cores × 16 MiB) | 32 MiB, 1 CCD |
 | CPU allocation | CFS quota `cfs_quota_us 1152000` = **11.52 cores**; affinity **all 48**; 1 NUMA node | 12/12 |
 | Neighbour load | **`load average 12.11 / 12.81 / 12.96`**, taken 12 min after our runs ended, 0 users | not recorded |
 | 3 M-iteration Python loop | **276 / 275 / 285 ms** | not recorded |
 | `aten` launch overhead, median | 7.56 µs (passes the §1b < 10 µs gate) | not recorded |
 | PCIe | gen 4 × 16 | gen 4 × 16 |
+
+> **Correction (2026-10-09).** An earlier version of this report computed `2800 × 80 % ≈ 2.24 GHz`
+> and blamed neighbour load for holding the clock down. All three steps of that argument were wrong.
+> (1) Under acpi-cpufreq, lscpu's `CPU max MHz` is the highest P-state, which is the 7402's
+> **base** clock. Boost goes up to 3.35 GHz and is not shown. (2) `scaling MHz` is one instantaneous
+> reading of current ÷ max frequency. It is not utilisation, and it says nothing about who is
+> loading the host. (3) Even if the 80 % figure were real, a clock-bound loop would slow by
+> 1/0.8 = 1.25×, which cannot explain 2.3×. The load average does show that neighbours were
+> present. But on a bare-metal container host they cost you through CFS contention, SMT siblings
+> and shared cache, not through frequency, and none of these was measured here. The runbook's
+> [`check_instance.sh`](../env/vastai/check_instance.sh) now measures the effective clock (§5) and
+> neighbour occupancy (§7) directly.
 
 The GPU is healthy: the vendor panel's 387.5 GB/s claim was simply wrong, and the measured 919 GB/s is
 91 % of the card's theoretical 1 008. No thermal throttling anywhere (≤ 60 °C,
@@ -225,7 +240,8 @@ becomes the long pole at 512. A field-by-field split of the host side confirms i
 localised: `sched` 1.72×, `sched_run` 1.97×, `bld_meta` 2.10×, `sample` 2.35×, `dth` 1.97×,
 `dth_wait` 1.90×, `ci` 1.97×. **Every unrelated pure-CPU field scales by the same ~2× — that is a
 slower interpreter, not a bottleneck.** The 3 M-iteration Python loop (276/275/285 ms, only 3.6 %
-spread) says the same thing and says it is clock-limited rather than contention-jittered.
+spread) says the same thing: the slowdown is steady, not jitter from intermittent contention. The loop
+cannot tell clock from IPC, so it supports the CPU-class explanation in §1 without proving it.
 
 Three consequences, and they are different for different parts of the report:
 
@@ -535,7 +551,9 @@ capturing a step that spends 61 % of its device time in an avoidable sampler bak
 When 6.1 and 6.2 land, the comparison needs a host where the 3 M-iteration Python loop is near the
 reference rather than 276 ms, so that the batch ≤ 256 absolute numbers become measurements instead of
 ratios. Prefer a high-clock consumer part (Ryzen 7000/9000) over a shared EPYC, and bind to one CCX
-([§3 of the runbook](../env/vastai/vast-evn-build.md)).
+([§3 of the runbook](../env/vastai/vast-evn-build.md)). Keep the `check_instance.sh` output with the
+results. Its §5 clock is the number log1003 lacked, and without it the cause of the gap could only be
+inferred.
 
 ### 6.4 Add a third vLLM arm to split compilation from graph capture
 
