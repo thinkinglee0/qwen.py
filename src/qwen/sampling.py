@@ -139,33 +139,38 @@ class SamplingTensors:
         )
 
 def apply_rep_penalty(logits, sampling_tensors: SamplingTensors):
-    rep_mask = sampling_tensors.prompt_mask | sampling_tensors.output_mask  # [bsz, vocab_size], bool
+    rep_mask = sampling_tensors.prompt_mask | sampling_tensors.output_mask  # [bsz, vocab], bool
     rep = torch.where(rep_mask, sampling_tensors.repetition_penalty[:, None], 1.0)  # unseen set to 1.0
+    ori_dtype = logits.dtype
     logits = torch.where(logits > 0, logits / rep, logits * rep)    # ensure new <= old while rep>1.0, no matter the signedness of ligits
-    return logits
+    return logits.to(ori_dtype) # keep dtype the same with apply_rep_penalty_sparse for oracle test.
 
 def apply_rep_penalty_sparse(logits, sampling_tensors: SamplingTensors):
     # in place: logits is modified; padding in seen_toks repeats a valid token, so duplicate writes carry the same value
+    # logits [bsz, vocab], bf16
     gathered = logits.gather(1, sampling_tensors.seen_toks)     # [B, L]
     rep = sampling_tensors.repetition_penalty[:, None]          # [B, 1], fp32
-    vals = torch.where(gathered > 0, gathered / rep, gathered * rep)    # [B, L], fp32
+    vals = torch.where(gathered > 0, gathered / rep, gathered * rep)        # [B, L], fp32
 
-    logits.scatter_(1, sampling_tensors.seen_toks, vals)
-    return logits
+    logits.scatter_(1, sampling_tensors.seen_toks, vals.to(logits.dtype))   # cast back to bf16
+    return logits   # bf16
 
 def apply_penalties(logits: torch.Tensor, sampling_tensors: SamplingTensors):
-    # logits [bsz, vocab_size], fp32
+    # logits [bsz, vocab], bf16
+    # [B, V], fp32
 
     if sampling_tensors.rep_switch_on:
         # logits = apply_rep_penalty(logits=logits, sampling_tensors=sampling_tensors)
-        logits = apply_rep_penalty_sparse(logits=logits, sampling_tensors=sampling_tensors)
+        logits = apply_rep_penalty_sparse(logits=logits, sampling_tensors=sampling_tensors) # bf16
 
     # frequency/presence based on output token
     if sampling_tensors.freq_switch_on:
-        logits = logits - sampling_tensors.frequency_penalty[:, None] * sampling_tensors.output_counts
+        # bf16.sub_(float32)
+        logits = logits.sub_(sampling_tensors.frequency_penalty[:, None] * sampling_tensors.output_counts)
 
     if sampling_tensors.pres_switch_on:
-        logits = logits - sampling_tensors.presence_penalty[:, None] * sampling_tensors.output_mask
+        # bf16.sub_(float32)
+        logits = logits.sub_(sampling_tensors.presence_penalty[:, None] * sampling_tensors.output_mask)
 
     return logits
 
@@ -206,16 +211,19 @@ def apply_top_p(logits: torch.Tensor, top_p: torch.Tensor):
     return logits.masked_fill(remove, float("-inf"))
 
 def apply_fused_top_k_and_p(logits: torch.Tensor, top_k: torch.Tensor, max_k: int, top_p: torch.Tensor):
-    # logits [bsz, vocab]
-    # top_k/top_p [bsz]
+    # logits [bsz, vocab], bf16
+    # top_k/top_p [bsz], fp32
     bsz, vocab = logits.shape
     assert 1 <= max_k <= vocab, f"max_k out of range: {max_k}"
 
-    top_vals, indices = torch.topk(logits, max_k, dim=-1, sorted=True)    # [bsz, max_k] descending, top-max_k of all lines
+    top_vals, indices = torch.topk(logits, max_k, dim=-1, sorted=True)    # [bsz, max_k], bf16, descending, top-max_k of all lines
 
     # mask out elements beyond top-k
     beyond = torch.arange(max_k, device=logits.device)[None, :] >= top_k[:, None]
-    top_vals = top_vals.masked_fill(beyond, float("-inf"))
+    top_vals = top_vals.masked_fill_(beyond, float("-inf"))  # in-place write
+
+    # # promote to fp32 for precision before top-p
+    # top_vals = top_vals.to(torch.float)
 
     # top-p on sorted top_vals
     probs = top_vals.softmax(dim=-1)    # [bsz, max_k]
@@ -226,13 +234,14 @@ def apply_fused_top_k_and_p(logits: torch.Tensor, top_k: torch.Tensor, max_k: in
     top_vals = top_vals.masked_fill(remove, float("-inf"))
 
     out = torch.full_like(logits, float("-inf"))    # full of -inf
+    logger.info(f"dtype, out: {out.dtype}, logits: {logits.dtype}, top_vals: {top_vals.dtype}")
     out.scatter_(1, indices, top_vals)      # scatter sruvial elements back to logits
     return out
 
 
-def sample2(logits: torch.Tensor, sampling_tensors: SamplingTensors):
+def sample(logits: torch.Tensor, sampling_tensors: SamplingTensors):
     assert sampling_tensors.temperature is not None and sampling_tensors.top_k is not None and sampling_tensors.top_p is not None
-    return sample(logits, 
+    return sample_topk_window(logits, 
                   skip_scale_host=sampling_tensors.skip_scale_host, greedy_host=sampling_tensors.greedy_host,
                   temperature=sampling_tensors.temperature,
                   top_k=sampling_tensors.top_k, max_k=sampling_tensors.max_k, top_p=sampling_tensors.top_p)
@@ -247,15 +256,18 @@ def scaling(logits: torch.Tensor, skip_scale_host: torch.Tensor, greedy_host: to
     # NOTE: no not use where() here, because it will create a new tensor
     scale = temperature if greedy is None else temperature.masked_fill(greedy, 1.0)
 
+    # NOTE: div_ do not change the dtype of logits, however logits/scale[:, None] will return a tensor with float32
     return logits.div_(scale[:, None]), greedy  # temperature; greedy rows unscaled
 
-def sample(logits: torch.Tensor, skip_scale_host: torch.Tensor, greedy_host: torch.Tensor, temperature: torch.Tensor,
+def sample_oracle(logits: torch.Tensor, skip_scale_host: torch.Tensor, greedy_host: torch.Tensor, temperature: torch.Tensor,
            top_k: torch.Tensor, max_k:int, top_p: torch.Tensor):
-    # logits: [n, vocab] (penalties already applied); all three params are [n]
+    # logits: [n, vocab] (penalties already applied), bf16; all three params are [n]
+
     if greedy_host.all():
         return logits.argmax(dim=-1)  # all greedy, no scaling, no sampling
 
     logits, greedy = scaling(logits, skip_scale_host, greedy_host, temperature)
+
     # argmax should be computed before top-k/p
     greedy_tokens = None
     if greedy is not None:
@@ -275,4 +287,39 @@ def sample(logits: torch.Tensor, skip_scale_host: torch.Tensor, greedy_host: tor
         return torch.where(greedy, greedy_tokens, sampled)              # [n]
 
     return sampled
+
+# top-k window
+def sample_topk_window(logits: torch.Tensor, skip_scale_host: torch.Tensor, greedy_host: torch.Tensor, temperature: torch.Tensor,
+           top_k: torch.Tensor, max_k:int, top_p: torch.Tensor):
+    # logits [B, V] bf16, penalties applied
+    if greedy_host.all():
+        return logits.argmax(dim=-1)    # [B]
+
+    # NOTE: keep in mind that indices are token ids.
+    top_vals, indices = torch.topk(logits, max_k, dim=-1, sorted=True)  # bf16, ranking is exact
+    greedy_tokens = indices[:, 0]                                       # [B], free argmax
+
+    w = top_vals.float()                                                # cast only the window
+    if not skip_scale_host.all():                                       # temperature on the window
+        scale = temperature if not greedy_host.any() else temperature.masked_fill(temperature <= EPS, 1.0)    # [B], fp32
+        w = w / scale[:, None]  # resides on L2 due to its small size.
+
+    # tok-k
+    beyond = torch.arange(max_k, device=w.device)[None, :] >= top_k[:, None]    # [B, max_k], bool
+    w = w.masked_fill(beyond, float("-inf"))
+
+    # top-p
+    probs = w.softmax(dim=-1)
+    remove = (probs.cumsum(dim=-1) - probs) > top_p[:, None]
+    w = w.masked_fill(remove, float("-inf"))                            # top-p in the window
+
+    # replace sfotmax+multinomial with Gumbel-max
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(w).clamp_(min=1e-20)))
+    local = (w + gumbel_noise).argmax(dim=-1, keepdim=True)     # column index of maximal values
+    sampled = indices.gather(1, local).squeeze(1)               # [B], tok id of the maximal vlue, that is, tok id with the max probility per row
+
+    if greedy_host.any():
+        return torch.where(temperature <= EPS, greedy_tokens, sampled)  # [B]
+    return sampled
+
 

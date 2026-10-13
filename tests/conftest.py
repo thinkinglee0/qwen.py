@@ -264,6 +264,13 @@ def tmp_cache(tmp_target_config: ModelConfig):
 @pytest.fixture(scope="function")
 def tmp_target_driver(tmp_target_config: ModelConfig) -> Iterator[ServingDriver]:
     tmp_target_config.set_default_compile_rope()  # enable rope compilation for cuda
+
+    # enable top-p and penalties
+    tmp_target_config.top_p = 0.8
+    tmp_target_config.repetition_penalty = 1.1
+    tmp_target_config.frequency_penalty = .2
+    tmp_target_config.presence_penalty = .1
+
     engine = LLMEngine(tmp_target_config)
     with ServingDriver(engine) as d:
         yield d

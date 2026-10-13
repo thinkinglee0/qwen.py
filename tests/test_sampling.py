@@ -3,7 +3,7 @@ import pytest
 import logging
 from types import SimpleNamespace
 
-from qwen.sampling import (apply_top_p, apply_top_k, apply_fused_top_k_and_p, apply_penalties, sample, extract_info_from_temperature,
+from qwen.sampling import (apply_top_p, apply_top_k, apply_fused_top_k_and_p, apply_penalties, sample_topk_window, extract_info_from_temperature,
                           SamplingParams, SamplingParamTable, SamplingTensors)
 from qwen.constants import MAX_EFFECTIVE_TOP_K, DEFAULT_PIPELINE_DEPTH
 from qwen.constants import EPS, MAX_EFFECTIVE_TOP_K
@@ -67,12 +67,13 @@ def _make_sampling_tensors(prompts, outputs, vocab_size,
         seen_toks=seen_toks,
     )
 
-def test_apply_penalties():
+@pytest.mark.parametrize("dtype", [torch.float, torch.bfloat16])
+def test_apply_penalties(dtype):
     torch.manual_seed(0)
     device = resolve_device()
     vocab_size = 151936          # Actual value for Qwen2.5
     bsz = 4
-    logits = torch.randn(bsz, vocab_size, device=device, dtype=torch.float)     # input dtype, fixed at sampler()
+    logits = torch.randn(bsz, vocab_size, device=device, dtype=dtype)     # input dtype, fixed at sampler()
 
     prompts = [[101, 202, 303], [55, 66],      [777], [11, 12]]
     outputs = [[202],           [66, 66, 66],  [],    [12, 12]]   # seq2 not yet generated
@@ -102,15 +103,16 @@ def test_apply_penalties():
         assert new_logits[0, tok] <= logits[0, tok]
 
     assert torch.sum(new_logits[1] != logits[1], dtype=torch.float32) == 1.0    # only one element (66) occurs in the output
-    torch.testing.assert_close((new_logits[1]-logits[1]).min().item(), -1.5, rtol=0, atol=1e-3)     # token_id=66 occurs three times, so frequency penalty = 0.5*3 = 1.5
-    torch.testing.assert_close((new_logits[1,66]-logits[1,66]).item(), -1.5, rtol=0, atol=1e-3)              # same
+    # token_id=66 occurs three times, so frequency penalty = 0.5*3 = 1.5.
+    # Compare against the fp32-subtract-then-round reference: in bf16 the diff itself is off by up to half an ulp.
+    assert new_logits[1, 66] == (logits[1, 66].float() - 1.5).to(dtype)
     assert new_logits[1, 55] == logits[1, 55]       # prompt-only token is untouched by freq penalty
 
     assert torch.equal(new_logits[2], logits[2])        # do nothing
 
     # presence penalty: a flat -presence_penalty on every token seen in the output, count-independent
     assert torch.sum(new_logits[3] != logits[3], dtype=torch.float32) == 1.0    # only token 12 is in the output
-    torch.testing.assert_close((new_logits[3, 12]-logits[3, 12]).item(), -0.7, rtol=0, atol=1e-3)
+    assert new_logits[3, 12] == (logits[3, 12].float() - 0.7).to(dtype)
     assert new_logits[3, 11] == logits[3, 11]       # prompt-only token is untouched by pres penalty
 
 
@@ -426,7 +428,7 @@ def test_sample_greedy_takes_argmax():
     # "no top-k" is spelled k=vocab now: the param table clamps into [1, cutoff] and never emits 0
     temperature=torch.tensor([0.0])
     skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
-    out = sample(logits, temperature=temperature,
+    out = sample_topk_window(logits, temperature=temperature,
                  skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([3]), max_k=3,
                  top_p=torch.tensor([1.0]))  # top_k/p no-op
@@ -440,7 +442,7 @@ def test_sample_greedy_deterministic_across_seeds():
         torch.manual_seed(seed)
         temperature = torch.tensor([0.0])
         skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
-        res.append(sample(logits, temperature=temperature,
+        res.append(sample_topk_window(logits, temperature=temperature,
                            skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                            top_k=torch.tensor([4]), max_k=4,
                            top_p=torch.tensor([1.0])).item())  # top_k/p no-op
@@ -453,7 +455,7 @@ def test_sample_all_neg_inf_row_does_not_crash():
     torch.manual_seed(0)
     temperature = torch.tensor([1.0])
     skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
-    out = sample(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
+    out = sample_topk_window(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([5]), max_k=5, top_p=torch.tensor([1.0]))
     assert out.shape == (1,)
     if logger.isEnabledFor(logging.DEBUG):
@@ -468,7 +470,7 @@ def test_sample_mixed_greedy_and_random_rows():
     torch.manual_seed(0)
     temperature = torch.tensor([0.0, 1.0])
     skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
-    out = sample(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
+    out = sample_topk_window(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([3, 3]), max_k=3, top_p=torch.tensor([1.0, 1.0]))
     assert out[0].item() == 1
     assert 0 <= out[1].item() < 3
@@ -480,6 +482,69 @@ def test_sample_top_k_1_equals_argmax_even_when_sampling():
     torch.manual_seed(123)
     temperature = torch.tensor([1.0])
     skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
-    out = sample(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
+    out = sample_topk_window(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([1]), max_k=1, top_p=torch.tensor([1.0]))
     assert out.item() == 1
+
+# ---------- sample: distribution (Gumbel-max over the top-k window) ----------
+
+def _reference_probs(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
+    # fp64 reference for one row: temperature -> top-k -> top-p (same keep rule as sample()) -> renormalise
+    z = logits.double() / temperature
+    vals, idx = torch.sort(z, descending=True)
+    vals[top_k:] = float("-inf")
+    p = vals.softmax(dim=-1)
+    remove = (p.cumsum(dim=-1) - p) > top_p
+    vals[remove] = float("-inf")
+    probs = torch.zeros_like(z)
+    probs[idx] = vals.softmax(dim=-1)
+    return probs
+
+
+def _chi2_critical(df: int, z: float = 4.753) -> float:
+    # Wilson-Hilferty approximation of the chi-square quantile; z = 4.753 is the one-sided 1e-6 tail
+    return df * (1 - 2 / (9 * df) + z * (2 / (9 * df)) ** 0.5) ** 3
+
+
+@pytest.mark.parametrize("dtype", [torch.float, torch.bfloat16])
+def test_sample_matches_softmax_distribution(dtype):
+    # Gumbel-max must draw from softmax(logits / T) restricted to the top-k/top-p set,
+    # with per-row parameters honoured inside one batch.
+    torch.manual_seed(0)
+    V, n = 64, 20000                                   # n draws per parameter group
+    base = (torch.randn(V) * 0.5).to(dtype)            # flat enough that top-p keeps several tokens; bf16 upcasts losslessly
+    groups = [(0.7, 8, 0.8), (1.3, 20, 0.95)]          # (temperature, top_k, top_p)
+
+    temperature = torch.cat([torch.full((n,), t) for t, _, _ in groups])
+    top_k = torch.cat([torch.full((n,), k, dtype=torch.int64) for _, k, _ in groups])
+    top_p = torch.cat([torch.full((n,), p) for _, _, p in groups])
+    logits = base.expand(len(groups) * n, V).clone()
+    skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+
+    out = sample_topk_window(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
+                 top_k=top_k, max_k=max(k for _, k, _ in groups), top_p=top_p)
+
+    for g, (t, k, p) in enumerate(groups):
+        expected = _reference_probs(base, t, k, p)
+        counts = torch.bincount(out[g * n:(g + 1) * n], minlength=V).double()
+
+        support = expected > 0
+        assert counts[~support].sum() == 0, f"group {g}: drew a token outside the top-k/top-p set"
+
+        exp_counts = expected[support] * n
+        chi2 = ((counts[support] - exp_counts) ** 2 / exp_counts).sum().item()
+        df = int(support.sum()) - 1
+        assert df >= 3, f"group {g}: support of {df + 1} is too small to test the distribution"
+        assert chi2 < _chi2_critical(df), f"group {g}: chi2={chi2:.1f} over df={df}"
+
+
+def test_sample_greedy_rows_take_window_argmax_in_mixed_batch():
+    # greedy rows come from indices[:, 0] of the topk; they must equal the plain argmax, including bf16 input
+    torch.manual_seed(1)
+    logits = (torch.randn(6, 1000) * 3).to(torch.bfloat16)
+    temperature = torch.tensor([0.0, 0.7, 0.0, 1.0, 0.0, 0.9])
+    skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+    out = sample_topk_window(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
+                 top_k=torch.full((6,), 20), max_k=20, top_p=torch.full((6,), 0.8))
+    greedy = temperature <= EPS
+    assert torch.equal(out[greedy], logits.argmax(dim=-1)[greedy])
