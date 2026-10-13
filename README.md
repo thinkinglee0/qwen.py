@@ -23,6 +23,7 @@ Development target: **Qwen2.5-0.5B** (fp32, CPU). Performance target: **Qwen2.5-
 | **M8**    | async scheduling (one decode step of lookahead)            | ✅ done. `step_0` launches a step with no sync; `step_1` drains the previous one. Request state splits into projected/actual so the next batch is planned before the current lands; token ids and penalty masks stay resident on device. **+20.2 % peak throughput, +46.4 % at batch 128, GPU idle in a pure-decode step 27.5 % → 1.5 % with kernel time unchanged (+0.8 %)**. Report: [log928](./docs/performance_analysis_log928.md). |
 | **M9**    | fused top-k + top-p sampling                                | ✅ done. One `topk(max_k)` feeds a `[batch, max_k]` window that does the per-row k mask, softmax, cumsum and top-p threshold, then scatters survivors back — deleting the full-vocabulary `torch.sort` that cost **15.4 ms of a 52 ms step**. **+51.5 % peak throughput (7 245 → 10 976 tok/s), −34.8 % TPOT at batch 512, device work per decode step −47 %**, the GPU-bound knee moves batch 64 → 128, and the batch-1024 OOM is gone. Report: [log1001](./docs/performance_analysis_log1001.md) ([中文](./docs/performance_analysis_log1001.zh.md)). |
 | **M10**   | external yardstick — A/B against vLLM 0.30.0                | ✅ done. Same host, same window, same workload, one engine at a time, via `benchmark/tool/vllm_sweep.py`. At batch 512 qwen.py is at **81 %** of vLLM with compilation and CUDA graphs *disabled* and **61 %** of its peak with both on; the gap factorises as **1.23× engine design × 1.17× compile+graphs**. Report: [log1003](./docs/performance_analysis_log1003.md) ([中文](./docs/performance_analysis_log1003.zh.md)). |
+| **M11**   | the sampler, finished                                        | ✅ done. Per-term penalty gates, a sparse `[B, L]` repetition penalty, `topk` on the bf16 logits with fp32 only on the `[B, max_k]` window, and Gumbel-max sampling there. The sampler at batch 512 went **16.35 → 1.57 ms/step**, and the device step **27.0 → 12.4 ms**. Peak throughput **12 754 → 15 999 tok/s (+25.4 %)** on a 7950X3D host, the project's best. Reports: [log1009](./docs/performance_analysis_log1009.md) ([中文](./docs/performance_analysis_log1009.zh.md)), [log1012](./docs/performance_analysis_log1012.md), [log1013](./docs/performance_analysis_log1013.md) ([中文](./docs/performance_analysis_log1013.zh.md)), [log1013 window run](./docs/performance_analysis_log1013_window.md); plan: [sampler_optimization_plan](./docs/sampler_optimization_plan.md). |
 | later     | Fused kernels in Trition | planed  |
 
 Correctness is the gate for every milestone: a milestone is "done" only when its activations match the reference within tolerance (see [Validation](#validation)).
@@ -61,8 +62,11 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 - **Sampling** — parses `generation_config.json`; applies repetition/frequency/presence penalties right after `forward`, then samples (temperature, top_k, top_p, multinomial) when `do_sample` is on.
 - **Device-resident penalty masks** — `TokenIdTable` keeps the full token-id history on device, one row per request slot, and derives `output_counts` plus the prompt/output presence masks there (`bin_count_and_mask`): both masks share one `[B, 2V+16]` buffer, so it is a single memset and a single scatter. The sampler needs nothing from the host, which is the precondition for launching a step without a sync.
 - **Sync-free sampler setup** — `max_k` is read from a pinned host mirror of the top-k column instead of `top_k.max().item()`; `MAX_EFFECTIVE_TOP_K = 1024` clamps a larger top-k rather than paying a wider `topk()` for something statistically indistinguishable from none. `SamplingParams.validate()` rejects out-of-range parameters at submission. **Note the semantics**: with `vocab_size > 1024`, "top-k disabled" is implemented as top-1024, which is a truncation and not a no-op (`test_fused_truncates_at_cutoff_where_sequential_keeps_the_tail` documents the divergence).
-- **Fused top-k + top-p** — `apply_fused_top_k_and_p` runs one `topk(max_k, sorted=True)` and does everything else on the resulting `[batch, max_k]` window: per-row k mask → softmax → cumsum → top-p threshold → `scatter_` back to vocab order. `torch.topk` already returns descending values, so the old `apply_top_p`'s full-vocabulary `torch.sort` was re-deriving an order it had just been handed — 15.4 ms/step at batch 512, plus a 1.73 GiB workspace that OOM'd batch 1024. The per-row mask has to be applied *before* the softmax or probabilities renormalise over the batch-wide slab instead of each row's own k; `test_fused_renormalises_probs_within_each_row_k` pins that.
-- **Known cost** — the sampler is still **61 % of device work at batch 512** (16.3 of 26.9 ms/step). What remains is ~23 full-vocabulary passes for a problem 20 columns wide: temperature, penalties, the `-inf` scatter-back, the fp32 softmax, the dead-row guard, `multinomial` and `argmax` all still run over all 151 936 columns. See [§2.4](#24-fused-top-k--top-p--log1001) and roadmap item 1.
+- **Fused top-k + top-p (M9)** — one `topk(max_k, sorted=True)` replaced the old full-vocabulary `torch.sort`, which was re-deriving an order `topk` had just handed over: 15.4 ms/step at batch 512, plus a 1.73 GiB workspace that OOM'd batch 1024. The per-row k mask has to be applied *before* the softmax, or the probabilities renormalise over the batch-wide slab instead of each row's own k (`test_fused_renormalises_probs_within_each_row_k`). `apply_fused_top_k_and_p` survives as the reference for that logic; `sample()` no longer calls it.
+- **"Nothing to do" gates (M11)** — `rep_switch_on`, `freq_switch_on`, `pres_switch_on`, `skip_scale_host` and `greedy_host` are read from the pinned host mirror of the sampling parameters, so they cost no device sync. Each penalty runs only if some row needs it; temperature is skipped when every row has T ∈ {0, 1}; an all-greedy batch returns `argmax` straight away. The gates are per term, finer than vLLM's all-or-nothing `no_penalties`.
+- **Sparse repetition penalty (M11)** — `apply_rep_penalty_sparse` gathers the logits at the request's token history (`seen_toks`, `[B, L]`, ≤ 0.7 % of the vocabulary), rescales them in fp32 and `scatter_`s them back in place. No `[B, V]` mask is read. Padding repeats the row's first prompt token, so a duplicate write carries the same value. `smp_pen` went **6.85 → 0.09 ms/step** at batch 512.
+- **Windowed sampling (M11)** — `sample()` runs `topk` on the **bf16** logits; bf16 → fp32 is lossless, so ranking in bf16 is exact, and it needs half the radix passes (0.76 against 1.87 ms). Only the `[B, max_k]` window is cast to fp32. Temperature, top-k mask, softmax, top-p and the draw all happen there: **Gumbel-max** (`argmax(w − log(−log u))`) replaces `multinomial`, and greedy rows take `indices[:, 0]` for free. Nothing returns to `[B, V]` after `topk`. `smp_pick` went **8.53 → 0.80 ms/step** at batch 512. `test_sample_matches_softmax_distribution` checks the draw against an fp64 reference with a χ² test, for fp32 and bf16 inputs.
+- **Remaining cost** — the sampler is **1.57 ms of a 12.4 ms device step** at batch 512: bf16 `topk` 0.76 ms, the dense `output_counts`/mask build in `smp_prep` 0.60 ms (roadmap item 4), penalties 0.09 ms. It is no longer the bottleneck; see [§2.6](#26-finishing-the-sampler--log1009--log1013).
 
 **Serving & observability**
 - **Streaming HTTP service** — FastAPI `/generate_stream` and `/health`; `async_generate` interleaves `_decode_step` into the running event loop so one worker serves multiple concurrent streams; `@asynccontextmanager`/`@pytest_asyncio.fixture`/`@pytest.fixture` ensure model weights load only once across sync, async, and endpoint tests.
@@ -78,6 +82,9 @@ Correctness is the gate for every milestone: a milestone is "done" only when its
 **Random seed for shuffle**: 0
 
 ### 1. Static Batching
+
+<details>
+<summary>Historical: measured on a CPU (Intel Core i7, SDPA attention) before static batching was replaced by continuous batching. Click to expand.</summary>
 
 #### 1.1 Platform: CPU Intel Core i7
 
@@ -105,7 +112,11 @@ Full per-batch-size latency table: [`docs/static_batching_cpu_benchmark.md`](./d
 
 #### 1.2 Platform: NVIDIA RTX 4090
 
-stay tuned
+Not measured, and no longer planned. `StaticScheduler` was replaced by continuous batching on a paged
+KV cache in `74a9daf` (2026-08-14), before the engine ever ran on a GPU. Every RTX 4090 measurement is
+of the continuous-batching engine; see [§2](#2-continuous-batching).
+
+</details>
 
 ### 2 Continuous Batching
 
@@ -355,18 +366,64 @@ and `detokenize=False`. Both engines selected `FLASH_ATTN`, so the attention ker
    there and paying the *same* interpreter, and a ratio of two host-bound loops is independent of
    interpreter speed — so unlike the absolute numbers, **this one transfers across hosts**: qwen.py's
    host-side step costs ~1.6× vLLM's eager one, anywhere.
-4. **Mind the host.** This instance's Python is **~2.3× slower** than log1001's (EPYC 7402 held at
-   ≈2.24 GHz by neighbour load). Same code, same branch: `gpu_busy_from_trace` agrees with log1001
-   **within ±2 % at every batch** while `wall_clean` is 2.26–2.38× higher up to batch 128, converging
-   to 1.01× at 512. **So batch 512/1024 is a measurement and transfers; batch ≤ 256 absolute
-   throughput does not** (the ratios in point 3 do). The §1b launch-overhead gate passed at 7.56 µs and
-   did not catch this — the pure-interpreter loop now in the runbook is what does.
+4. **Mind the host.** This instance's Python is **~2.3× slower** than log1001's. The most likely cause
+   is CPU class: a Zen 2 EPYC 7402 against a Zen 4 Ryzen 5 7500F. An earlier version blamed neighbour
+   load holding the clock at 2.24 GHz; that was wrong (see the correction in log1003 §1). Same code,
+   same branch: `gpu_busy_from_trace` agrees with log1001 **within ±2 % at every batch** while
+   `wall_clean` is 2.26–2.38× higher up to batch 128, converging to 1.01× at 512. **So batch 512/1024
+   is a measurement and transfers; batch ≤ 256 absolute throughput does not** (the ratios in point 3
+   do). log1009 (§2.6) later tested this directly on two hosts with the same GPU.
 5. **The measured gap is a floor.** The 400 W cap was Active for **64.7–68.6 %** of vLLM's busy samples
    against **42.3–42.6 %** of qwen.py's, because qwen.py leaves the GPU idle 5–86 % of the time and
    cannot draw as much power. On a 450 W host vLLM gains more. vLLM also ran first, on the colder box.
 6. **Priorities invert.** Roadmap item 1's remaining half is worth ~1.8× on qwen.py's device time at
    batch 512 — **more than the entire 1.44× gap**. Finish the sampler before renting a faster host to
    re-measure, and before capturing graphs around a step that wastes 61 % of its device time.
+
+#### 2.6 Finishing the sampler — log1009 → log1013
+
+**Workload**: as above. Every comparison below is **same-host A/B**, with both arms run back to back
+on one instance. Reports: [log1009](./docs/performance_analysis_log1009.md) ·
+[log1012](./docs/performance_analysis_log1012.md) · [log1013](./docs/performance_analysis_log1013.md) ·
+[log1013 window run](./docs/performance_analysis_log1013_window.md) · the
+[plan](./docs/sampler_optimization_plan.md) with every prediction set against its measurement.
+
+| stage | report, host | sampler (ms/step, batch 512) | device step | peak tok/s (same-host baseline) |
+| --- | --- | --- | --- | --- |
+| start: fused top-k/p only | log1009, Ryzen 5900X | 16.35 | 27.05 | 11 117 |
+| + gates + sparse penalty, **bf16 tail** | log1012, Ryzen 3900X | 4.67 | 15.19 | 13 913 (11 199, +24.2 %) |
+| same, **fp32 at entry** | log1013, Ryzen 7950X3D | 9.77 | 20.38 | 12 990 (11 137, +16.6 %) |
+| + bf16 `topk`, fp32 window, Gumbel-max | log1013 window run, 7950X3D | **1.57** | **12.36–12.60** | **15 999** (12 754, **+25.4 %**) |
+
+Device spans repeat to within 0.02 ms across hosts, so the sampler and device-step columns compare
+across rows. Throughput only compares within a row.
+
+**Conclusions**:
+
+1. **Device work transfers across hosts; low-batch throughput does not.** log1009 ran one commit on
+   two instances with the same GPU. `gpu_busy` agreed to 0.1 %, while throughput differed by up to
+   2.3× (batch 1: 66 against 30 tok/s on a 2016 Xeon). Across the later rounds, every host-bound
+   number tracks single-thread CPU speed.
+2. **The sampler is done, and the right dtype policy came from measuring it twice.** Running the tail
+   in bf16 (log1012) was fast but put probabilities in bf16. Casting at the sampler entry (log1013)
+   fixed that but cost **5.1 ms/step**. The final version runs `topk` on bf16, which is exact because
+   bf16 → fp32 is lossless, and casts only the 20-column window: fp32 probabilities at almost no cost.
+3. **The same device saving pays very differently by host.** In log1013 the identical commit gained
+   **+5.8 %** on a 260 W-capped EPYC, whose host floor is ~25 ms, and **+16.6 %** on a 7950X3D, whose
+   floor is ~10 ms. On a slow host most of the saving turns into GPU idle.
+4. **Two of the plan's predictions were wrong, and both are corrected in it.** Skipping the greedy
+   `argmax` saved 0.33 ms, not 0.76: the second `argmax` in the trace is inside `torch.multinomial`.
+   An in-place temperature divide saved ≈ 0: `div_` moves the same 622 MB as `div`. The revised C + E
+   prediction then landed within 5 %.
+5. **The bottleneck has moved.** At batch 512 the decode step (12.3 ms) is now level with the host
+   floor, and **prefill is 69 % of the run** (86 % at batch 1024). A full 8 k-token prefill step is
+   ~61 ms of compute-bound forward, of which the sampler is 0.4 ms.
+6. **Rental gates matter as much as code.**
+   * A 260 W power limit costs ~13 % on prefill and nothing on decode.
+   * Neighbour load (log1013 window run: 48 % average CPU busy) makes host-side fields unusable
+     across arms.
+   * The 3 M-iteration interpreter loop predicts host cost well within Zen 2 (`fwd`/loop
+     0.068–0.072), but underestimates Zen 4 by ~22 %.
 
 ---
 
@@ -468,52 +525,47 @@ Other following verifications see `tests/` folder for details. The main ones `te
 
 ## Roadmap
 
-Ordered by measured cost — see [log1003 §6](./docs/performance_analysis_log1003.md) and
-[log1001 §7](./docs/performance_analysis_log1001.md), which supersede
-[log928 §7](./docs/performance_analysis_log928.md) and
-[log915 §7](./docs/performance_analysis_log915.md#7-recommendations-in-order) where they differ.
+Ordered by measured cost — see [log1013 window run §8](./docs/performance_analysis_log1013_window.md)
+and [log1013 §8](./docs/performance_analysis_log1013.md), which supersede the earlier reports where
+they differ.
 
-1. **Finish moving sampling onto the candidate set** — 🟡 **half done** (M9). The full-vocabulary
-   `torch.sort` is gone and with it 15.4 ms/step and the batch-1024 OOM, but the *tail* of the sampler
-   still runs over all 151 936 columns: temperature, the `-inf` scatter-back, the fp32 softmax, the
-   dead-row guard, `multinomial` and `argmax`. That is **16.3 of 26.9 ms/step (61 % of device work)
-   at batch 512** — roughly 23 full-vocabulary passes for a problem 20 columns wide.
-   * Carry `(top_vals, indices)` out of `apply_fused_top_k_and_p` and finish inside the window:
-     temperature is rank-preserving so it is safe *after* `topk`, `argmax` is free because
-     `sorted=True` already put the max in column 0, and `multinomial` over `[batch, max_k]` maps back
-     with one `indices.gather`. ≈9 ms/step.
-   * **Penalties must stay ahead of `topk`** (they change the ranking) but they are a *sparse* update:
-     at most `prompt_len + output_len ≤ 1 024` of 151 936 columns, 0.7 %. Gather, apply, scatter back
-     instead of six full-vocabulary passes. ≈3.5 ms/step.
-   * Together: sampler → ~4 ms/step, device step **26.9 → ~15 ms (~1.8×)**. Per
-     [log1003 §6.1](./docs/performance_analysis_log1003.md) that is **larger than the entire 1.44× gap
-     to vLLM** at batch 512, which makes it the highest-value work available by a clear margin.
-2. **A compiled / graph-captured decode step** — now with an external price tag: vLLM's own A/B on the
-   same workload says compilation + CUDA graphs are worth **7.28× at batch 1**, 3.58× at 64, 1.72× at
-   256 and 1.17× at 512 ([§2.5](#25-external-yardstick--qwenpy-vs-vllm-0300-log1003)). qwen.py's decode
-   step is the easy case for capture: fixed `max_num_seqs` slots, resident parameter tables, no dynamic
-   control flow in the hot path. **Sequence it after item 1** — capturing a step that spends 61 % of its
-   device time in an avoidable sampler bakes the waste in. Still the only change that improves
-   single-stream latency.
-3. ~~**Settle the allocator pressure behind the batch-256 stalls and the batch-1024 OOM**~~ — ✅
-   **mostly resolved by M9**, as log928 §7.1 predicted it would be. The 1.73 GiB `torch.sort`
-   workspace is gone, batch 1024 completes, and the non-monotonic batch-256 idle fraction did not
-   reappear (3.1 % baseline / 5.6 % fused in log1001, against log928's 12.6 %). Remaining: item 1
-   still allocates a fresh `[batch, vocab]` tensor per step for the `-inf` scatter-back, which
-   finishing the window work removes.
-4. **Reduce the pipeline's first-token cost** — §2.3 puts prefill latency up 37–78 % for batch ≥ 32,
+1. ~~**Finish moving sampling onto the candidate set**~~ — ✅ **done (M11)**. The sampler at batch 512
+   went 16.35 → 1.57 ms/step and the device step 27.0 → 12.4 ms (§2.6), and peak throughput rose
+   +25.4 %. log1003 §6.1 priced this work above the entire 1.44× gap to vLLM at batch 512; item 6
+   re-measures that gap.
+2. **A compiled / graph-captured decode step** — **now the main lever at every batch ≤ 512.** At
+   batch 512 the decode step is level with the host floor; at batch ≤ 256 the GPU sits 37–68 % idle.
+   vLLM's own A/B prices compilation + CUDA graphs at **7.28× at batch 1**, 3.58× at 64, 1.72× at 256
+   and 1.17× at 512 ([§2.5](#25-external-yardstick--qwenpy-vs-vllm-0300-log1003)). qwen.py's decode
+   step is the easy case for capture: fixed `max_num_seqs` slots, resident parameter tables, no
+   dynamic control flow, and since M11 no `[B, V]` allocation in the sampler. Capture needs static
+   addresses, so per-step inputs must be written into fixed buffers with `copy_`. It is still the only
+   change that improves single-stream latency.
+3. **Prefill** — **69–86 % of the run at batch ≥ 512.** A full 8 k-token chunk takes ~61 ms of
+   compute-bound forward. Profile one prefill step against vLLM's on the same chunk. Look at
+   attention/GEMM efficiency, chunk size, and how chunks interleave with decode.
+4. **D1/D2: stop zero-filling `output_counts` and the masks** when freq/pres are off (−0.55 ms/step at
+   batch 512). The switches must be computed before `bin_count_and_mask` runs. It shows in wall time
+   only once item 2 lowers the host floor; until then it pays at batch 1024.
+5. **Reduce the pipeline's first-token cost** — §2.3 puts prefill latency up 37–78 % for batch ≥ 32,
    because a first token is committed one iteration late. Prioritising the drain of a step that
    produced a first token, or keeping prefill chunks out of the iteration immediately after an
    admission, should recover most of it without giving up the decode win.
-5. **Make one-batch-per-process the harness default** — one pytest process per batch size is the
-   verified fix for the ~30 % residual profiler overhead (log916), and log928, log1001 and log1003 all
-   got it only from a shell loop. Every `gpu_idle_fraction` published from a multi-batch session is
-   overstated by ~2 points for all but its first batch point.
-6. **Promote `set_sync_debug_mode` from `warn` to `error`** — the decode path is sync-free as of M8 and
-   `test_profile.py` already arms the warning across the measurement window. Making it fatal turns
-   "no accidental sync" into a test rather than an observation, once the prefill path is clean too.
-7. **Fused kernels in Triton**, once the orchestration overhead above no longer hides them.
-8. **Scale to the 7B target** on the same harness.
+6. **Re-run the vLLM yardstick on a 7950X3D-class host**, now that the sampler is no longer 61 % of
+   device time. log1003's ratios came from a slower host and the pre-M11 sampler.
+7. **Rental gates** — before a run, check `enforced.power.limit`, the load average and per-CPU busy
+   figures from `check_instance.sh`, alongside the interpreter loop. Treat the loop as a floor check,
+   not a predictor, across CPU generations. Prefer quiet, fast-CPU hosts for device-side work: only
+   there does a device saving show up fully in throughput (§2.6, conclusion 3).
+8. **Make one-batch-per-process the harness default** — one pytest process per batch size is the
+   verified fix for the ~30 % residual profiler overhead (log916). Every `gpu_idle_fraction` published
+   from a multi-batch session is overstated by ~2 points for all but its first batch point.
+9. **Promote `set_sync_debug_mode` from `warn` to `error`** — the decode path is sync-free as of M8,
+   and M11's gates read only pinned host mirrors. Making it fatal turns "no accidental sync" into a
+   test rather than an observation, once the prefill path is clean too.
+10. **Fused kernels in Triton**, once the orchestration overhead above no longer hides them. The
+    sampler window is not a candidate: it is ~0.03 ms of launch-bound kernels.
+11. **Scale to the 7B target** on the same harness.
 
 ## License
 
