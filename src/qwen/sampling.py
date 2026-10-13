@@ -42,6 +42,10 @@ class SamplingParams:
             if not (-2. <= self.presence_penalty <= 2.):
                 raise ValueError(f"presence_penalty must be in [-2., 2.]")
 
+def extract_info_from_temperature(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    greedy_host = tensor <= EPS
+    skip_scale_host = greedy_host | (tensor == 1.0)
+    return skip_scale_host, greedy_host
 
 # resident sampling params on device, one column per sequence, for async H2D copy
 class SamplingParamTable:
@@ -78,13 +82,21 @@ class SamplingParamTable:
 
     def gather(self, slot_idx: torch.Tensor, slot_idx_stage: torch.Tensor):
         """Per step: one index_select on device, zero Python iteration."""
-        sel = self.fields_device.index_select(1, slot_idx)
+        float_fields_device = self.fields_device.index_select(1, slot_idx)
+
+        # calculate switches from fields_stage
+        float_fields_stage = self.fields_stage.index_select(1, slot_idx_stage)
+        skip_scale_host, greedy_host = extract_info_from_temperature(float_fields_stage[0])
+        rep_switch_on = bool((float_fields_stage[2] != 1.0).any().item())
+        freq_switch_on = bool((float_fields_stage[3] != 0.0).any().item())
+        pres_switch_on = bool((float_fields_stage[4] != 0.0).any().item())
 
         top_k_stage = self.top_k_stage.index_select(0, slot_idx_stage)
+        top_k = self.top_k_device.index_select(0, slot_idx)
         max_k = int(top_k_stage.max().item())
 
         # (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), top_k, max_k
-        return sel.unbind(0), self.top_k_device.index_select(0, slot_idx), max_k
+        return float_fields_device.unbind(0), top_k, max_k, (skip_scale_host, greedy_host, rep_switch_on, freq_switch_on, pres_switch_on)
 
 @dataclass
 class SamplingTensors:
@@ -98,32 +110,63 @@ class SamplingTensors:
     prompt_mask: torch.Tensor
     output_counts: torch.Tensor
     output_mask: torch.Tensor
+    seen_toks: torch.Tensor
+    skip_scale_host: torch.Tensor
+    greedy_host: torch.Tensor
+    rep_switch_on: bool
+    freq_switch_on: bool
+    pres_switch_on: bool
 
     @classmethod
     def from_table(cls, sampling_param_tab: SamplingParamTable, slot_idx: torch.Tensor, slot_idx_stage: torch.Tensor,
-                   prompt_mask: torch.Tensor, output_counts: torch.Tensor, output_mask: torch.Tensor):
+                   prompt_mask: torch.Tensor, output_counts: torch.Tensor, output_mask: torch.Tensor,
+                   seen_toks: torch.Tensor):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"from_table, {slot_idx}")
-        (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), top_k, max_k = sampling_param_tab.gather(slot_idx=slot_idx, slot_idx_stage=slot_idx_stage)
+        (temperature, top_p, repetition_penalty, frequency_penalty, presence_penalty), \
+            top_k, max_k, \
+            (skip_scale_host, greedy_host, rep_switch_on, freq_switch_on, pres_switch_on) = \
+                sampling_param_tab.gather(slot_idx=slot_idx, slot_idx_stage=slot_idx_stage)
 
         return cls(
-            temperature=temperature, top_k=top_k, max_k=max_k,
-            top_p=top_p, repetition_penalty=repetition_penalty, frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
+            temperature=temperature, top_k=top_k, max_k=max_k,top_p=top_p,
+            repetition_penalty=repetition_penalty, frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
             prompt_mask=prompt_mask,
             output_counts=output_counts, output_mask=output_mask,
+            seen_toks=seen_toks,
+            skip_scale_host=skip_scale_host, greedy_host=greedy_host, rep_switch_on=rep_switch_on,
+            freq_switch_on=freq_switch_on, pres_switch_on=pres_switch_on,
         )
 
-def apply_penalties(logits, sampling_tensors: SamplingTensors, vocab_size: int):
-    # logits [bsz, vocab_size]    
-
-    # repetition penalty based on prompt and output
-    rep_mask = sampling_tensors.prompt_mask | sampling_tensors.output_mask
+def apply_rep_penalty(logits, sampling_tensors: SamplingTensors):
+    rep_mask = sampling_tensors.prompt_mask | sampling_tensors.output_mask  # [bsz, vocab_size], bool
     rep = torch.where(rep_mask, sampling_tensors.repetition_penalty[:, None], 1.0)  # unseen set to 1.0
     logits = torch.where(logits > 0, logits / rep, logits * rep)    # ensure new <= old while rep>1.0, no matter the signedness of ligits
+    return logits
+
+def apply_rep_penalty_sparse(logits, sampling_tensors: SamplingTensors):
+    # in place: logits is modified; padding in seen_toks repeats a valid token, so duplicate writes carry the same value
+    gathered = logits.gather(1, sampling_tensors.seen_toks)     # [B, L]
+    rep = sampling_tensors.repetition_penalty[:, None]          # [B, 1], fp32
+    vals = torch.where(gathered > 0, gathered / rep, gathered * rep)    # [B, L], fp32
+
+    logits.scatter_(1, sampling_tensors.seen_toks, vals)
+    return logits
+
+def apply_penalties(logits: torch.Tensor, sampling_tensors: SamplingTensors):
+    # logits [bsz, vocab_size], fp32
+
+    if sampling_tensors.rep_switch_on:
+        # logits = apply_rep_penalty(logits=logits, sampling_tensors=sampling_tensors)
+        logits = apply_rep_penalty_sparse(logits=logits, sampling_tensors=sampling_tensors)
 
     # frequency/presence based on output token
-    logits = logits - sampling_tensors.frequency_penalty[:, None] * sampling_tensors.output_counts
-    logits = logits - sampling_tensors.presence_penalty[:, None] * sampling_tensors.output_mask
+    if sampling_tensors.freq_switch_on:
+        logits = logits - sampling_tensors.frequency_penalty[:, None] * sampling_tensors.output_counts
+
+    if sampling_tensors.pres_switch_on:
+        logits = logits - sampling_tensors.presence_penalty[:, None] * sampling_tensors.output_mask
+
     return logits
 
 def apply_top_k(logits: torch.Tensor, top_k: torch.Tensor, max_k: int):
@@ -189,35 +232,47 @@ def apply_fused_top_k_and_p(logits: torch.Tensor, top_k: torch.Tensor, max_k: in
 
 def sample2(logits: torch.Tensor, sampling_tensors: SamplingTensors):
     assert sampling_tensors.temperature is not None and sampling_tensors.top_k is not None and sampling_tensors.top_p is not None
-    return sample(logits, sampling_tensors.temperature, sampling_tensors.top_k, max_k=sampling_tensors.max_k, top_p=sampling_tensors.top_p)
+    return sample(logits, 
+                  skip_scale_host=sampling_tensors.skip_scale_host, greedy_host=sampling_tensors.greedy_host,
+                  temperature=sampling_tensors.temperature,
+                  top_k=sampling_tensors.top_k, max_k=sampling_tensors.max_k, top_p=sampling_tensors.top_p)
 
-def sample(logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, max_k:int, top_p: torch.Tensor):
+def scaling(logits: torch.Tensor, skip_scale_host: torch.Tensor, greedy_host: torch.Tensor, temperature: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    greedy = temperature <= EPS if greedy_host.any() else None  # has greedy rows, but not all rows are greedy
+
+    if skip_scale_host.all():
+        return logits, greedy   # no scaling
+
+    # NOTE: no not use where() here, because it will create a new tensor
+    scale = temperature if greedy is None else temperature.masked_fill(greedy, 1.0)
+
+    return logits.div_(scale[:, None]), greedy  # temperature; greedy rows unscaled
+
+def sample(logits: torch.Tensor, skip_scale_host: torch.Tensor, greedy_host: torch.Tensor, temperature: torch.Tensor,
+           top_k: torch.Tensor, max_k:int, top_p: torch.Tensor):
     # logits: [n, vocab] (penalties already applied); all three params are [n]
-    greedy = temperature <= EPS
-    t = torch.where(greedy, torch.ones_like(temperature), temperature)
-    logits = logits / t[:, None]                             # temperature; greedy rows unscaled
+    if greedy_host.all():
+        return logits.argmax(dim=-1)  # all greedy, no scaling, no sampling
+
+    logits, greedy = scaling(logits, skip_scale_host, greedy_host, temperature)
+    # argmax should be computed before top-k/p
+    greedy_tokens = None
+    if greedy is not None:
+        greedy_tokens = logits.argmax(dim=-1)                           # greedy rows take argmax
 
     logits = apply_fused_top_k_and_p(logits=logits, top_k=top_k, max_k=max_k, top_p=top_p)
+    probs = logits.softmax(dim=-1)      # [n, vocab]
 
-    # softmax in fp32 for numerical stability
-    probs = logits.float().softmax(dim=-1)                   # [n, vocab]
-
-    # Guard against all-(-inf) rows: softmax of all -inf -> all NaN, and even a
-    # near-underflow row can sum to 0, both of which make multinomial throw /
-    # return garbage. Detect dead rows by their probability mass, not by scanning
-    # logits for -inf.
-    #
-    # Applied unconditionally: an `if dead.any()` branch would stall the launch
-    # queue on a device->host sync every single step, just to skip one elementwise
-    # kernel in the rare case. Flat weights make the row uniform -- multinomial
-    # normalizes internally, so there is no need to divide by vocab. Greedy rows
-    # get overwritten by argmax below either way.
     row_sum = probs.sum(dim=-1, keepdim=True)                # [n, 1]
     dead = ~torch.isfinite(row_sum) | (row_sum <= 0)         # [n, 1] bool, broadcasts over vocab
     probs = probs.masked_fill(dead, 1.0)
 
     sampled = torch.multinomial(probs, num_samples=1).squeeze(1)    # select by probability
-    argmax = logits.argmax(dim=-1)                           # greedy rows take argmax
-    return torch.where(greedy, argmax, sampled)              # [n]
 
+    if greedy is not None:
+        assert greedy_tokens is not None
+        return torch.where(greedy, greedy_tokens, sampled)              # [n]
+
+    return sampled
 

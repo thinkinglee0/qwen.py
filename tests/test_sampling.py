@@ -3,46 +3,76 @@ import pytest
 import logging
 from types import SimpleNamespace
 
-from qwen.sampling import (apply_top_p, apply_top_k, apply_fused_top_k_and_p, apply_penalties, sample,
+from qwen.sampling import (apply_top_p, apply_top_k, apply_fused_top_k_and_p, apply_penalties, sample, extract_info_from_temperature,
                           SamplingParams, SamplingParamTable, SamplingTensors)
 from qwen.constants import MAX_EFFECTIVE_TOP_K, DEFAULT_PIPELINE_DEPTH
+from qwen.constants import EPS, MAX_EFFECTIVE_TOP_K
 from qwen.utils import pad_token_ids
 from constants import *
 from qwen.utils import resolve_device, default_dtype
 
 logger = logging.getLogger(__name__)
 
-def _make_sampling_tensors(prompts, outputs, vocab_size, repetition_penalty, frequency_penalty, presence_penalty, device):
+def _make_sampling_tensors(prompts, outputs, vocab_size,
+                           repetition_penalty, frequency_penalty, presence_penalty,
+                           rep_switch_on, freq_switch_on, pres_switch_on,
+                           device):
     """Build the token-history tensors the scheduler normally derives from the
     resident token-id table (see TokenIdTable.bin_count_and_mask)."""
     bsz = len(prompts)
+    temperature=torch.ones(bsz, device=device)
+    skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+
     prompt_mask = torch.zeros(bsz, vocab_size, dtype=torch.bool, device=device)
     output_mask = torch.zeros(bsz, vocab_size, dtype=torch.bool, device=device)
     output_counts = torch.zeros(bsz, vocab_size, dtype=torch.int32, device=device)
+    max_s_len = 0
+    s_lens = []
     for i, (p, o) in enumerate(zip(prompts, outputs)):
-        if p:
-            prompt_mask[i, torch.tensor(p, device=device)] = True
+        assert p
+        prompt_mask[i, torch.tensor(p, device=device)] = True
+        logger.debug(f"i: {i}, id from prompt_mask: {prompt_mask[i].nonzero()}")
+
         if o:
             o_t = torch.tensor(o, device=device)
             output_mask[i, o_t] = True
             output_counts[i].scatter_add_(0, o_t, torch.ones_like(o_t, dtype=torch.int32))
+            logger.debug(f"i: {i}, id from output_mask: {output_mask[i].nonzero()}")
+
+        s_len = len(p) + len(o)
+        s_lens.append(s_len)
+        if s_len > max_s_len:
+            max_s_len = s_len
+
+    # j = torch.arange(max_s_len)[None, :]                    # [1, L]
+    # s_len_tensor = torch.tensor(s_lens, dtype=torch.int32)[:, None] # [bsz, 1]
+    # is_valid = j<s_len_tensor
+
+    # [B, L]; padding with the first tok in prompt, 
+    seen_toks = torch.zeros(bsz, max_s_len, dtype=torch.int64, device=device)
+    for i, (p, o) in enumerate(zip(prompts, outputs)):
+        t = p + o + [p[0]]*(max_s_len-s_lens[i])    # padding
+        seen_toks[i].copy_(torch.tensor(t))
+
     return SamplingTensors(
-        temperature=torch.ones(bsz, device=device),
+        temperature=temperature,
         # the param table only ever emits effective top_k in [1, cutoff]; at the cutoff it cuts nothing
         top_k=torch.full((bsz,), min(MAX_EFFECTIVE_TOP_K, vocab_size), dtype=torch.int64, device=device),
         max_k=min(MAX_EFFECTIVE_TOP_K, vocab_size),
         top_p=torch.ones(bsz, device=device),
         repetition_penalty=repetition_penalty, frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
+        skip_scale_host=skip_scale_host, greedy_host=greedy_host, 
+        rep_switch_on=rep_switch_on, freq_switch_on=freq_switch_on, pres_switch_on=pres_switch_on,
         prompt_mask=prompt_mask, output_counts=output_counts, output_mask=output_mask,
+        seen_toks=seen_toks,
     )
-
 
 def test_apply_penalties():
     torch.manual_seed(0)
     device = resolve_device()
     vocab_size = 151936          # Actual value for Qwen2.5
     bsz = 4
-    logits = torch.randn(bsz, vocab_size, device=device, dtype=torch.float32)
+    logits = torch.randn(bsz, vocab_size, device=device, dtype=torch.float)     # input dtype, fixed at sampler()
 
     prompts = [[101, 202, 303], [55, 66],      [777], [11, 12]]
     outputs = [[202],           [66, 66, 66],  [],    [12, 12]]   # seq2 not yet generated
@@ -51,10 +81,17 @@ def test_apply_penalties():
     repetition_penalty  = torch.tensor([1.15, 1.0, 1.0, 1.0], device=device)
     frequency_penalty = torch.tensor([0.0,  0.5, 0.0, 0.0], device=device)
     presence_penalty = torch.tensor([0.0,  0.0, 0.0, 0.7], device=device)
+    rep_switch_on = bool((repetition_penalty != 1.0).any().item())
+    freq_switch_on = bool((frequency_penalty != 0.0).any().item())
+    pres_switch_on = bool((presence_penalty != 0.0).any().item())
 
-    sampling_tensors = _make_sampling_tensors(prompts, outputs, vocab_size,
-                                              repetition_penalty, frequency_penalty, presence_penalty, device)
-    new_logits = apply_penalties(logits, sampling_tensors, vocab_size)
+    sampling_tensors = _make_sampling_tensors(
+        prompts=prompts, outputs=outputs, vocab_size=vocab_size,
+        repetition_penalty=repetition_penalty, frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
+        rep_switch_on=rep_switch_on, freq_switch_on=freq_switch_on, pres_switch_on=pres_switch_on,
+        device=device)
+    logger.info(f"seen_toks: {sampling_tensors.seen_toks}")
+    new_logits = apply_penalties(logits.clone(), sampling_tensors)   # repetition penalty scatters in place
 
     assert new_logits.shape == torch.Size([bsz, vocab_size])
     assert torch.sum(new_logits[0] != logits[0], dtype=torch.float32) == 3.0    # because of three distinct elements (101, 202, 303)
@@ -376,7 +413,7 @@ def test_param_table_gather_max_k_is_plain_max_of_effective_k():
         tab.set_slot(slot, SamplingParams(top_k=k), cfg)
 
     idx_host = torch.tensor([0, 1, 2])
-    _, top_k, max_k = tab.gather(slot_idx=idx_host.to(cfg.device), slot_idx_stage=idx_host)
+    _, top_k, max_k, _ = tab.gather(slot_idx=idx_host.to(cfg.device), slot_idx_stage=idx_host)
     assert top_k.tolist() == [cutoff, 7, cutoff]
     assert max_k == cutoff
 
@@ -387,7 +424,10 @@ def test_sample_greedy_takes_argmax():
     # temperature <= EPS -> greedy; result must be argmax and not random
     logits = torch.tensor([[1., 9., 3.]])
     # "no top-k" is spelled k=vocab now: the param table clamps into [1, cutoff] and never emits 0
-    out = sample(logits, temperature=torch.tensor([0.0]),
+    temperature=torch.tensor([0.0])
+    skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+    out = sample(logits, temperature=temperature,
+                 skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([3]), max_k=3,
                  top_p=torch.tensor([1.0]))  # top_k/p no-op
     assert out.item() == 1
@@ -398,9 +438,12 @@ def test_sample_greedy_deterministic_across_seeds():
     res = []
     for seed in range(5):
         torch.manual_seed(seed)
-        res.append(sample(logits, temperature=torch.tensor([0.0]),
-                 top_k=torch.tensor([4]), max_k=4,
-                 top_p=torch.tensor([1.0])).item())  # top_k/p no-op
+        temperature = torch.tensor([0.0])
+        skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+        res.append(sample(logits, temperature=temperature,
+                           skip_scale_host=skip_scale_host, greedy_host=greedy_host,
+                           top_k=torch.tensor([4]), max_k=4,
+                           top_p=torch.tensor([1.0])).item())  # top_k/p no-op
     assert len(set(res)) == 1 and res[0] == 1
 
 
@@ -408,7 +451,9 @@ def test_sample_all_neg_inf_row_does_not_crash():
     # Regression test for bug #3: a row with all -inf should not make multinomial crash
     logits = torch.full((1, 5), NINF)
     torch.manual_seed(0)
-    out = sample(logits, temperature=torch.tensor([1.0]),
+    temperature = torch.tensor([1.0])
+    skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+    out = sample(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([5]), max_k=5, top_p=torch.tensor([1.0]))
     assert out.shape == (1,)
     if logger.isEnabledFor(logging.DEBUG):
@@ -421,7 +466,9 @@ def test_sample_mixed_greedy_and_random_rows():
     logits = torch.tensor([[1., 9., 2.],   # greedy -> 1
                            [3., 1., 2.]])  # sample
     torch.manual_seed(0)
-    out = sample(logits, temperature=torch.tensor([0.0, 1.0]),
+    temperature = torch.tensor([0.0, 1.0])
+    skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+    out = sample(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([3, 3]), max_k=3, top_p=torch.tensor([1.0, 1.0]))
     assert out[0].item() == 1
     assert 0 <= out[1].item() < 3
@@ -431,6 +478,8 @@ def test_sample_top_k_1_equals_argmax_even_when_sampling():
     # When top_k=1, even sampling rows have a single candidate = argmax, so result is deterministic
     logits = torch.tensor([[2., 8., 3.]])
     torch.manual_seed(123)
-    out = sample(logits, temperature=torch.tensor([1.0]),
+    temperature = torch.tensor([1.0])
+    skip_scale_host, greedy_host = extract_info_from_temperature(temperature)
+    out = sample(logits, temperature=temperature, skip_scale_host=skip_scale_host, greedy_host=greedy_host,
                  top_k=torch.tensor([1]), max_k=1, top_p=torch.tensor([1.0]))
     assert out.item() == 1

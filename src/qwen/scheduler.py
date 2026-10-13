@@ -441,7 +441,11 @@ class TokenIdTable:
         vocab_idx = torch.where(is_valid, rows + out_offset, DUMP)  # [B, 2V+16], move the range of output tokens to the sencond V region by add V.
         masks.scatter_(1, vocab_idx, True)                          # racing writes of same value: safe
 
-        return masks[:, :V], output_counts, masks[:, V : 2 * V]     # prompt_mask, output_counts, output_mask
+        # [B, L]; padding with the first tok in prompt, 
+        seen_toks = torch.where(is_valid, rows, rows[:, :1])
+
+        # prompt_mask, output_counts, output_mask, seen_toks, is_valid
+        return masks[:, :V], output_counts, masks[:, V : 2 * V], seen_toks
 
 
 class SchedulerOutput:
@@ -508,13 +512,17 @@ class SchedulerOutput:
         assert self.scheduler is not None and self.scheduler.sampling_param_tab is not None
         assert self.slot_idx is not None and self.slot_idx_stage_snapshot is not None
 
-        prompt_mask, output_counts, output_mask = self.scheduler.tok_id_tab.bin_count_and_mask(slot_idx=self.slot_idx, vocab_size=self.config.vocab_size)
+        prompt_mask, output_counts, output_mask, seen_toks = \
+            self.scheduler.tok_id_tab.bin_count_and_mask(slot_idx=self.slot_idx, vocab_size=self.config.vocab_size)
+
         return SamplingTensors.from_table(
             sampling_param_tab=self.scheduler.sampling_param_tab,
             slot_idx=self.slot_idx,
             slot_idx_stage=self.slot_idx_stage_snapshot,
             prompt_mask=prompt_mask,
-            output_counts=output_counts, output_mask=output_mask,)
+            output_counts=output_counts, output_mask=output_mask,
+            seen_toks=seen_toks,
+            )
 
     def incr_num_in_flight(self):
         for req in self.reqs:

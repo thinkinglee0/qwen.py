@@ -70,13 +70,15 @@ class QwenForCausalLM(nn.Module):
         return self.lm_head(hidden_states)  # shape [T, vocab_size]
 
     def sampler(self, logits: torch.Tensor, sampling_tensors: SamplingTensors, step_metrics: SchedulerStepMetrics | None = None) -> torch.Tensor:
+        logits = logits.float()     # prompt to fp32 at the beginning
+        
         if not self.config.do_penalities and not self.config.do_sample:     # shortcut for greedy decoding without penalties
             return logits.argmax(dim=-1)
 
         if self.config.do_penalities:
             assert sampling_tensors is not None
             with timed(step_metrics, "smp_pen"):
-                logits = apply_penalties(logits, sampling_tensors, self.config.vocab_size)
+                logits = apply_penalties(logits, sampling_tensors)
 
         with timed(step_metrics, "smp_pick"):
             if self.config.do_sample:
