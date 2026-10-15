@@ -16,6 +16,7 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     def forward(self, hidden_states, meta: AttentionMetadata):
+        '''
         # pre-attention norm
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -30,5 +31,10 @@ class DecoderLayer(nn.Module):
         # fully connected, mlp
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        '''
+
+        # more concise formulae, pre-LN
+        hidden_states = hidden_states + self.self_attn(self.input_layernorm(hidden_states), meta)
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
         return hidden_states
